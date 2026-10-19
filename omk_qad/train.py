@@ -142,14 +142,23 @@ def phase_cache(a) -> None:
         say(f"IMATRIX from {imat['seqs']} x {a.seq} tokens ({len(col.sums)} weights) -> {[str(q) for q in paths]}")
 
     passes: list = []
-    ev_stream = _packed(a.eval_data, tok, a.seq, tok.eos_token_id, passes)
-    ex = torch.stack([next(ev_stream) for _ in range(a.n_eval)])
+    fams = [q for q in a.eval_data.split(",") if q]  # one eval family per file (name = file stem)
+    names = [Path(q).stem for q in fams]
+    if len(set(names)) != len(names):
+        raise SystemExit(f"eval families need distinct file stems: {names}")
+    ex, fam = [], []
+    for k, q in enumerate(fams):
+        stream = _packed(q, tok, a.seq, tok.eos_token_id, passes)
+        ex += [next(stream) for _ in range(a.n_eval)]
+        fam += [k] * a.n_eval
+    ex = torch.stack(ex)
     parts = [topk_of(ex[i : i + 4]) for i in range(0, len(ex), 4)]
     ev = {"x": ex.to(torch.int32), "idx": torch.cat([q[0] for q in parts]), "val": torch.cat([q[1] for q in parts]),
-          "teacher_ppl": math.exp(sum(q[2] for q in parts) / (len(ex) * (a.seq - 1)))}
+          "teacher_ppl": math.exp(sum(q[2] for q in parts) / (len(ex) * (a.seq - 1))),
+          "family": torch.tensor(fam, dtype=torch.int32), "families": names}
     torch.save(ev, os.path.join(a.cache, "eval.pt"))
-    say(f"eval: {len(ex)} x {a.seq} tokens; teacher ppl {ev['teacher_ppl']:.3f}; top-{a.topk} mass "
-        f"{ev['val'].float().exp().sum(-1).mean().item():.4f}")
+    say(f"eval: {len(ex)} x {a.seq} tokens ({a.n_eval} per family {names}); teacher ppl {ev['teacher_ppl']:.3f}; "
+        f"top-{a.topk} mass {ev['val'].float().exp().sum(-1).mean().item():.4f}")
 
     srcs = [(q.split("=")[0], float(q.split("=")[1]) if "=" in q else 1.0) for q in a.data.split(",") if q]
     folded, block = (None, None)
@@ -312,6 +321,9 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
     mtp = has_mtp(student)
     tot = dict.fromkeys(("jac", "klk", "nll", "top1", "jac_m", "klk_m", "top1_m"), 0.0)
     n = n_m = 0
+    names = ev.get("families") or []
+    fam = ev["family"].tolist() if "family" in ev else [0] * len(ev["x"])
+    per = [dict.fromkeys(("jac", "klk", "nll", "top1", "n"), 0.0) for _ in names]
     for i0 in range(0, len(ev["x"]), 4):
         x = ev["x"][i0 : i0 + 4].long().to(a.device)
         h = hidden_of(student, x, cuda)
@@ -323,10 +335,13 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
                     lg = F.linear(h[i, c0:c1], wh)
                 j, k, ce, t1 = token_terms(lg, ev["idx"][i0 + i, c0:c1].to(a.device),
                                            ev["val"][i0 + i, c0:c1].to(a.device), x[i, c0 + 1 : c1 + 1])
-                tot["jac"] += j.sum().item()
-                tot["klk"] += k.sum().item()
-                tot["nll"] += ce.sum().item()
-                tot["top1"] += t1.sum().item()
+                terms = {"jac": j.sum().item(), "klk": k.sum().item(), "nll": ce.sum().item(), "top1": t1.sum().item()}
+                for key, v in terms.items():
+                    tot[key] += v
+                    if per:
+                        per[fam[i0 + i]][key] += v
+                if per:
+                    per[fam[i0 + i]]["n"] += c1 - c0
                 n += c1 - c0
             if mtp:  # z_t (t <= T-3) predicts x_{t+2}; teacher distribution at t+1
                 for c0 in range(0, x.shape[1] - 2, a.loss_chunk):
@@ -344,6 +359,9 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
            "ppl": math.exp(tot["nll"] / n), "teacher_ppl": ev.get("teacher_ppl")}
     if mtp:
         res.update(jaccard_mtp=tot["jac_m"] / n_m, klk_mtp=tot["klk_m"] / n_m, top1_mtp=tot["top1_m"] / n_m)
+    if len(per) > 1:  # the same metrics per eval family (rows of each family are disjoint)
+        res["families"] = {nm: {"jaccard": f["jac"] / f["n"], "klk": f["klk"] / f["n"], "top1": f["top1"] / f["n"],
+                                "ppl": math.exp(f["nll"] / f["n"])} for nm, f in zip(names, per, strict=True)}
     res.update(extra or {})
     say("EVAL", json.dumps(res))
     return res
@@ -549,6 +567,12 @@ def phase_train(a) -> None:
         save_state(path, step, latents, student, opt, a, ctl, results, origin)
         say(f"CHECKPOINT step {step} -> {path}")
 
+    def peak() -> str:  # read by omk_qad.multi preflight: what this student needs on its GPU
+        if a.device == "cpu":
+            return "PEAK_MEM allocated=0.0GiB reserved=0.0GiB (cpu)"
+        return (f"PEAK_MEM allocated={torch.cuda.max_memory_allocated(a.device) / 2**30:.2f}GiB "
+                f"reserved={torch.cuda.max_memory_reserved(a.device) / 2**30:.2f}GiB")
+
     step = start - 1
     for step in range(start, last + 1):
         ctl.step = step
@@ -580,10 +604,12 @@ def phase_train(a) -> None:
         if why:
             pauser.file.unlink(missing_ok=True)
             say(f"PAUSED at step {step} ({why}); relaunch the same command to resume from {last_ck}")
+            say(peak())
             return
     if step == a.steps and step >= start:
         save_state(final, step, latents, student, opt, a, ctl, results, origin)
         say(f"STAGE_DONE stage {a.stage}{' branch ' + a.branch if a.branch else ''}: {final}")
+    say(peak())
     say(f"QAD_DONE at step {step} in {time.time() - t0:.0f}s")
 
 
@@ -632,9 +658,9 @@ def main(argv=None) -> None:
     ap.add_argument("--seed", type=int, default=0)
     # cache
     ap.add_argument("--data", default="", help="comma list of path[=weight] (.txt | .jsonl text/messages | .parquet)")
-    ap.add_argument("--eval-data", default="")
+    ap.add_argument("--eval-data", default="", help="comma list of eval files, one family each (name = file stem)")
     ap.add_argument("--n-seq", type=int, default=16000)
-    ap.add_argument("--n-eval", type=int, default=32)
+    ap.add_argument("--n-eval", type=int, default=32, help="eval rows per eval family")
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--topk", type=int, default=64)
     ap.add_argument("--shard", type=int, default=1000)

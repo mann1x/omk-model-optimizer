@@ -767,3 +767,103 @@ def test_ternary_student_uses_the_folded_imatrix(setup):
     assert all(weighted[n].msq.shape[-1] == weighted[n].cols for n in tern)
     changed = sum(not torch.equal(weighted[n].served(), plain[n].served()) for n in tern)
     assert changed == len(tern)  # importance moves the weighted-L2 optimum of every ternary weight
+
+
+# --- separate students over one shared teacher (plan M5) -----------------------------------------------------------
+def _multi_spec(model: Path, out: Path, text: Path, evals: str) -> dict:
+    common = {"steps": 2, "bs": 2, "warmup": 1, "eval_every": 2, "save_every": 2, "latent_dtype": "fp16",
+              "latent_min": 65536, "loss_chunk": 32}
+    return {"model": str(model), "out": str(out), "llama_cpp": str(LLAMA_CPP), "layout": {"rest": "IQ2_M"},
+            "cache": {"data": str(text), "eval_data": evals, "n_seq": 8, "n_eval": 1, "seq": 64, "shard": 4},
+            "preflight_steps": 2, "references": {"elsewhere": {"note": "another metric"}},
+            "students": [
+                {"name": "iq2", "gpu": None, "layout": {"fixed": {"dense_mlp": "iq2_xxs"}},
+                 "train": {**common, "lr": 1e-3, "loss": "jaccard"}},
+                {"name": "tern", "gpu": None,
+                 "layout": {"fixed": {"dense_mlp": "pq2_0"},
+                            "override": {"attention": "pq2_0", "linear_attn": "pq2_0", "lm_head": "pq2_0"}},
+                 "train": {**common, "lr": 6e-5, "loss": "kl"}},
+            ]}
+
+
+def test_multi_students_share_only_the_teacher(setup):
+    """An IQ2 and a ternary student from one spec share only the teacher.
+
+    One probe, one cache + imatrix; two concurrent processes with their own hyper-parameters, layouts, checkpoints
+    and GGUFs; one report over the same eval rows.
+    """
+    import shutil
+
+    from omk_qad import multi
+
+    model, _ = setup["dense_tied"]
+    out = WORK / "multi"
+    if out.exists():
+        shutil.rmtree(out)  # this test's own scratch
+    out.mkdir(parents=True)
+    words = setup["text"].read_text().split()
+    evals = []
+    for k, part in enumerate((words[: len(words) // 2], words[len(words) // 2 :])):  # two eval families
+        evals.append(out / f"eval_{'ab'[k]}.txt")
+        evals[-1].write_text(" ".join(part))
+    spec = _multi_spec(model, out, setup["text"], ",".join(map(str, evals)))
+    sp = out / "spec.json"
+    sp.write_text(json.dumps(spec))
+    _run("omk_qad.multi", "all", "--spec", str(sp))
+
+    assert (out / "cache" / "cache.log").read_text().count("CACHE_DONE") == 1
+    assert (out / "cache" / "imatrix.folded.pt").exists()
+    sums = {n: json.loads((out / n / "stage1" / "summary.json").read_text()) for n in ("iq2", "tern")}
+    assert {sm["origin"]["cache"] for sm in sums.values()} == {str(out / "cache")}  # the same teacher rows
+    assert (sums["iq2"]["args"]["lr"], sums["iq2"]["args"]["loss"]) == (1e-3, "jaccard")  # each its own recipe
+    assert (sums["tern"]["args"]["lr"], sums["tern"]["args"]["loss"]) == (6e-5, "kl")
+    assert all((out / n / "stage1" / "final.pt").exists() for n in ("iq2", "tern"))
+
+    st = json.loads((out / "multi.json").read_text())["train"]
+    assert st["iq2"]["pid"] != st["tern"]["pid"]
+    assert st["iq2"]["started"] < st["tern"]["ended"] and st["tern"]["started"] < st["iq2"]["ended"]  # concurrent
+
+    lay = {n: torch.load(out / n / "layout.pt", weights_only=False) for n in ("iq2", "tern")}
+    assert lay["iq2"].get("hadamard_block") is None and lay["tern"]["hadamard_block"] == 256
+    rep = {n: json.loads((out / n / f"{n}.export.json").read_text()) for n in ("iq2", "tern")}
+    assert "IQ2_XXS" in rep["iq2"]["type_counts"] and "PQ2_0" not in rep["iq2"]["type_counts"]
+    assert rep["tern"]["type_counts"]["PQ2_0"] > 0
+    assert all(r["verify_failures"] == [] and r["type_mismatches"] == [] for r in rep.values())
+    report = json.loads((out / "report.json").read_text())
+    assert report["same_eval_rows"] and [r["student"] for r in report["rows"]] == ["iq2", "tern"]
+    assert all(r["status"] == "final" and r["klk"] is not None for r in report["rows"])
+    for r in report["rows"]:  # one row per family, equal token counts: the overall KL is their mean
+        assert r["klk"] == pytest.approx((r["klk:eval_a"] + r["klk:eval_b"]) / 2, rel=1e-6)
+    md = (out / "report.md").read_text()
+    assert "klk:eval_a" in md and "elsewhere" in md and "elsewhere" not in md.split("References")[0]
+
+    again = _run("omk_qad.multi", "train", "--spec", str(sp))  # finished students are reported, not relaunched
+    assert again.count("not relaunched") == 2
+
+    pre = _run("omk_qad.multi", "preflight", "--spec", str(sp), "--students", "tern")
+    pf = json.loads((out / "multi.json").read_text())["preflight"]["tern"]
+    assert pf["reserved_gib"] == 0.0 and "no GPU is shared" in pre
+    assert not (out / "tern" / "stage1" / "last.pt").exists() or (out / "tern" / "stage1" / "final.pt").exists()
+    assert (out / "_preflight" / "tern" / "stage1" / "final.pt").exists()  # its own scratch run, not the student's
+
+    changed = json.loads(sp.read_text())
+    changed["students"][0]["layout"] = {"fixed": {"dense_mlp": "iq2_xs"}}
+    with pytest.raises(SystemExit, match="differs from its existing"):
+        multi.phase_plan(changed, changed["students"][:1])
+
+    other = WORK / "multi_block"  # a ternary student folding with another block than the shared folded imatrix
+    if other.exists():
+        shutil.rmtree(other)
+    s2 = {**spec, "out": str(other)}
+    for n in ("iq2", "tern"):
+        (other / n).mkdir(parents=True)
+        lay2 = dict(lay[n])
+        if n == "tern":
+            lay2["hadamard_block"] = 512
+        torch.save(lay2, other / n / "layout.pt")
+    with pytest.raises(SystemExit, match="folds with block 512"):
+        multi.check_blocks(s2)
+
+    gpu = {**spec, "students": [{**s, "gpu": 0} for s in spec["students"]]}  # sharing a GPU needs a measured peak
+    with pytest.raises(SystemExit, match="run 'preflight' first"):
+        multi.fit(gpu, gpu["students"], {})
