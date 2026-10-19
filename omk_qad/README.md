@@ -12,7 +12,7 @@ Reference recipe: NVIDIA Nemotron 3.5 Bolt 74B-A9B 24GB (experts IQ2_XXS + QAD, 
 | `census.py` | Classifies every parameter by structure (fused experts, router, shared/dense MLP, attention, linear attention, embeddings), applies a format policy with block-size fallbacks, proves 100 % parameter coverage, emits the ModelOpt quant config. |
 | `ptq.py` | PTQ of any HF causal LM (text tower) to the census policy → ModelOpt GGML-packed HF checkpoint. The PTQ floor. |
 | `gguf_export.py` | Packed checkpoint → GGUF through llama.cpp's own converter, carrying the packed bytes verbatim; verifies every quantized tensor with gguf-py's reference decoders (which match libggml exactly). |
-| `tiny.py` | Tiny random models with the exact architecture of the targets (qwen3_5_moe_text / qwen3_5_text) for CPU tests. |
+| `tiny.py` | Tiny random models with the exact architecture of the targets (qwen3_5_moe_text / qwen3_5_text; `dense_tied` = Qwen3.5-4B config, tied embeddings) for CPU tests. |
 | `layout.py` | Per-GGUF-tensor layout decided by llama.cpp itself: the converter is run on index probes (source id / row / column, no weights read) to get each GGUF tensor's source rows and column order, and `llama-quantize --dry-run <ftype>` on a sparse shape-only GGUF gives the plan (default IQ2_M with experts / dense MLP fixed at IQ2_XXS). |
 | `ggml_lib.py` | libggml's own encoder/decoder via ctypes (what llama-quantize runs) for every type ModelOpt lacks (IQ3_S, K-quants, ...). |
 | `fakequant.py` | Training-time fake quant from the layout: latents (fp16, stochastic rounding) served with each GGUF segment encoded in GGUF block order (ModelOpt for IQ1/IQ2/Q8_0, libggml otherwise); forward hooks swap served weights in one module at a time; the gradient is applied inside backward (momentum-free Adafactor, per expert). |
@@ -76,6 +76,8 @@ IQ2_M breakdown:
 |---|---|---|---|
 | Qwen3.6-27B-A3B-Coder | routed + shared experts 5.99 GB | lm_head Q5_K, linear-attn Q4_K/IQ2_S, embed IQ3_S, attn IQ2_S/IQ3_S | **7.18 GB** |
 | Qwen3.6-27B dense | MLP 4.41 GB | linear-attn Q4_K/IQ2_S, lm_head Q5_K, embed IQ3_S, attn IQ2_S/IQ3_S/Q4_K | **8.85 GB** |
+
+Tied embeddings (e.g. Qwen3.5-4B): the one tensor is classed `lm_head`, trained fake-quantized at the head's planned type (llama.cpp ships it as `token_embd` with the output rule), imatrix from the head's input; the gradient sums the lookup and head uses (CPU test). The ModelOpt PTQ path (`ptq.py`) is not yet tested on a tied model.
 
 Known gaps: the GGML CUDA extension is not yet built/tested here (CPU path only); the IQ2 re-encode cost per
 step on GPU is unmeasured (CPU reference encoder: ~1.3 M params/s; libggml K-quants run on CPU, `--ggml-refresh N`);

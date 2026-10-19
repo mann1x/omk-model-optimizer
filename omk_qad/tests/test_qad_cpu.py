@@ -64,13 +64,14 @@ def _cache(model: Path, layout: Path, cache: Path, text: Path) -> Path:
 
 @pytest.fixture(scope="module")
 def setup():
-    """Sharp tiny MoE / dense / MoE+MTP teachers, their IQ2_M-rest layouts, small teacher caches with imatrix."""
+    """Sharp tiny MoE / dense / MoE+MTP / tied dense+MTP teachers, IQ2_M-rest layouts, teacher caches + imatrix."""
     from omk_qad.layout import build_layout
     from omk_qad.tiny import make_tiny
 
     WORK.mkdir(parents=True, exist_ok=True)
     out = {}
-    for name, kind, mtp in (("moe", "moe", False), ("dense", "dense", False), ("moe_mtp", "moe", True)):
+    for name, kind, mtp in (("moe", "moe", False), ("dense", "dense", False), ("moe_mtp", "moe", True),
+                            ("dense_tied", "dense_tied", True)):  # Qwen3.5-4B shape: tied embeddings + MTP
         tiny = WORK / f"tiny_{name}"
         if not (tiny / "config.json").exists():
             make_tiny(kind, tiny, mtp=mtp)
@@ -86,11 +87,12 @@ def setup():
         text.write_text((LLAMA_CPP / "README.md").read_text()[:60000])
     out["cache"] = _cache(*out["moe"], WORK / "cache_moe", text)
     out["cache_mtp"] = _cache(*out["moe_mtp"], WORK / "cache_moe_mtp", text)
+    out["cache_tied"] = _cache(*out["dense_tied"], WORK / "cache_dense_tied", text)
     out["text"] = text
     return out
 
 
-@pytest.mark.parametrize("kind", ["moe", "dense"])
+@pytest.mark.parametrize("kind", ["moe", "dense", "dense_tied"])
 def test_layout_plan(setup, kind):
     from omk_qad.layout import summary
 
@@ -99,8 +101,12 @@ def test_layout_plan(setup, kind):
     assert s["unsupported_quantized"] == []
     two_bit = "routed_experts" if kind == "moe" else "dense_mlp"
     assert set(s["per_class"][two_bit]) == {"IQ2_XXS"}
-    assert s["per_class"]["embedding"] == {"IQ3_S": 1}  # llama.cpp IQ2_M rule for token_embd
-    assert s["per_class"]["lm_head"] == {"Q5_K": 1}  # llama.cpp IQ2_M rule for output
+    if kind == "dense_tied":  # one tensor: classed as the head, shipped as token_embd with the output's rule
+        assert "embedding" not in s["per_class"] and s["per_class"]["lm_head"] == {"Q5_K": 1}
+        assert layout["targets"]["token_embd.weight"]["cls"] == "lm_head" and "output.weight" not in layout["targets"]
+    else:
+        assert s["per_class"]["embedding"] == {"IQ3_S": 1}  # llama.cpp IQ2_M rule for token_embd
+        assert s["per_class"]["lm_head"] == {"Q5_K": 1}  # llama.cpp IQ2_M rule for output
     # the converter's V-head reorder of ssm_out is found by the probe, never assumed
     assert {g.split(".", 2)[2] for g in s["permuted_columns"] if g.endswith(".weight")} == {"ssm_out.weight"}
     for g, t in layout["targets"].items():
@@ -124,26 +130,34 @@ def test_ggml_codec_matches_gguf_py():
         assert np.array_equal(d, gguf.quants.dequantize(q, qt).reshape(d.shape)), name
 
 
-def test_gradients_match_autograd(setup):
-    """Hook path (served weights, use counting, checkpoint recompute, chunked head) == plain autograd."""
+@pytest.mark.parametrize("kind", ["moe", "dense_tied"])
+def test_gradients_match_autograd(setup, kind):
+    """Hook path (served weights, use counting, checkpoint recompute, chunked head) == plain autograd.
+
+    Tied: the one tensor is used twice per step (lookup in the body, head on the final hidden state); its update
+    must receive the sum of both. The MTP head is frozen here (the reference model has none).
+    """
     from omk_qad import train as T
     from omk_qad.ptq import load_text_causal_lm
 
-    model, lay = setup["moe"]
-    a = _args(model, ce_weight=0.3, loss_chunk=24)
+    model, lay = setup[kind]
+    a = _args(model, ce_weight=0.3, loss_chunk=24, mtp="freeze")
     student, lats, fp, ctl, head = T.build_student(a, torch.load(lay, weights_only=False))
-    sh = torch.load(setup["cache"] / "train_0000.pt")
+    if kind == "dense_tied":
+        assert head == "model.embed_tokens.weight" and lats[head].segments  # trained, fake-quantized
+    sh = torch.load(setup["cache" if kind == "moe" else "cache_tied"] / "train_0000.pt")
     x, idx, val = sh["x"][:2].long(), sh["idx"][:2], sh["val"][:2]
     cap = {}
     for n, lat in lats.items():
         lat.update = lambda g, n=n: cap.__setitem__(n, g.clone())
     served = {n: lat.served().clone() for n, lat in lats.items()}
     T.train_step(student, lats, lats[head], fp, None, x, idx, val, a)
-    assert set(cap) == set(lats) and ctl.stats["undelivered"] == 0
+    trunk = {n for n in lats if not n.startswith("mtp.")}
+    assert set(cap) == trunk and ctl.stats["undelivered"] == 0
     named = dict(student.named_parameters())
-    fp_names = [n for n, p in named.items() if p.requires_grad]
+    fp_names = [n for n, p in named.items() if p.requires_grad and not n.startswith("mtp.")]
     ref, _ = load_text_causal_lm(a.model, "cpu", torch.float32)
-    leaves = {n: t.clone().requires_grad_() for n, t in served.items()}
+    leaves = {n: t.clone().requires_grad_() for n, t in served.items() if n in trunk}
     fpl = {n: named[n].detach().clone().requires_grad_() for n in fp_names}
     lg = torch.func.functional_call(ref, {**leaves, **fpl}, (x,)).logits[:, :-1].float()
     j, _, ce, _ = T.token_terms(lg.reshape(-1, lg.shape[-1]), idx.reshape(-1, idx.shape[-1]),
@@ -381,3 +395,54 @@ def test_pause_resume_is_bitwise_and_stage2_branches(setup):
     assert sha() == before
     p = _train(model, lay, setup["cache"], a, "--stage", "2", check=False)
     assert p.returncode != 0 and "--branch" in p.stdout + p.stderr
+
+
+def test_tied_train_export_verify_load(setup):
+    """Tied embeddings + MTP (Qwen3.5-4B shape) train, export and load.
+
+    The head trains fake-quantized with its imatrix and ships as token_embd only; the GGUF holds exactly what
+    training served; llama.cpp loads it.
+    """
+    import shutil
+
+    sys.path.insert(0, str(LLAMA_CPP / "gguf-py"))
+    import gguf
+
+    from omk_qad import train as T
+
+    model, lay = setup["dense_tied"]
+    cache = setup["cache_tied"]
+    imat = torch.load(cache / "imatrix.pt", weights_only=False)
+    e = imat["entries"]["model.embed_tokens.weight"]  # the head's input (final hidden state), named by identity
+    assert int(e["counts"].sum()) == imat["chunk_count"] * (imat["chunk_size"] - 1)
+
+    run, out = WORK / "run_tied", WORK / "qad_tied.gguf"
+    if run.exists():
+        shutil.rmtree(run)  # this test's own scratch
+    _run("omk_qad.train", *TRAIN, "--model", str(model), "--layout", str(lay), "--cache", str(cache),
+         "--out", str(run), "--steps", "2", "--eval-every", "2", "--save-every", "2")
+    final = run / "stage1" / "final.pt"
+    _run("omk_qad.train", "--phase", "export", "--model", str(model), "--layout", str(lay), "--device", "cpu",
+         "--load", str(final), "--gguf", str(out), "--latent-dtype", "fp16", "--latent-min", "65536")
+    rep = json.loads(out.with_suffix(".export.json").read_text())
+    assert rep["verify_failures"] == [] and rep["type_mismatches"] == [] and rep["export_only"] == []
+    quantized = {n for n, t in rep["tensors"].items() if t["how"] != "float"}
+    assert "token_embd.weight" in quantized and "output.weight" not in rep["tensors"]
+    assert {n for n in quantized if rep["tensors"][n]["imatrix"]} == quantized  # tied head included
+
+    student, lats, _, _, head = T.build_student(_args(model, latent_dtype="fp16", imatrix=str(cache / "imatrix.pt")),
+                                                torch.load(lay, weights_only=False))
+    T.load_state(str(final), lats, student, None)
+    tensors = {t.name: t for t in gguf.GGUFReader(out).tensors}
+    for lat in lats.values():
+        for g, chunks in lat.payloads().items():
+            want = np.concatenate([_flat(c) for c in chunks])
+            assert np.array_equal(np.asarray(tensors[g].data).reshape(-1), want), g
+    assert lats[head].payloads().keys() == {"token_embd.weight"}
+
+    proc = subprocess.run(
+        [str(LLAMA_CPP / "build/bin/llama-perplexity"), "-m", str(out), "-f", str(setup["text"]), "-c", "128",
+         "--chunks", "2", "-t", "8", "-ngl", "0"],
+        capture_output=True, text=True, env=CPU_ENV, check=False,
+    )
+    assert proc.returncode == 0 and "Final estimate" in proc.stdout + proc.stderr, proc.stderr[-2000:]

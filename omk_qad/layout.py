@@ -91,6 +91,12 @@ def param_classes(model) -> dict[str, str]:
     for name in out:  # the MTP head is its own class (its own format), whatever its structure
         if name.startswith("mtp."):
             out[name] = "mtp"
+    emb_in, emb_out = model.get_input_embeddings(), model.get_output_embeddings()
+    if emb_out is not None and emb_in.weight is emb_out.weight:
+        # tied: the one tensor IS the head (llama.cpp ships it as token_embd with the output's rules); classing it
+        # "embedding" would make it export-only, so the head would train unquantized and ship quantized
+        tied = next(n for n, p in model.named_parameters() if p is emb_in.weight)
+        out[tied] = "lm_head"
     return out
 
 

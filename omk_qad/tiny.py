@@ -8,6 +8,7 @@ of 256 (the GGML super-block).
 
   python -m omk_qad.tiny --kind moe   --out DIR   # Qwen3.6-27B-A3B-Coder shape (qwen3_5_moe_text)
   python -m omk_qad.tiny --kind dense --out DIR   # Qwen3.6-27B shape (qwen3_5_text)
+  python -m omk_qad.tiny --kind dense_tied --out DIR   # Qwen3.5-4B shape (qwen3_5_text, tied embeddings)
 """
 
 import argparse
@@ -21,6 +22,7 @@ from huggingface_hub import hf_hub_download
 REFERENCE = {
     "moe": "ManniX-ITA/Qwen3.6-27B-A3B-Coder",
     "dense": "Qwen/Qwen3.6-27B",
+    "dense_tied": "Qwen/Qwen3.5-4B",  # the smoke target: one tensor is both the lookup table and the head
 }
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.jinja")
 

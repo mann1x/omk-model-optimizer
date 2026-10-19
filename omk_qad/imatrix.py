@@ -41,10 +41,14 @@ class Collector:
         self.n_fused = 0
         named = dict(model.named_parameters())
         want = names if names is not None else set(named)
+        # by identity, not by module path: a tied head's weight is registered once, under the embedding's name
+        # (lm_head.weight is model.embed_tokens.weight), and its input -- the final hidden state -- belongs there
+        name_of = {id(p): n for n, p in named.items()}
         for mod_name, mod in model.named_modules():
             prefix = f"{mod_name}." if mod_name else ""
-            if isinstance(mod, nn.Linear) and f"{prefix}weight" in want:
-                self.handles.append(mod.register_forward_pre_hook(self._linear_hook(f"{prefix}weight")))
+            wname = name_of.get(id(mod.weight)) if isinstance(mod, nn.Linear) else None
+            if wname is not None and wname in want:
+                self.handles.append(mod.register_forward_pre_hook(self._linear_hook(wname)))
             fused = [(f"{prefix}{p}", getattr(mod, p)) for p in ("gate_up_proj", "up_proj", "down_proj")
                      if isinstance(getattr(mod, p, None), torch.Tensor) and getattr(mod, p).ndim == 3]
             fused = [(n, p) for n, p in fused if n in want]
