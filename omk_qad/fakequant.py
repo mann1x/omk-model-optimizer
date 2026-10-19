@@ -21,6 +21,7 @@ counter is separate from the parameter's.
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,14 +59,19 @@ class Codec:
         """gguf-py GGMLQuantizationType of ``name``."""
         return self.gguf.GGMLQuantizationType[name]
 
-    def encode(self, qtype: str, x: torch.Tensor):
-        """Packed payload of float32 ``x`` [rows, cols]: uint8 torch tensor (ModelOpt) or numpy array (ggml)."""
+    def encode(self, qtype: str, x: torch.Tensor, importance: torch.Tensor | None = None):
+        """Packed payload of float32 ``x`` [rows, cols]: uint8 torch tensor (ModelOpt) or numpy array (ggml).
+
+        ``importance`` is the encoder-convention vector from :func:`omk_qad.imatrix.importance_for` (or None).
+        """
         if qtype in MODELOPT_TYPES:
             from modelopt.torch.quantization.ggml import GGML_FORMAT_REGISTRY
 
-            packed, _ = GGML_FORMAT_REGISTRY[qtype.lower()].quantize(x.float().contiguous())
+            kw = {} if importance is None else {"importance": importance.to(x.device)}
+            packed, _ = GGML_FORMAT_REGISTRY[qtype.lower()].quantize(x.float().contiguous(), **kw)
             return packed
-        return self.ggml.quantize(int(self.qtype(qtype)), x.detach().float().cpu().numpy())
+        imat = None if importance is None else importance.detach().float().cpu().numpy()
+        return self.ggml.quantize(int(self.qtype(qtype)), x.detach().float().cpu().numpy(), imat)
 
     def decode(self, qtype: str, packed, rows: int, cols: int, device, dtype=torch.float32) -> torch.Tensor:
         """Inverse of :meth:`encode`, as a [rows, cols] tensor on ``device``."""
@@ -93,6 +99,7 @@ class Segment:
     colperm: torch.Tensor | None
     inv: torch.Tensor | None
     n_rows: int
+    chunks: list = field(default_factory=list)  # (rows, n, expert): never crosses an expert boundary
 
 
 def _as_slice(rows: torch.Tensor) -> slice | torch.Tensor:
@@ -161,6 +168,28 @@ class Latent:
         self.version = 0  # bumped by every write; param._version cannot be used: updates go through .data
         self.gbuf: torch.Tensor | None = None
         self._cache: dict[int, tuple] = {}  # chunk id -> (latent version, step encoded, payload)
+        self.msq: torch.Tensor | None = None  # imatrix E[x^2] per expert [E, C] (set_imatrix)
+        self._imp: dict = {}
+
+    def set_imatrix(self, msq: torch.Tensor | None) -> None:
+        """E[x^2] [E, C] of this weight's inputs (omk_qad.imatrix.mean_sq); invalidates cached encodings."""
+        if msq is not None and msq.shape[-1] != self.cols:
+            raise ValueError(f"{self.name}: imatrix width {msq.shape[-1]} != {self.cols}")
+        self.msq, self._imp, self._cache = msq, {}, {}
+
+    def importance(self, seg: Segment, expert: int) -> torch.Tensor | None:
+        """Encoder importance for one expert's rows of ``seg`` (columns in GGUF order)."""
+        if self.msq is None:
+            return None
+        key = (seg.gguf, expert)
+        if key not in self._imp:
+            from .imatrix import importance_for
+
+            m = self.msq[expert if self.msq.shape[0] > 1 else 0]
+            if seg.colperm is not None:
+                m = m[seg.colperm]
+            self._imp[key] = importance_for(seg.qtype, m)
+        return self._imp[key]
 
     # ---------------------------------------------------------------- served weight
     @torch.no_grad()
@@ -175,7 +204,7 @@ class Latent:
         version = self.version
         k = 0
         for seg in self.segments:
-            for rows in _chunk(seg.rows, seg.n_rows, self.cols):
+            for rows, _, expert in seg.chunks:
                 x = w[rows].float()
                 if seg.colperm is not None:
                     x = x[:, seg.colperm.to(x.device)]
@@ -187,7 +216,7 @@ class Latent:
                 if fresh:
                     payload = hit[2]
                 else:
-                    payload = self.codec.encode(seg.qtype, x)
+                    payload = self.codec.encode(seg.qtype, x, self.importance(seg, expert))
                     self._cache[k] = (version, self.ctl.step, payload)
                     self.ctl.stats["encodes"] += 1
                 d = self.codec.decode(seg.qtype, payload, x.shape[0], self.cols, x.device)
@@ -202,7 +231,7 @@ class Latent:
         self.served()
         out, k = {}, 0
         for seg in self.segments:
-            for _ in _chunk(seg.rows, seg.n_rows, self.cols):
+            for _ in seg.chunks:
                 out.setdefault(seg.gguf, []).append(self._cache[k][2])
                 k += 1
         return out
@@ -298,8 +327,27 @@ def build_segments(layout: dict, name: str, train_types: bool = True) -> list[Se
         rows = t["rows"].long()
         perm = t["colperm"].long() if t["colperm"] is not None else None
         inv = torch.argsort(perm) if perm is not None else None
-        segs.append(Segment(g, t["type"], _as_slice(rows), perm, inv, len(rows)))
+        seg = Segment(g, t["type"], _as_slice(rows), perm, inv, len(rows))
+        seg.chunks = expert_chunks(rows, layout["params"][name])
+        segs.append(seg)
     return segs
+
+
+def expert_chunks(rows: torch.Tensor, shape: list[int]) -> list[tuple]:
+    """(rows, n, expert) chunks of a segment: split where the expert changes (3-D weights) and by size."""
+    cols = shape[-1]
+    per_expert = shape[1] if len(shape) == 3 else None
+    eid = rows // per_expert if per_expert else torch.zeros_like(rows)
+    cut = [0, *(torch.nonzero(eid[1:] != eid[:-1]).flatten() + 1).tolist(), len(rows)]
+    out = []
+    for a, b in itertools.pairwise(cut):
+        part = _as_slice(rows[a:b])
+        out.extend((r, _len(r), int(eid[a])) for r in _chunk(part, b - a, cols))
+    return out
+
+
+def _len(rows: slice | torch.Tensor) -> int:
+    return rows.stop - rows.start if isinstance(rows, slice) else len(rows)
 
 
 def install(model: nn.Module, latents: dict[str, Latent], skip: set[str] = frozenset()) -> list:

@@ -17,7 +17,9 @@ Reference recipe: NVIDIA Nemotron 3.5 Bolt 74B-A9B 24GB (experts IQ2_XXS + QAD, 
 | `ggml_lib.py` | libggml's own encoder/decoder via ctypes (what llama-quantize runs) for every type ModelOpt lacks (IQ3_S, K-quants, ...). |
 | `fakequant.py` | Training-time fake quant from the layout: latents (fp16, stochastic rounding) served with each GGUF segment encoded in GGUF block order (ModelOpt for IQ1/IQ2/Q8_0, libggml otherwise); forward hooks swap served weights in one module at a time; the gradient is applied inside backward (momentum-free Adafactor, per expert). |
 | `train.py` | QAD driver: `--phase cache` (teacher top-K once), `train` (lossless gate, Jaccard top-K+rest, Bolt LR schedule), `export`. |
-| `qad_export.py` | Latents -> GGUF at the plan with the encoders training served; proves every quantized tensor is the latent rows/columns training encoded, re-reads and verifies every tensor and type. |
+| `qad_export.py` | Latents -> GGUF at the plan with the encoders training served; proves every quantized tensor is the latent rows/columns training encoded, re-reads and verifies every tensor and type. Writes the imatrix next to the GGUF (`<stem>.imatrix.gguf` + `.imatrix.pt`). |
+| `mtp.py` | MTP (nextn) head of Qwen3.5/3.6 checkpoints rebuilt from the trunk's own layer class (HF ForCausalLM drops `mtp.*`), loaded from the checkpoint, run as llama.cpp's `graph_mtp`; exported as `blk.<n_layer>.nextn.*` + `nextn_predict_layers`. |
+| `imatrix.py` | Importance matrix collected from the teacher during `--phase cache` (per expert for fused experts, MTP head included), saved as `imatrix.pt` and llama.cpp's `imatrix.gguf`; weights every encoder in training and export. |
 
 ```bash
 ENV=/root/anaconda3/envs/omk-modelopt/bin/python
@@ -37,20 +39,45 @@ Census on the real targets (text tower, default Bolt policy):
 QAD (one GPU; the teacher is cached, never resident while training):
 
 ```bash
-$ENV -m omk_qad.layout --model TEXT_CFG_DIR --out L.pt                  # config + tokenizer only; ~2.5 min CPU
-$ENV -m omk_qad.train --phase cache  --model M --cache C --data a.jsonl=3,b.parquet=1 --eval-data e.txt
-$ENV -m omk_qad.train --phase train  --model M --layout L.pt --cache C --out O
-$ENV -m omk_qad.train --phase export --model M --layout L.pt --load O/state.pt --gguf X.gguf   # no --load = PTQ floor
+$ENV -m omk_qad.layout --model TEXT_CFG_DIR --out L.pt [--rest IQ2_M] [--compare IQ2_M,IQ3_S,Q3_K_S,bolt]
+$ENV -m omk_qad.train --phase cache  --model M --layout L.pt --cache C --data a.jsonl=3,b.parquet=1 --eval-data e.txt
+$ENV -m omk_qad.train --phase train  --model M --layout L.pt --cache C --out O                 # stage 1
+$ENV -m omk_qad.train --phase train  --model M --layout L.pt --cache C --out O --stage 2 --branch NAME [...]
+$ENV -m omk_qad.train --phase export --model M --layout L.pt --load O/stage1/final.pt --gguf X.gguf   # no --load = PTQ floor
 ```
 
-IQ2_M layout (llama.cpp dry-run sizes), 2-bit class fixed at IQ2_XXS:
+**Layout.** The fixed (trained) classes default to routed/shared experts + dense MLP at IQ2_XXS (`--fixed`).
+Everything else follows a llama.cpp preset's rules (`--rest`: IQ2_M default, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_XS,
+IQ3_S, IQ3_M, Q2_K(_S), Q3_K_S/M, Q4_K_S/M, or `bolt` = Q8_0). `--override class=type` and
+`--override-regex 'pattern=type'` refine it, in the precedence fixed > class > regex > preset. A layout with
+no fixed class (pure llama.cpp IQ2_M) is refused. The MTP head defaults to Q4_K (`--mtp-type`, `rest`, or
+`--no-mtp`).
+
+**Runs.** `--phase cache` also collects the imatrix (first `--imatrix-seqs` training sequences, default 256);
+training and export use it (`--imatrix auto` = the cache's), and export refuses a different one than training
+used. Each run dir holds `last.pt` (rolling; written every `--save-every` 100 steps or `--save-minutes` 20,
+on pause and at the end) and `final.pt` when the stage completes. Pause with Ctrl-C / SIGTERM or
+`touch <run>/PAUSE`; relaunching the same command resumes from `last.pt`, and the result is bitwise identical
+to an uninterrupted run (CPU test). Stage 1 lives in `O/stage1`. Each stage 2 is `O/stage2/<branch>`,
+initialised weights-only from `O/stage1/final.pt` (`--init-from`), so several stage-2 recipes can start from
+one stage 1. A finished stage or branch is immutable (a relaunch is refused).
+
+Rest presets (llama.cpp dry-run sizes, `layout --compare`, MTP head at Q4_K included), 2-bit class fixed at IQ2_XXS:
+
+| rest | IQ2_M | IQ2_S | IQ3_XXS | IQ3_S | IQ3_M | Q2_K | Q3_K_S | Q3_K_M | bolt (Q8_0) |
+|---|---|---|---|---|---|---|---|---|---|
+| A3B-Coder (GB) | **7.18** | 7.16 | 7.21 | 7.32 | 7.33 | 7.20 | 7.25 | 7.34 | 8.51 |
+| 27B dense (GB) | **8.85** | 8.72 | 9.04 | 9.47 | 9.53 | 8.92 | 9.12 | 9.55 | 14.81 |
+
+IQ2_M breakdown:
 
 | Model | IQ2_XXS class | rest (llama.cpp IQ2_M rules) | Total |
 |---|---|---|---|
 | Qwen3.6-27B-A3B-Coder | routed + shared experts 5.99 GB | lm_head Q5_K, linear-attn Q4_K/IQ2_S, embed IQ3_S, attn IQ2_S/IQ3_S | **7.18 GB** |
 | Qwen3.6-27B dense | MLP 4.41 GB | linear-attn Q4_K/IQ2_S, lm_head Q5_K, embed IQ3_S, attn IQ2_S/IQ3_S/Q4_K | **8.85 GB** |
 
-Known gaps: the GGML CUDA extension is not yet built/tested here (CPU path only); ForCausalLM loading drops
-the MTP head, so exports carry none until it is grafted back from the base; the IQ2 re-encode cost per step on GPU is unmeasured (CPU reference encoder: ~1.3 M params/s); the token
-embedding is quantized at export only (IQ3_S encode is ~4 M params/s on CPU); no imatrix in the encoders yet;
-on-policy teacher rollouts are not generated yet (the cache takes any text/chat data).
+Known gaps: the GGML CUDA extension is not yet built/tested here (CPU path only); the IQ2 re-encode cost per
+step on GPU is unmeasured (CPU reference encoder: ~1.3 M params/s; libggml K-quants run on CPU, `--ggml-refresh N`);
+the token embedding is quantized at export only; on-policy teacher rollouts are not generated yet (the cache
+takes any text/chat data); the MTP head's draft acceptance in llama.cpp is wired (draft-mtp engages on the
+exported tiny model) but its numerical match to `graph_mtp` is only provable on a real head (GPU smoke).

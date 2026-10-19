@@ -71,6 +71,8 @@ def main() -> None:
             for b in batches:
                 m(input_ids=b.to(a.device))
 
+    if a.algorithm != "max":  # statistics need the per-expert eager loop (grouped_mm bypasses F.linear hooks)
+        model.config._experts_implementation = "eager"
     mtq.quantize(model, cfg, forward_loop)
     a.out.mkdir(parents=True, exist_ok=True)
     export_hf_checkpoint(model, export_dir=a.out)

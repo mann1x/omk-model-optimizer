@@ -43,19 +43,26 @@ SHRINK_MOE = {
 SHRINK_DENSE = {"intermediate_size": 512}
 
 
-def tiny_text_config(kind: str) -> dict:
-    """The reference text config with sizes shrunk (no weights downloaded)."""
+def tiny_text_config(kind: str, mtp: bool = False) -> dict:
+    """The reference text config with sizes shrunk (no weights downloaded); ``mtp`` keeps one MTP layer."""
     cfg = json.loads(Path(hf_hub_download(REFERENCE[kind], "config.json")).read_text())
     text = dict(cfg.get("text_config", cfg))
     text.update(SHRINK)
     text.update(SHRINK_MOE if kind == "moe" else SHRINK_DENSE)
-    text.pop("mtp_num_hidden_layers", None)
-    text.pop("mtp_use_dedicated_embeddings", None)
+    if mtp:
+        text["mtp_num_hidden_layers"] = 1
+        text["mtp_use_dedicated_embeddings"] = False
+    else:
+        text.pop("mtp_num_hidden_layers", None)
+        text.pop("mtp_use_dedicated_embeddings", None)
     return text
 
 
-def make_tiny(kind: str, out: Path, seed: int = 0, std: float = 0.05) -> Path:
-    """Build, randomise and save a tiny model of ``kind`` ("moe" | "dense") with the reference tokenizer."""
+def make_tiny(kind: str, out: Path, seed: int = 0, std: float = 0.05, mtp: bool = False) -> Path:
+    """Build, randomise and save a tiny model of ``kind`` ("moe" | "dense") with the reference tokenizer.
+
+    ``mtp`` adds one random MTP (nextn) layer saved as ``model-mtp.safetensors`` (checkpoint names ``mtp.*``).
+    """
     from transformers import (
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
@@ -63,7 +70,7 @@ def make_tiny(kind: str, out: Path, seed: int = 0, std: float = 0.05) -> Path:
         Qwen3_5TextConfig,
     )
 
-    text = tiny_text_config(kind)
+    text = tiny_text_config(kind, mtp)
     config_cls, model_cls = (
         (Qwen3_5MoeTextConfig, Qwen3_5MoeForCausalLM) if kind == "moe" else (Qwen3_5TextConfig, Qwen3_5ForCausalLM)
     )
@@ -80,6 +87,10 @@ def make_tiny(kind: str, out: Path, seed: int = 0, std: float = 0.05) -> Path:
     model = model.to(torch.bfloat16)
     out.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out)
+    if mtp:
+        from .mtp import save_random_weights
+
+        save_random_weights(model, out, std=std, seed=seed + 1)
     for fname in TOKENIZER_FILES:
         shutil.copy(hf_hub_download(REFERENCE[kind], fname), out / fname)
     return out
@@ -91,8 +102,9 @@ def main() -> None:
     ap.add_argument("--kind", choices=sorted(REFERENCE), required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mtp", action="store_true", help="add one random MTP (nextn) layer")
     a = ap.parse_args()
-    print(make_tiny(a.kind, a.out, a.seed))
+    print(make_tiny(a.kind, a.out, a.seed, mtp=a.mtp))
 
 
 if __name__ == "__main__":

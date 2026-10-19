@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-tensor GGUF layout of an HF causal LM: names, source rows/columns and the llama.cpp quant plan.
+r"""Per-tensor GGUF layout of an HF causal LM: names, source rows/columns and the llama.cpp quant plan.
 
 Two questions, both answered by llama.cpp itself rather than re-implemented here:
 
@@ -14,8 +14,12 @@ Two questions, both answered by llama.cpp itself rather than re-implemented here
      at a fixed format (e.g. experts at IQ2_XXS) are passed as ``--tensor-type`` overrides, so llama.cpp's
      own counters (first n/8 ffn_down, ...) behave as in a real llama-quantize run with those overrides.
 
-  python -m omk_qad.layout --model DIR --out LAYOUT.pt [--ftype IQ2_M]
+  python -m omk_qad.layout --model DIR --out LAYOUT.pt [--rest IQ2_M|IQ2_S|IQ3_XXS|Q2_K|...|bolt]
                            [--fixed routed_experts=iq2_xxs,shared_experts=iq2_xxs,dense_mlp=iq2_xxs]
+                           [--override linear_attn=q4_k] [--override-regex 'attn_v\.weight$=q6_k']
+                           [--compare IQ2_M,IQ2_S,IQ3_XXS,Q2_K,bolt]
+
+The fixed (QAD-trained) classes are mandatory: there is no pure llama.cpp-mix mode.
 
 DIR needs config.json and the tokenizer files only. LAYOUT.pt (torch) holds the index arrays; a JSON
 summary (types, sizes, per-class formats, unsupported tensors) is written beside it.
@@ -39,6 +43,14 @@ from .gguf_export import _import_llama_cpp
 log = logging.getLogger("omk_qad.layout")
 
 FLOAT_TYPES = {"F32", "F16", "BF16"}
+# The rest of the model follows a llama.cpp ftype's own rules; "bolt" = NVIDIA Bolt's map (Q8_0 for everything
+# not fixed; Bolt's NVFP4 Mamba projections have no verified llama.cpp path here).
+REST_PRESETS = ("IQ2_M", "IQ2_S", "IQ2_XS", "IQ3_XXS", "IQ3_XS", "IQ3_S", "IQ3_M", "Q2_K_S", "Q2_K", "Q3_K_S", "Q3_K_M",
+                "Q4_K_S", "Q4_K_M", "bolt")
+REST_ALIASES = {"bolt": "Q8_0"}
+# MTP (nextn) head: Q4_K like our published GGUFs' MTP-head override (an IQ2 head has no imatrix coverage and
+# drafts poorly); "rest" lets llama.cpp's own rules decide.
+DEFAULT_MTP_TYPE = "Q4_K"
 DEFAULT_FIXED = {"routed_experts": "iq2_xxs", "shared_experts": "iq2_xxs", "dense_mlp": "iq2_xxs"}
 _PLAN_LINE = re.compile(
     r"^\[\s*\d+/\s*\d+\]\s+(\S+)\s+- \[([^\]]*)\], type =\s*(\S+), size =.*?(?:->\s*[\d.]+ MiB \((\S+)\))?\s*$"
@@ -46,13 +58,17 @@ _PLAN_LINE = re.compile(
 _SIZE_LINE = re.compile(r"(model|quant) size\s*=\s*([\d.]+) MiB")
 
 
-def meta_text_model(model_dir: Path):
-    """The text causal LM of ``model_dir`` on the meta device (no weights read) and its text config."""
+def meta_text_model(model_dir: Path, mtp: bool = True):
+    """The text causal LM of ``model_dir`` on the meta device (no weights read), with its MTP head if declared."""
     from transformers import AutoConfig, AutoModelForCausalLM
+
+    from .mtp import attach, mtp_layers
 
     config = AutoConfig.from_pretrained(model_dir).get_text_config()
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
+        if mtp and mtp_layers(config):
+            attach(model)
     return model, config
 
 
@@ -72,6 +88,9 @@ def param_classes(model) -> dict[str, str]:
             if name.startswith(mod + ".") and (best is None or len(mod) > len(best[0])):
                 best = (mod, cls)
         out[name] = best[1] if best else ("vectors" if p.ndim <= 1 else "other")
+    for name in out:  # the MTP head is its own class (its own format), whatever its structure
+        if name.startswith("mtp."):
+            out[name] = "mtp"
     return out
 
 
@@ -93,7 +112,8 @@ def _probe(shape: tuple[int, ...], kind: str, src_id: int) -> torch.Tensor:
 
 
 def _converter_pass(
-    model_dir: Path, llama_cpp: Path, params: dict[str, tuple[int, ...]], kind: str, sink, sparse_out=None
+    model_dir: Path, llama_cpp: Path, params: dict[str, tuple[int, ...]], kind: str, sink, sparse_out=None,
+    mtp: bool = False,
 ):
     """Run llama.cpp's converter for ``model_dir``'s arch on index probes of ``kind``; ``sink(name, data)``."""
     gguf, get_model_architecture, get_model_class, text_type = _import_llama_cpp(llama_cpp)
@@ -103,7 +123,7 @@ def _converter_pass(
 
     class ProbeModel(base_cls):  # type: ignore[misc, valid-type]
         model_arch = base_cls.model_arch
-        no_mtp = True  # the text causal LM has no MTP head; see gguf_export
+        no_mtp = not mtp  # MTP tensors present -> the converter maps them to blk.<n_layer>.nextn.*
 
         def index_tensors(self, remote_hf_model_id=None):
             # Only the base, file-reading ModelBase.index_tensors is replaced, for this call: arch subclasses
@@ -156,20 +176,23 @@ def _converter_pass(
     writer.close()
 
 
-def _dry_run(llama_cpp: Path, sparse: Path, ftype: str, overrides: dict[str, str], work: Path) -> tuple[dict, dict]:
+def _dry_run(
+    llama_cpp: Path, sparse: Path, ftype: str, patterns: list[tuple[str, str]], work: Path
+) -> tuple[dict, dict]:
     """llama-quantize --dry-run plan: {gguf name: target type (upper)}, {"model": MiB, "quant": MiB}."""
     cmd = [str(llama_cpp / "build" / "bin" / "llama-quantize"), "--dry-run"]
-    if overrides:
-        tt = work / f"{sparse.stem}.tensor_types.txt"
-        tt.write_text("".join(f"^{re.escape(n)}$={t}\n" for n, t in sorted(overrides.items())))
+    if patterns:  # llama.cpp applies the FIRST matching pattern, so order is precedence
+        tt = work / f"{sparse.stem}.{ftype}.tensor_types.txt"
+        tt.write_text("".join(f"{pat}={t.lower()}\n" for pat, t in patterns))
         cmd += ["--tensor-type-file", str(tt)]
     cmd += [str(sparse), ftype]
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
     text = proc.stdout + proc.stderr
-    (work / f"{sparse.stem}.dry_run.log").write_text(text)
+    (work / f"{sparse.stem}.{ftype}.dry_run.log").write_text(text)
     if proc.returncode != 0:
-        raise SystemExit(f"llama-quantize --dry-run failed ({proc.returncode}): {work}/{sparse.stem}.dry_run.log")
+        log_file = work / f"{sparse.stem}.{ftype}.dry_run.log"
+        raise SystemExit(f"llama-quantize --dry-run {ftype} failed ({proc.returncode}): {log_file}")
     plan, sizes = {}, {}
     for line in text.splitlines():
         m = _PLAN_LINE.match(line.strip())
@@ -181,19 +204,20 @@ def _dry_run(llama_cpp: Path, sparse: Path, ftype: str, overrides: dict[str, str
     return plan, sizes
 
 
-def build_layout(model_dir: Path, llama_cpp: Path, ftype: str = "IQ2_M", fixed: dict[str, str] | None = None,
-                 work: Path | None = None) -> dict:
-    """Probe the converter and ask llama-quantize for the plan; returns the layout dict (see module doc)."""
+def probe_model(model_dir: Path, llama_cpp: Path, work: Path, mtp: bool = True) -> dict:
+    """Converter index probes (no weights read): per GGUF tensor its shape, source rows and column order.
+
+    Also writes the sparse shape-only GGUF every plan is computed from (``probe["sparse"]``).
+    """
     t0 = time.time()
-    fixed = DEFAULT_FIXED if fixed is None else fixed
-    model_dir = Path(model_dir)
-    work = Path(work or model_dir)
+    model_dir, work = Path(model_dir), Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    model, config = meta_text_model(model_dir)
+    model, _ = meta_text_model(model_dir, mtp)
     params = {n: tuple(p.shape) for n, p in model.named_parameters()}
     classes = param_classes(model)
     names = list(params)
     del model
+    has_mtp = any(n.startswith("mtp.") for n in names)
 
     # pass 1 (source ids) also writes the sparse shape-only GGUF; passes 2/3 give rows and columns
     src: dict[str, np.ndarray] = {}
@@ -212,7 +236,7 @@ def build_layout(model_dir: Path, llama_cpp: Path, ftype: str = "IQ2_M", fixed: 
         src[name] = first.astype(np.int64)
 
     sparse = work / "layout_shapes.gguf"
-    _converter_pass(model_dir, llama_cpp, params, "src", sink_src, sparse_out=sparse)
+    _converter_pass(model_dir, llama_cpp, params, "src", sink_src, sparse_out=sparse, mtp=has_mtp)
 
     rows_of: dict[str, np.ndarray] = {}
 
@@ -227,7 +251,7 @@ def build_layout(model_dir: Path, llama_cpp: Path, ftype: str = "IQ2_M", fixed: 
             return
         rows_of[name] = first.astype(np.int64)
 
-    _converter_pass(model_dir, llama_cpp, params, "row", sink_row)
+    _converter_pass(model_dir, llama_cpp, params, "row", sink_row, mtp=has_mtp)
 
     cols_of: dict[str, np.ndarray | None] = {}
 
@@ -250,53 +274,103 @@ def build_layout(model_dir: Path, llama_cpp: Path, ftype: str = "IQ2_M", fixed: 
             return
         cols_of[name] = None if np.array_equal(first, np.arange(cols)) else first.astype(np.int64)
 
-    _converter_pass(model_dir, llama_cpp, params, "col", sink_col)
+    _converter_pass(model_dir, llama_cpp, params, "col", sink_col, mtp=has_mtp)
+    # a transformed tensor (e.g. norm + 1) shifts the source-id probe too, so only proven mappings keep a source
+    source = {g: names[int(src[g][0])] for g in cols_of}
+    return {"model_dir": str(model_dir), "llama_cpp": str(llama_cpp), "params": params, "classes": classes,
+            "shapes": shapes, "source": source, "rows": rows_of, "cols": cols_of, "bad": bad, "sparse": sparse,
+            "work": work, "has_mtp": has_mtp, "seconds": round(time.time() - t0, 1)}
 
-    # overrides for fixed-format classes, by exact GGUF name
-    def source_of(g):
-        return names[int(src[g][0])] if g in src else None
 
-    overrides = {}
-    for g in shapes:
-        p = source_of(g)
-        if p is not None and g not in bad and classes.get(p) in fixed and len(shapes[g]) >= 2:
-            overrides[g] = fixed[classes[p]]
-    plan, sizes = _dry_run(llama_cpp, sparse, ftype, overrides, work)
+def _check_type(t: str, llama_cpp: Path) -> str:
+    gguf = _import_llama_cpp(Path(llama_cpp))[0]  # gguf-py must be llama.cpp's, never a pip gguf
+    name = t.upper()
+    if name not in gguf.GGMLQuantizationType.__members__:
+        raise SystemExit(f"unknown GGML type {t!r}")
+    return name
+
+
+def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None = None,
+                overrides: dict[str, str] | None = None, regex: dict[str, str] | None = None,
+                mtp_type: str = DEFAULT_MTP_TYPE) -> dict:
+    """The layout for one preset: ``fixed`` classes at their trained format, everything else per llama.cpp.
+
+    ``rest`` is the llama.cpp ftype whose rules plan the non-fixed tensors (or ``bolt`` = Q8_0 rest);
+    ``overrides`` force a type per census class, ``regex`` per GGUF-name pattern. Precedence (llama.cpp applies
+    the first matching pattern): fixed > class overrides > regex overrides > ``rest`` rules.
+    """
+    t0 = time.time()
+    fixed = DEFAULT_FIXED if fixed is None else fixed
+    if not fixed:
+        raise SystemExit("no fixed class: a pure llama.cpp mix is not a QAD layout (set --fixed)")
+    rest_ftype = REST_ALIASES.get(rest.lower(), rest.upper())
+    lc = probe["llama_cpp"]
+    fixed = {c: _check_type(t, lc) for c, t in fixed.items()}
+    overrides = {c: _check_type(t, lc) for c, t in (overrides or {}).items()}
+    regex = {r: _check_type(t, lc) for r, t in (regex or {}).items()}
+    if probe.get("has_mtp") and mtp_type.lower() != "rest":  # "rest": llama.cpp's own rules for the nextn block
+        overrides = {"mtp": _check_type(mtp_type, lc), **overrides}
+    if set(fixed) & set(overrides):
+        raise SystemExit(f"classes both fixed and overridden: {sorted(set(fixed) & set(overrides))}")
+    shapes, source, classes = probe["shapes"], probe["source"], probe["classes"]
+    exact: dict[str, str] = {}
+    for table in (fixed, overrides):
+        for g in shapes:
+            p = source.get(g)
+            if p is not None and classes.get(p) in table and len(shapes[g]) >= 2 and g not in exact:
+                exact[g] = table[classes[p]]
+    if not any(classes.get(source.get(g)) in fixed for g in exact):
+        raise SystemExit(f"no tensor of the fixed classes {sorted(fixed)} exists in this model")
+    patterns = [(f"^{re.escape(g)}$", t) for g, t in exact.items()] + list(regex.items())
+    plan, sizes = _dry_run(Path(probe["llama_cpp"]), probe["sparse"], rest_ftype, patterns, Path(probe["work"]))
     missing = sorted(set(shapes) - set(plan))
     if missing:
         raise SystemExit(f"llama-quantize plan lacks {len(missing)} tensors, e.g. {missing[:5]}")
 
     targets = {}
     for g, shape in shapes.items():
-        # a transformed tensor (e.g. norm + 1) shifts the source-id probe too, so its source is not trusted
-        p = source_of(g) if g in cols_of else None
+        p = source.get(g)
         targets[g] = {
             "shape": list(shape),
             "type": plan[g],
             "src": p,
             "cls": classes.get(p) if p else None,
-            "rows": torch.from_numpy(rows_of[g]) if g in rows_of else None,
-            "colperm": torch.from_numpy(cols_of[g]) if cols_of.get(g) is not None else None,
-            "mapping": "direct" if g in cols_of else f"unsupported: {bad.get(g, 'unknown')}",
+            "rows": torch.from_numpy(probe["rows"][g]) if p else None,
+            "colperm": torch.from_numpy(probe["cols"][g]) if p and probe["cols"][g] is not None else None,
+            "mapping": "direct" if p else f"unsupported: {probe['bad'].get(g, 'unknown')}",
         }
     by_param = defaultdict(list)
     for g, t in targets.items():
-        if t["src"] is not None and t["mapping"] == "direct":
+        if t["src"] is not None:
             by_param[t["src"]].append(g)
-    layout = {
-        "model_dir": str(model_dir),
-        "ftype": ftype,
+    return {
+        "model_dir": probe["model_dir"],
+        "ftype": rest_ftype,
+        "rest": rest,
         "fixed": fixed,
-        "llama_cpp": str(llama_cpp),
-        "params": {n: list(s) for n, s in params.items()},
+        "overrides": overrides,
+        "regex": regex,
+        "mtp": bool(probe.get("has_mtp")),
+        "mtp_type": mtp_type if probe.get("has_mtp") else None,
+        "llama_cpp": probe["llama_cpp"],
+        "params": {n: list(s) for n, s in probe["params"].items()},
         "classes": classes,
         "targets": targets,
         "by_param": dict(by_param),
         "sizes_mib": sizes,
-        "seconds": round(time.time() - t0, 1),
+        "seconds": round(probe["seconds"] + time.time() - t0, 1),
     }
-    sparse.unlink(missing_ok=True)
-    return layout
+
+
+def build_layout(model_dir: Path, llama_cpp: Path, rest: str = "IQ2_M", fixed: dict[str, str] | None = None,
+                 work: Path | None = None, overrides: dict[str, str] | None = None,
+                 regex: dict[str, str] | None = None, mtp: bool = True, mtp_type: str = DEFAULT_MTP_TYPE) -> dict:
+    """Probe + plan in one call (see :func:`probe_model`, :func:`plan_layout`)."""
+    probe = probe_model(model_dir, llama_cpp, Path(work or model_dir), mtp)
+    try:
+        return plan_layout(probe, rest, fixed, overrides, regex, mtp_type)
+    finally:
+        probe["sparse"].unlink(missing_ok=True)
 
 
 def summary(layout: dict) -> dict:
@@ -307,7 +381,12 @@ def summary(layout: dict) -> dict:
     return {
         "model_dir": layout["model_dir"],
         "ftype": layout["ftype"],
+        "rest": layout.get("rest", layout["ftype"]),
         "fixed": layout["fixed"],
+        "overrides": layout.get("overrides", {}),
+        "mtp": layout.get("mtp", False),
+        "mtp_type": layout.get("mtp_type"),
+        "regex": layout.get("regex", {}),
         "type_counts": dict(Counter(t["type"] for t in layout["targets"].values())),
         "per_class": {k: dict(v) for k, v in sorted(per_class.items())},
         "unsupported": {g: t["mapping"] for g, t in layout["targets"].items() if t["mapping"] != "direct"},
@@ -320,24 +399,49 @@ def summary(layout: dict) -> dict:
     }
 
 
+def _pairs(text: str) -> dict[str, str]:
+    return dict(kv.split("=", 1) for kv in text.split(",") if kv)
+
+
 def main() -> None:
     """CLI entry point."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--llama-cpp", type=Path, default=Path("/opt/llama.cpp"))
-    ap.add_argument("--ftype", default="IQ2_M")
+    ap.add_argument("--rest", "--ftype", dest="rest", default="IQ2_M",
+                    help=f"llama.cpp ftype whose rules plan the non-fixed tensors: {', '.join(REST_PRESETS)}")
     ap.add_argument("--fixed", default=",".join(f"{k}={v}" for k, v in DEFAULT_FIXED.items()),
-                    help="class=type pairs forced before llama.cpp plans the rest ('' = pure llama.cpp mix)")
+                    help="class=type pairs trained at a fixed format (required, non-empty)")
+    ap.add_argument("--override", default="", help="class=type pairs for non-fixed classes, e.g. linear_attn=q4_k")
+    ap.add_argument("--override-regex", action="append", default=[],
+                    help="GGUF-name regex=type (repeatable), e.g. 'attn_v\\.weight$=q6_k'")
+    ap.add_argument("--no-mtp", action="store_true", help="leave the MTP (nextn) head out even if declared")
+    ap.add_argument("--mtp-type", default=DEFAULT_MTP_TYPE, help="type of the MTP head tensors, or 'rest'")
+    ap.add_argument("--compare", default="", help="comma list of rest presets: print a size table, save --rest only")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    fixed = dict(kv.split("=", 1) for kv in a.fixed.split(",") if kv)
-    layout = build_layout(a.model, a.llama_cpp, a.ftype, fixed, work=a.out.parent)
+    fixed, overrides = _pairs(a.fixed), _pairs(a.override)
+    regex = dict(r.rsplit("=", 1) for r in a.override_regex)
     a.out.parent.mkdir(parents=True, exist_ok=True)
+    probe = probe_model(a.model, a.llama_cpp, a.out.parent, not a.no_mtp)
+    try:
+        if a.compare:
+            rows = []
+            for rest in a.compare.split(","):
+                lay = plan_layout(probe, rest, fixed, overrides, regex, a.mtp_type)
+                gb = lay["sizes_mib"].get("quant", float("nan")) * 2**20 / 1e9
+                types = Counter(t["type"] for t in lay["targets"].values() if t["cls"] not in fixed)
+                rows.append(f"{rest:8s} {gb:7.2f} GB   rest types: {dict(types.most_common())}")
+            print("\n".join(rows))
+        layout = plan_layout(probe, a.rest, fixed, overrides, regex, a.mtp_type)
+    finally:
+        probe["sparse"].unlink(missing_ok=True)
     torch.save(layout, a.out)
     s = summary(layout)
     a.out.with_suffix(".json").write_text(json.dumps(s, indent=1))
-    print(json.dumps({k: s[k] for k in ("type_counts", "per_class", "sizes_mib", "seconds")}, indent=1))
+    keys = ("rest", "fixed", "type_counts", "per_class", "sizes_mib", "seconds")
+    print(json.dumps({k: s[k] for k in keys}, indent=1))
     print(f"unsupported mappings: {len(s['unsupported'])} (quantized among them: {s['unsupported_quantized']})")
     print(f"permuted columns: {s['permuted_columns']}")
 

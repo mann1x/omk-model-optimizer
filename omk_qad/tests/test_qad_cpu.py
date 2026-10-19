@@ -21,6 +21,8 @@ _DEFAULT_WORK = "/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/back
 WORK = Path(os.environ.get("OMK_QAD_WORK", _DEFAULT_WORK)) / "qad"
 LLAMA_CPP = Path(os.environ.get("OMK_LLAMA_CPP", "/opt/llama.cpp"))
 CPU_ENV = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+TRAIN = ("--phase", "train", "--device", "cpu", "--bs", "2", "--lr", "1e-3", "--warmup", "1", "--latent-dtype", "fp16",
+         "--latent-min", "65536", "--loss-chunk", "32")
 
 
 def _run(*args: str) -> str:
@@ -31,47 +33,59 @@ def _run(*args: str) -> str:
 
 def _args(model: Path, **kw) -> argparse.Namespace:
     base = {"device": "cpu", "model": str(model), "beta2": 0.99, "clip": 1.0, "ggml_refresh": 1, "latent_dtype": "fp32",
-            "export_only": "embedding", "latent_min": 65536, "loss": "jaccard", "ce_weight": 0.0, "loss_chunk": 32}
+            "export_only": "embedding", "latent_min": 65536, "loss": "jaccard", "ce_weight": 0.0, "loss_chunk": 32,
+            "mtp": "train", "mtp_weight": 0.3, "imatrix": "none"}
     base.update(kw)
     return argparse.Namespace(**base)
 
 
-@pytest.fixture(scope="module")
-def setup():
-    """Sharp tiny MoE teacher (lm_head x10: a peaked target), its IQ2_M layout, a small teacher cache."""
+def _sharp(tiny: Path, sharp: Path) -> None:
+    """lm_head x10 copy of ``tiny`` (a peaked teacher target); the MTP file is carried over (HF drops mtp.*)."""
     from transformers import AutoModelForCausalLM
 
+    m = AutoModelForCausalLM.from_pretrained(tiny, dtype=torch.bfloat16)  # bf16 as the real checkpoints
+    with torch.no_grad():
+        m.lm_head.weight.mul_(10)
+    m.save_pretrained(sharp)
+    for f in tiny.iterdir():
+        if (f.suffix in (".json", ".txt", ".jinja") and f.name not in ("config.json", "generation_config.json")) or \
+                f.name == "model-mtp.safetensors":
+            (sharp / f.name).write_bytes(f.read_bytes())
+
+
+def _cache(model: Path, layout: Path, cache: Path, text: Path) -> Path:
+    """Small teacher cache + imatrix (resumes an older cache that has no imatrix yet)."""
+    if not (cache / "cache.json").exists() or not (cache / "imatrix.pt").exists():
+        _run("omk_qad.train", "--phase", "cache", "--model", str(model), "--cache", str(cache), "--layout", str(layout),
+             "--device", "cpu", "--data", str(text), "--eval-data", str(text), "--n-seq", "8", "--n-eval", "2",
+             "--seq", "64", "--shard", "4", "--llama-cpp", str(LLAMA_CPP))
+    return cache
+
+
+@pytest.fixture(scope="module")
+def setup():
+    """Sharp tiny MoE / dense / MoE+MTP teachers, their IQ2_M-rest layouts, small teacher caches with imatrix."""
     from omk_qad.layout import build_layout
     from omk_qad.tiny import make_tiny
 
     WORK.mkdir(parents=True, exist_ok=True)
     out = {}
-    for kind in ("moe", "dense"):
-        tiny = WORK / f"tiny_{kind}"
+    for name, kind, mtp in (("moe", "moe", False), ("dense", "dense", False), ("moe_mtp", "moe", True)):
+        tiny = WORK / f"tiny_{name}"
         if not (tiny / "config.json").exists():
-            make_tiny(kind, tiny)
-        sharp = WORK / f"tiny_{kind}_sharp"
+            make_tiny(kind, tiny, mtp=mtp)
+        sharp = WORK / f"tiny_{name}_sharp"
         if not (sharp / "config.json").exists():
-            m = AutoModelForCausalLM.from_pretrained(tiny, dtype=torch.bfloat16)  # bf16 as the real checkpoints
-            with torch.no_grad():
-                m.lm_head.weight.mul_(10)
-            m.save_pretrained(sharp)
-            for f in tiny.iterdir():
-                if f.suffix in (".json", ".txt", ".jinja") and f.name not in ("config.json", "generation_config.json"):
-                    (sharp / f.name).write_bytes(f.read_bytes())
-        lay = WORK / f"layout_{kind}.pt"
+            _sharp(tiny, sharp)
+        lay = WORK / f"layout2_{name}.pt"  # v2: carries rest/mtp (2026-10-19)
         if not lay.exists():
-            torch.save(build_layout(sharp, LLAMA_CPP, "IQ2_M", work=WORK), lay)
-        out[kind] = (sharp, lay)
+            torch.save(build_layout(sharp, LLAMA_CPP, "IQ2_M", work=WORK / f"lay_{name}"), lay)
+        out[name] = (sharp, lay)
     text = WORK / "text.txt"
     if not text.exists():
         text.write_text((LLAMA_CPP / "README.md").read_text()[:60000])
-    cache = WORK / "cache_moe"
-    if not (cache / "cache.json").exists():
-        _run("omk_qad.train", "--phase", "cache", "--model", str(out["moe"][0]), "--cache", str(cache),
-             "--device", "cpu", "--data", str(text), "--eval-data", str(text), "--n-seq", "8", "--n-eval", "2",
-             "--seq", "64", "--shard", "4")
-    out["cache"] = cache
+    out["cache"] = _cache(*out["moe"], WORK / "cache_moe", text)
+    out["cache_mtp"] = _cache(*out["moe_mtp"], WORK / "cache_moe_mtp", text)
     out["text"] = text
     return out
 
@@ -176,24 +190,31 @@ def test_train_export_verify_load(setup):
     from omk_qad import train as T
 
     model, lay = setup["moe"]
+    import shutil
+
     run, out = WORK / "run_moe", WORK / "qad_moe.gguf"
-    _run("omk_qad.train", "--phase", "train", "--model", str(model), "--layout", str(lay),
-         "--cache", str(setup["cache"]), "--out", str(run), "--device", "cpu", "--steps", "2", "--bs", "2",
-         "--lr", "1e-3", "--warmup", "1", "--eval-every", "2", "--save-every", "2", "--latent-dtype", "fp16",
-         "--latent-min", "65536", "--loss-chunk", "32")
-    log = (run / "log.txt").read_text()
-    assert "LOSSLESS_GATE" in log and "QAD_DONE" in log
-    res = json.loads((run / "summary.json").read_text())["results"]
+    if run.exists():
+        shutil.rmtree(run)  # this test's own scratch: a finished stage is immutable, so a rerun starts clean
+    _run("omk_qad.train", *TRAIN, "--model", str(model), "--layout", str(lay), "--cache", str(setup["cache"]),
+         "--out", str(run), "--steps", "2", "--eval-every", "2", "--save-every", "2")
+    s1 = run / "stage1"
+    log = (s1 / "log.txt").read_text()
+    assert "LOSSLESS_GATE" in log and "STAGE_DONE stage 1" in log and "QAD_DONE" in log
+    res = json.loads((s1 / "summary.json").read_text())["results"]
     assert [r["tag"] for r in res] == ["init", "step2"]
+    imat = str(setup["cache"] / "imatrix.pt")
+    assert torch.load(s1 / "final.pt", weights_only=False)["imatrix"] == imat  # recorded: export must reuse it
     _run("omk_qad.train", "--phase", "export", "--model", str(model), "--layout", str(lay), "--device", "cpu",
-         "--load", str(run / "state.pt"), "--gguf", str(out), "--latent-dtype", "fp16", "--latent-min", "65536")
+         "--load", str(s1 / "final.pt"), "--gguf", str(out), "--latent-dtype", "fp16", "--latent-min", "65536")
     rep = json.loads(out.with_suffix(".export.json").read_text())
     assert rep["verify_failures"] == [] and rep["type_mismatches"] == [] and rep["export_only"] == []
     assert rep["type_counts"]["IQ2_XXS"] == 4 * 6  # 4 layers x (gate/up/down exps + shexp)
+    assert rep["with_imatrix"] > 0 and out.with_suffix(".imatrix.gguf").exists()
 
-    # train == ship: the trained latents' served payloads are byte-identical to the GGUF tensors
-    student, lats, _, _, _ = T.build_student(_args(model, latent_dtype="fp16"), torch.load(lay, weights_only=False))
-    T.load_state(str(run / "state.pt"), lats, student, None)
+    # train == ship: the trained latents' served payloads (same imatrix) are byte-identical to the GGUF tensors
+    student, lats, _, _, _ = T.build_student(_args(model, latent_dtype="fp16", imatrix=imat),
+                                             torch.load(lay, weights_only=False))
+    T.load_state(str(s1 / "final.pt"), lats, student, None)
     tensors = {t.name: t for t in gguf.GGUFReader(out).tensors}
     checked = 0
     for lat in lats.values():
@@ -225,3 +246,138 @@ def test_dense_ptq_floor_export(setup):
     rep = json.loads(out.with_suffix(".export.json").read_text())
     assert rep["verify_failures"] == [] and rep["type_mismatches"] == []
     assert rep["type_counts"]["IQ2_XXS"] == 4 * 3
+
+
+def test_layout_presets_overrides_and_refusals(setup):
+    """Every rest preset keeps the fixed classes at IQ2_XXS; overrides apply; a pure llama.cpp mix is refused."""
+    from omk_qad.layout import plan_layout, probe_model, summary
+
+    model, _ = setup["moe"]
+    probe = probe_model(model, LLAMA_CPP, WORK / "lay_presets")
+    sizes = {}
+    for rest in ("IQ2_M", "IQ3_S", "Q3_K_S", "bolt"):
+        s = summary(plan_layout(probe, rest))
+        assert set(s["per_class"]["routed_experts"]) == {"IQ2_XXS"}, rest
+        assert set(s["per_class"]["shared_experts"]) == {"IQ2_XXS"}, rest
+        sizes[rest] = s["sizes_mib"]["quant"]
+    assert set(summary(plan_layout(probe, "bolt"))["per_class"]["attention"]) == {"Q8_0"}
+    assert sizes["IQ2_M"] < sizes["bolt"]
+
+    lay = plan_layout(probe, "IQ2_M", overrides={"attention": "Q6_K"}, regex={r"output\.weight": "Q8_0"})
+    s = summary(lay)
+    assert set(s["per_class"]["attention"]) == {"Q6_K"} and s["per_class"]["lm_head"] == {"Q8_0": 1}
+    with pytest.raises(SystemExit, match=r"pure llama\.cpp mix"):
+        plan_layout(probe, "IQ2_M", fixed={})
+    with pytest.raises(SystemExit, match="both fixed and overridden"):
+        plan_layout(probe, "IQ2_M", overrides={"routed_experts": "Q4_K"})
+
+
+def test_mtp_layout_imatrix_and_export(setup):
+    """MTP head: nextn tensors planned + trained-mapped; imatrix covers trunk, experts and MTP; GGUF ships it."""
+    sys.path.insert(0, str(LLAMA_CPP / "gguf-py"))
+    import gguf
+
+    model, lay_path = setup["moe_mtp"]
+    layout = torch.load(lay_path, weights_only=False)
+    assert layout["mtp"] and layout["mtp_type"] == "Q4_K"
+    n_layer = 4
+    nextn = {g: t for g, t in layout["targets"].items() if g.startswith(f"blk.{n_layer}.")}
+    assert {f"blk.{n_layer}.nextn.{k}.weight" for k in ("eh_proj", "enorm", "hnorm", "shared_head_norm")} <= set(nextn)
+    assert sum(t["type"] == "Q4_K" for t in nextn.values()) >= 10  # eh_proj + attention + experts + shared expert
+    for g, t in nextn.items():
+        if t["type"] not in ("F32", "F16", "BF16"):  # quantized: proven mtp.* rows/cols (norms/router stay float)
+            assert t["cls"] == "mtp" and t["mapping"] == "direct" and t["type"] == "Q4_K", g
+
+    # imatrix: every quantized tensor's source has data; routed-expert rows = top_k x the tokens the layer saw
+    rec = torch.load(setup["cache_mtp"] / "imatrix.pt", weights_only=False)
+    e = rec["entries"]
+    for g, t in layout["targets"].items():
+        if t["type"] not in ("F32", "F16", "BF16") and t["cls"] != "embedding":
+            assert t["src"] in e, g
+    top_k = 2
+    for pre in [f"model.layers.{i}." for i in range(n_layer)] + ["mtp.layers.0."]:
+        tokens = int(e[pre + "mlp.shared_expert.gate_proj.weight"]["counts"].sum())
+        assert tokens > 0, pre
+        for w in ("gate_up_proj", "down_proj"):
+            c = e[pre + f"mlp.experts.{w}"]["counts"]
+            assert int(c.sum()) == top_k * tokens and c.shape[0] == 8, (pre, w)
+    imat_gguf = setup["cache_mtp"] / "imatrix.gguf"
+    names = {t.name for t in gguf.GGUFReader(imat_gguf).tensors}
+    assert f"blk.{n_layer}.ffn_down_exps.weight.in_sum2" in names
+    assert f"blk.{n_layer}.nextn.eh_proj.weight.counts" in names
+
+    out = WORK / "ptq_moe_mtp.gguf"
+    _run("omk_qad.train", "--phase", "export", "--model", str(model), "--layout", str(lay_path), "--device", "cpu",
+         "--gguf", str(out), "--latent-min", "65536", "--imatrix", str(setup["cache_mtp"] / "imatrix.pt"))
+    rep = json.loads(out.with_suffix(".export.json").read_text())
+    assert rep["verify_failures"] == [] and rep["type_mismatches"] == [] and rep["export_only"] == []
+    quantized = {n for n, t in rep["tensors"].items() if t["how"] != "float"}
+    weighted = {n for n in quantized if rep["tensors"][n]["imatrix"]}
+    assert weighted == quantized - {"token_embd.weight"}  # a lookup table has no input activations
+    r = gguf.GGUFReader(out)
+    kv = {f.name: f.contents() for f in r.fields.values()}
+    assert kv["qwen35moe.nextn_predict_layers"] == 1 and kv["qwen35moe.block_count"] == n_layer + 1
+    assert out.with_suffix(".imatrix.gguf").exists() and out.with_suffix(".imatrix.pt").exists()
+
+    # llama.cpp consumes both artifacts: the model loads, and our imatrix.gguf drives an IQ2_XXS requantize
+    proc = subprocess.run(
+        [str(LLAMA_CPP / "build/bin/llama-perplexity"), "-m", str(out), "-f", str(setup["text"]), "-c", "128",
+         "--chunks", "2", "-t", "8", "-ngl", "0"],
+        capture_output=True, text=True, env=CPU_ENV, check=False,
+    )
+    assert proc.returncode == 0 and "Final estimate" in proc.stdout + proc.stderr, proc.stderr[-2000:]
+    proc = subprocess.run(
+        [str(LLAMA_CPP / "build/bin/llama-quantize"), "--allow-requantize", "--imatrix",
+         str(out.with_suffix(".imatrix.gguf")), str(out), str(WORK / "requant_iq2xxs.gguf"), "IQ2_XXS", "8"],
+        capture_output=True, text=True, env=CPU_ENV, check=False,
+    )
+    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
+
+
+def _train(model: Path, lay: Path, cache: Path, out: Path, *extra: str, check: bool = True):
+    cmd = [sys.executable, "-m", "omk_qad.train", *TRAIN, "--model", str(model), "--layout", str(lay),
+           "--cache", str(cache), "--out", str(out), "--steps", "3", "--eval-every", "3", "--save-every", "1", *extra]
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=CPU_ENV, check=False)
+    if check:
+        assert proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    return proc
+
+
+def test_pause_resume_is_bitwise_and_stage2_branches(setup):
+    """PAUSE mid-run + relaunch == straight run (bitwise); finished stages are immutable; stage-2 branches."""
+    import hashlib
+    import shutil
+
+    model, lay = setup["moe"]
+    a, b = WORK / "run_straight", WORK / "run_paused"
+    for d in (a, b):
+        if d.exists():
+            shutil.rmtree(d)  # test scratch of this test only
+    _train(model, lay, setup["cache"], a)
+    (b / "stage1").mkdir(parents=True)
+    (b / "stage1" / "PAUSE").touch()
+    p = _train(model, lay, setup["cache"], b)
+    assert "PAUSED at step 1" in p.stdout + p.stderr and not (b / "stage1" / "final.pt").exists()
+    assert not (b / "stage1" / "PAUSE").exists()  # consumed: the relaunch is not paused again
+    p = _train(model, lay, setup["cache"], b)
+    assert "RESUME from step 1" in p.stdout + p.stderr
+    fa = torch.load(a / "stage1" / "final.pt", weights_only=False)
+    fb = torch.load(b / "stage1" / "final.pt", weights_only=False)
+    assert fa["step"] == fb["step"] == 3
+    for k in ("latents", "fp"):
+        assert fa[k].keys() == fb[k].keys()
+        assert all(torch.equal(fa[k][n], fb[k][n]) for n in fa[k]), k
+
+    p = _train(model, lay, setup["cache"], a, check=False)
+    assert p.returncode != 0 and "immutable" in p.stdout + p.stderr
+
+    def sha():
+        return hashlib.sha256((a / "stage1" / "final.pt").read_bytes()).hexdigest()
+
+    before = sha()
+    _train(model, lay, setup["cache"], a, "--stage", "2", "--branch", "kl", "--loss", "kl")
+    meta = json.loads((a / "stage2" / "kl" / "final.json").read_text())
+    assert meta["stage"] == 2 and meta["init_from"] == str(a / "stage1" / "final.pt")
+    assert sha() == before
+    p = _train(model, lay, setup["cache"], a, "--stage", "2", check=False)
+    assert p.returncode != 0 and "--branch" in p.stdout + p.stderr

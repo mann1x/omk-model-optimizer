@@ -14,6 +14,7 @@ compared with the decode computed here, and every type is checked against the pl
 """
 
 import hashlib
+import itertools
 import json
 import logging
 import time
@@ -24,13 +25,36 @@ import torch
 
 from .fakequant import FLOAT_TYPES, Codec
 from .gguf_export import _import_llama_cpp
+from .imatrix import mean_sq
 
 log = logging.getLogger("omk_qad.qad_export")
 
 
+def _encode_rows(codec, qtype: str, x: torch.Tensor, eids: torch.Tensor, msq: torch.Tensor | None,
+                 colperm: torch.Tensor | None, device):
+    """Encode ``x`` [rows, cols] per run of equal expert id with that expert's importance (as training did)."""
+    from .imatrix import importance_for
+
+    cut = [0, *(torch.nonzero(eids[1:] != eids[:-1]).flatten() + 1).tolist(), len(eids)]
+    raws, decs = [], []
+    for a, b in itertools.pairwise(cut):
+        imp = None
+        if msq is not None:
+            m = msq[int(eids[a]) if msq.shape[0] > 1 else 0]
+            imp = importance_for(qtype, m[colperm] if colperm is not None else m)
+        payload = codec.encode(qtype, x[a:b].to(device), imp)
+        raws.append(codec.to_bytes(qtype, payload, b - a))
+        decs.append(codec.decode(qtype, payload, b - a, x.shape[1], "cpu").numpy())
+    return np.concatenate(raws), np.concatenate(decs)
+
+
 def export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path | None = None,
-                device: str | torch.device = "cpu") -> dict:
-    """Write ``model``'s current weights as a GGUF at ``layout``'s plan; returns the export report."""
+                device: str | torch.device = "cpu", imatrix: dict | None = None) -> dict:
+    """Write ``model``'s current weights as a GGUF at ``layout``'s plan; returns the export report.
+
+    ``imatrix`` (omk_qad.imatrix.load record: entries by HF name + metadata) weights the encoders exactly as in
+    training, and is saved next to the GGUF in llama.cpp's format (``<stem>.imatrix.gguf``).
+    """
     t0 = time.time()
     llama_cpp = Path(llama_cpp or layout["llama_cpp"])
     gguf, get_model_architecture, get_model_class, text_type = _import_llama_cpp(llama_cpp)
@@ -50,7 +74,7 @@ def export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path
 
     class LiveModel(base_cls):  # type: ignore[misc, valid-type]
         model_arch = base_cls.model_arch
-        no_mtp = True  # the text causal LM has no MTP head (gap: graft it from the base)
+        no_mtp = not any(n.startswith("mtp.") for n in names)  # model.mtp (omk_qad.mtp) -> blk.<n>.nextn.*
 
         def index_tensors(self, remote_hf_model_id=None):
             from conversion.base import ModelBase
@@ -95,12 +119,20 @@ def export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path
             if not torch.equal(src, x):
                 raise SystemExit(f"{name}: converter values differ from the layout's latent rows/columns")
             how = "trained-blocks"
-        payload = codec.encode(t["type"], x.to(device))
-        decoded = codec.decode(t["type"], payload, rows_n, cols, "cpu").numpy()
-        raw = codec.to_bytes(t["type"], payload, rows_n).reshape(*data.shape[:-1], -1)
+        src_shape = layout["params"].get(t["src"]) if t["src"] else None
+        if t["mapping"] == "direct" and len(src_shape) == 3:
+            eids = t["rows"].long() // src_shape[1]
+        else:
+            eids = torch.zeros(rows_n, dtype=torch.long)
+        entries = imatrix["entries"] if imatrix else {}
+        msq = mean_sq(entries[t["src"]]) if t["src"] in entries else None
+        perm = t["colperm"].long() if t["colperm"] is not None else None
+        raw, decoded = _encode_rows(codec, t["type"], x, eids, msq, perm, device)
+        raw = raw.reshape(*data.shape[:-1], -1)
+        report["tensors"].setdefault(name, {})["imatrix"] = msq is not None
         real_add(name, raw, raw_dtype=codec.qtype(t["type"]))
         expected[name] = hashlib.sha256(np.ascontiguousarray(decoded).tobytes()).hexdigest()
-        report["tensors"][name] = {"type": t["type"], "how": how}
+        report["tensors"][name] = {"type": t["type"], "how": how, "imatrix": msq is not None}
 
     writer.add_tensor = add_tensor
     conv.write()
@@ -130,6 +162,18 @@ def export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path
         size_bytes=out.stat().st_size,
         seconds=round(time.time() - t0, 1),
     )
+    if imatrix:
+        from .imatrix import save as save_imatrix
+
+        side = out.with_suffix("")
+        side.mkdir(exist_ok=True)
+        save_imatrix(imatrix["entries"], layout, side, imatrix["datasets"], imatrix["chunk_size"],
+                     imatrix["chunk_count"], llama_cpp)
+        (side / "imatrix.gguf").replace(out.with_suffix(".imatrix.gguf"))
+        (side / "imatrix.pt").replace(out.with_suffix(".imatrix.pt"))
+        side.rmdir()
+        report["imatrix"] = str(out.with_suffix(".imatrix.gguf"))
+    report["with_imatrix"] = sum(1 for v in report["tensors"].values() if v.get("imatrix"))
     out.with_suffix(".export.json").write_text(json.dumps(report, indent=1))
     if bad or wrong_type:
         raise SystemExit(f"EXPORT VERIFY FAILED: {len(bad)} decode mismatches, {len(wrong_type)} type mismatches")
