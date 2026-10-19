@@ -55,7 +55,7 @@ def _sharp(tiny: Path, sharp: Path) -> None:
 
 def _cache(model: Path, layout: Path, cache: Path, text: Path) -> Path:
     """Small teacher cache + imatrix (resumes an older cache that has no imatrix yet)."""
-    if not (cache / "cache.json").exists() or not (cache / "imatrix.pt").exists():
+    if not all((cache / f).exists() for f in ("cache.json", "imatrix.pt", "imatrix.folded.pt")):  # M3 backfills
         _run("omk_qad.train", "--phase", "cache", "--model", str(model), "--cache", str(cache), "--layout", str(layout),
              "--device", "cpu", "--data", str(text), "--eval-data", str(text), "--n-seq", "8", "--n-eval", "2",
              "--seq", "64", "--shard", "4", "--llama-cpp", str(LLAMA_CPP))
@@ -602,3 +602,54 @@ def test_ternary_stage2_branch_from_iq2_stage1(setup):
     student, lats, _, _, _ = T.build_student(_args(model, latent_dtype="fp16"), torch.load(lay, weights_only=False))
     with pytest.raises(SystemExit, match="stored folded"):
         T.load_state(str(run / "stage2" / "ternary" / "final.pt"), lats, student, None, weights_only=True)
+
+
+# --- folded-basis imatrix (plan M3) -------------------------------------------------------------------------------
+def test_folded_imatrix_is_the_folded_statistic(setup):
+    """Collector's folded sums == sum((H s x[:, perm])^2) of the hooked inputs; trace preserved; not a reorder."""
+    from omk_qad.imatrix import Collector, folded_candidates
+    from omk_qad.ptq import load_text_causal_lm
+
+    model, lay = setup["dense_tied"]
+    layout = torch.load(lay, weights_only=False)
+    cand = folded_candidates(layout)
+    out_proj = next(n for n in cand if n.endswith("linear_attn.out_proj.weight"))
+    assert cand[out_proj] is not None  # ssm_out: the converter's V-head column reorder is carried
+    m, _ = load_text_causal_lm(str(model), "cpu", torch.float32)
+    m.requires_grad_(False)
+    seen = {}
+    mod = m.get_submodule(out_proj.rsplit(".", 1)[0])
+    h = mod.register_forward_pre_hook(lambda _m, args: seen.setdefault("x", []).append(args[0].detach().clone()))
+    col = Collector(m, folded=cand)
+    x = torch.load(setup["cache_tied"] / "train_0000.pt")["x"][:2].long()
+    with torch.no_grad():
+        m(input_ids=x)
+    col.close()
+    h.remove()
+    st, fst = col.state(), col.folded_state()
+    xin = torch.cat(seen["x"]).reshape(-1, mod.in_features).float()
+    want = col.basis(xin.shape[-1]).fold(xin[:, cand[out_proj]]).double().square().sum(0)
+    assert torch.allclose(fst[out_proj]["sums"][0], want, rtol=1e-5)
+    for n in fst:  # orthogonal fold: the total energy per expert is the same in both bases
+        assert torch.allclose(fst[n]["sums"].sum(-1), st[n]["sums"].sum(-1), rtol=1e-5), n
+    model_diag = st[out_proj]["sums"][0][cand[out_proj]]
+    assert not torch.allclose(fst[out_proj]["sums"][0].sort().values, model_diag.sort().values, rtol=1e-2)
+
+
+def test_ternary_student_uses_the_folded_imatrix(setup):
+    from omk_qad import train as T
+
+    model, lay = setup["dense_tied"]
+    tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
+    cache = setup["cache_tied"]
+    rec = torch.load(cache / "imatrix.folded.pt", weights_only=False)
+    assert rec["basis"] == "seeded" and rec["entries"]
+    layout = torch.load(tl, weights_only=False)
+    _, plain, _, _, _ = T.build_student(_args(model, ternary_method="opt"), layout)
+    _, weighted, _, _, _ = T.build_student(_args(model, ternary_method="opt", imatrix=str(cache / "imatrix.pt")),
+                                           layout)
+    tern = [n for n, lat in weighted.items() if lat.basis is not None]
+    assert tern and all(weighted[n].msq is not None for n in tern)
+    assert all(weighted[n].msq.shape[-1] == weighted[n].cols for n in tern)
+    changed = sum(not torch.equal(weighted[n].served(), plain[n].served()) for n in tern)
+    assert changed == len(tern)  # importance moves the weighted-L2 optimum of every ternary weight

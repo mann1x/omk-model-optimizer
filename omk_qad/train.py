@@ -126,15 +126,19 @@ def phase_cache(a) -> None:
         return i.to(torch.int32).cpu(), v.to(torch.float16).cpu(), nll
 
     def save_imatrix():
-        from .imatrix import save
+        from .imatrix import save, save_folded
 
         col, imat["collector"] = imat["collector"], None
         col.close()
         if not imat["seqs"]:
             raise SystemExit("imatrix: no sequence reached the collector; refusing to save an empty imatrix")
         layout = torch.load(a.layout, weights_only=False) if a.layout else None
-        paths = save(col.state(), layout, Path(a.cache), [p for p, _ in srcs], a.seq, imat["seqs"],
-                     Path(a.llama_cpp))
+        datasets = [p for p, _ in srcs]
+        paths = []
+        if not (Path(a.cache) / "imatrix.pt").exists():  # never overwrite an imatrix (it is part of provenance)
+            paths += save(col.state(), layout, Path(a.cache), datasets, a.seq, imat["seqs"], Path(a.llama_cpp))
+        if col.fsums:
+            paths.append(save_folded(col.folded_state(), Path(a.cache), datasets, a.seq, imat["seqs"]))
         say(f"IMATRIX from {imat['seqs']} x {a.seq} tokens ({len(col.sums)} weights) -> {[str(q) for q in paths]}")
 
     passes: list = []
@@ -148,12 +152,14 @@ def phase_cache(a) -> None:
         f"{ev['val'].float().exp().sum(-1).mean().item():.4f}")
 
     srcs = [(q.split("=")[0], float(q.split("=")[1]) if "=" in q else 1.0) for q in a.data.split(",") if q]
-    if a.imatrix_seqs and not (Path(a.cache) / "imatrix.pt").exists():
-        from .imatrix import Collector
+    want_folded = bool(a.layout) and not (Path(a.cache) / "imatrix.folded.pt").exists()
+    if a.imatrix_seqs and (not (Path(a.cache) / "imatrix.pt").exists() or want_folded):
+        from .imatrix import Collector, folded_candidates
 
-        imat["collector"] = Collector(teacher)  # training-stream sequences only (eval rows were done above)
+        folded = folded_candidates(torch.load(a.layout, weights_only=False)) if want_folded else None
+        imat["collector"] = Collector(teacher, folded=folded)  # training-stream rows only (eval rows done above)
         if not a.layout:
-            say("WARNING: no --layout: imatrix.pt only; imatrix.gguf (llama.cpp format) is written at export")
+            say("WARNING: no --layout: imatrix.pt only (no imatrix.gguf, no folded statistic for ternary students)")
     streams = [_packed(p, tok, a.seq, tok.eos_token_id, passes) for p, _ in srcs]
     rng, n_src = random.Random(a.seed), [0] * len(srcs)
     t0 = time.time()
@@ -225,8 +231,23 @@ def build_student(a, layout: dict):
             if lat.segments and n in rec["entries"]:
                 lat.set_imatrix(mean_sq(rec["entries"][n]).to(a.device))
         folded = [n for n, lat in latents.items() if lat.basis is not None]
-        say(f"imatrix {a.imatrix}: {len(latents) - len(missing) - len(folded)} latents weighted; without data: "
-            f"{missing[:6]}; ternary (folded basis, model-basis imatrix not applicable): {len(folded)}")
+        fpath = Path(a.imatrix).with_name("imatrix.folded.pt")
+        weighted_f = 0
+        if folded and fpath.exists():
+            rec_f = load_imatrix(fpath)
+            if rec_f.get("basis") != "seeded":
+                raise SystemExit(f"{fpath}: basis {rec_f.get('basis')!r}, this trainer folds with seeded signs")
+            for n in folded:
+                e = rec_f["entries"].get(n)
+                if e is None:
+                    continue
+                if e["block"] != latents[n].basis.block:
+                    raise SystemExit(f"{fpath}: {n} block {e['block']} != the student's {latents[n].basis.block}")
+                latents[n].set_imatrix(mean_sq(e).to(a.device), folded=True)
+                weighted_f += 1
+        say(f"imatrix {a.imatrix}: {len(latents) - len(missing) - len(folded)} model-basis latents weighted; "
+            f"without data: {missing[:6]}; ternary: {weighted_f}/{len(folded)} weighted from "
+            f"{fpath.name if weighted_f else '- (no folded statistic)'}")
     tied = head_param is student.get_input_embeddings().weight
     install(student, latents, skip=set() if tied else {head_name})
     student.config.use_cache = False
@@ -482,6 +503,9 @@ def phase_train(a) -> None:
     opt = torch.optim.AdamW(fp_params, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0) if fp_params else None
     last_ck = run / "last.pt"
     origin = {"cache": a.cache, "layout": a.layout, "imatrix": a.imatrix}
+    fpath = Path(a.imatrix).with_name("imatrix.folded.pt") if a.imatrix != "none" else None
+    if fpath is not None and fpath.exists():
+        origin["imatrix_folded"] = str(fpath)
     results: list = []
     start = 1
     resume = a.load or (str(last_ck) if last_ck.exists() else "")

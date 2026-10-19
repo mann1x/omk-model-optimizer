@@ -264,11 +264,17 @@ class Latent:
                 k += 1
         return out.reshape(self.shape)
 
-    def set_imatrix(self, msq: torch.Tensor | None) -> None:
-        """E[x^2] [E, C] of this weight's inputs (omk_qad.imatrix.mean_sq); invalidates cached encodings."""
+    def set_imatrix(self, msq: torch.Tensor | None, folded: bool = False) -> None:
+        """E[x^2] [E, C] of this weight's inputs (omk_qad.imatrix.mean_sq); invalidates cached encodings.
+
+        A ternary (folded) latent takes only the folded statistic (``folded=True``: E[(H s x)^2], GGUF column
+        order); the model-basis diagonal is not the folded one (the rotation mixes columns) and is ignored.
+        """
         if msq is not None and msq.shape[-1] != self.cols:
             raise ValueError(f"{self.name}: imatrix width {msq.shape[-1]} != {self.cols}")
-        if self.basis is not None:  # the model-basis diagonal is not the folded one (the rotation mixes columns)
+        if folded and self.basis is None:
+            raise ValueError(f"{self.name}: a folded-basis imatrix for a model-basis latent")
+        if self.basis is not None and not folded:
             msq = None
         self.msq, self._imp, self._cache = msq, {}, {}
 
@@ -281,7 +287,7 @@ class Latent:
             from .imatrix import importance_for
 
             m = self.msq[expert if self.msq.shape[0] > 1 else 0]
-            if seg.colperm is not None:
+            if seg.colperm is not None and self.basis is None:  # a folded statistic is already in GGUF order
                 m = m[seg.colperm]
             self._imp[key] = importance_for(seg.qtype, m)
         return self._imp[key]

@@ -27,12 +27,21 @@ import torch.nn.functional as F
 
 
 class Collector:
-    """Accumulates sum(x^2) per input column and row counts for every 2-D+ weight of ``model``."""
+    """Accumulates sum(x^2) per input column and row counts for every 2-D+ weight of ``model``.
 
-    def __init__(self, model: nn.Module, names: set[str] | None = None):
+    ``folded`` {weight name: GGUF column order or None} also accumulates the ternary students' statistic,
+    sum((H s x)^2) with x in GGUF column order (omk_qad.ternary.HadamardBasis, seeded signs): a ternary latent
+    lives in that basis, and the rotation mixes columns, so the model-basis diagonal does not carry over.
+    """
+
+    def __init__(self, model: nn.Module, names: set[str] | None = None,
+                 folded: dict[str, torch.Tensor | None] | None = None):
         """Hook every Linear (and fused-experts module) whose weight name is in ``names`` (default: all)."""
         self.sums: dict[str, torch.Tensor] = {}
         self.counts: dict[str, torch.Tensor] = {}
+        self.fsums: dict[str, torch.Tensor] = {}
+        self.folded = {n: (None if perm is None else perm.long(), None) for n, perm in (folded or {}).items()}
+        self._bases: dict = {}  # input width -> omk_qad.ternary.HadamardBasis
         self.handles = []
         # transformers' fused experts default to grouped_mm (torch._grouped_mm, no F.linear): the per-expert
         # eager loop computes the same thing and is what F.linear interception sees; restored by close()
@@ -58,13 +67,28 @@ class Collector:
         if self.n_fused and self._impl not in (None, "eager"):
             model.config._experts_implementation = "eager"
 
+    def basis(self, width: int):
+        """The seeded Hadamard basis of an input width (shared by every weight of that width)."""
+        from .ternary import HadamardBasis
+
+        if width not in self._bases:
+            self._bases[width] = HadamardBasis(width)
+        return self._bases[width]
+
     def _add(self, name: str, x: torch.Tensor, expert: int, n_expert: int) -> None:
-        x = x.detach().reshape(-1, x.shape[-1]).double()
+        x = x.detach().reshape(-1, x.shape[-1])
+        xd = x.double()
         if name not in self.sums:
             self.sums[name] = torch.zeros(n_expert, x.shape[-1], dtype=torch.float64, device=x.device)
             self.counts[name] = torch.zeros(n_expert, dtype=torch.int64, device=x.device)
-        self.sums[name][expert] += x.square().sum(0)
+            if name in self.folded:
+                self.fsums[name] = torch.zeros(n_expert, x.shape[-1], dtype=torch.float64, device=x.device)
+        self.sums[name][expert] += xd.square().sum(0)
         self.counts[name][expert] += x.shape[0]
+        if name in self.folded:
+            perm = self.folded[name][0]
+            xf = x.float()[:, perm.to(x.device)] if perm is not None else x.float()
+            self.fsums[name][expert] += self.basis(x.shape[-1]).fold(xf).double().square().sum(0)
 
     def _linear_hook(self, name: str):
         def hook(module, args):
@@ -107,6 +131,11 @@ class Collector:
     def state(self) -> dict:
         """{param name: {"sums", "counts"}} on CPU."""
         return {n: {"sums": self.sums[n].cpu(), "counts": self.counts[n].cpu()} for n in self.sums}
+
+    def folded_state(self) -> dict:
+        """{param name: {"sums" (folded basis, GGUF column order), "counts", "block"}} on CPU."""
+        return {n: {"sums": self.fsums[n].cpu(), "counts": self.counts[n].cpu(),
+                    "block": self.basis(self.fsums[n].shape[-1]).block} for n in self.fsums}
 
 
 class _Restore:
@@ -189,3 +218,30 @@ def load(path: Path) -> dict:
     rec = torch.load(path, map_location="cpu", weights_only=False)
     rec["path"] = str(path)
     return rec
+
+
+def folded_candidates(layout: dict) -> dict[str, torch.Tensor | None]:
+    """Weights a ternary student could fold.
+
+    2-D+ sources of quantizable targets with one GGUF column order and an input width a Hadamard block fits
+    (omk_qad.ternary.hadamard_block).
+    """
+    out: dict[str, torch.Tensor | None] = {}
+    for p, gs in layout["by_param"].items():
+        shape = layout["params"][p]
+        if len(shape) < 2 or shape[-1] % 256:
+            continue
+        perms = {None if layout["targets"][g]["colperm"] is None else tuple(layout["targets"][g]["colperm"].tolist())
+                 for g in gs}
+        if len(perms) == 1:
+            perm = next(iter(perms))
+            out[p] = None if perm is None else torch.tensor(perm)
+    return out
+
+
+def save_folded(fimat: dict, out_dir: Path, datasets: list[str], chunk_size: int, chunks: int) -> Path:
+    """``imatrix.folded.pt``: the ternary students' statistic, with the basis it was computed in."""
+    path = Path(out_dir) / "imatrix.folded.pt"
+    torch.save({"entries": fimat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks,
+                "basis": "seeded"}, path)
+    return path
