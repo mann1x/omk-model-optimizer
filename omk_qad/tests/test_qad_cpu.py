@@ -446,3 +446,159 @@ def test_tied_train_export_verify_load(setup):
         capture_output=True, text=True, env=CPU_ENV, check=False,
     )
     assert proc.returncode == 0 and "Final estimate" in proc.stdout + proc.stderr, proc.stderr[-2000:]
+
+
+# --- ternary student (plan M2): PQ2_0 latents in the Hadamard-folded basis ------------------------------------------
+TERNARY_CLASSES = ("attention", "linear_attn", "dense_mlp", "lm_head")  # bonsai4b's set (tied embedding = head)
+
+
+def _ternary_layout(lay_path: Path, out: Path, qtype: str = "PQ2_0") -> Path:
+    """The IQ2_M-rest layout with every quantized tensor of TERNARY_CLASSES set to a ternary type (M4 stand-in)."""
+    lay = torch.load(lay_path, weights_only=False)
+    for t in lay["targets"].values():
+        if t["cls"] in TERNARY_CLASSES and t["type"] not in ("F32", "F16", "BF16"):
+            t["type"] = qtype
+    torch.save(lay, out)
+    return out
+
+
+def test_hadamard_basis():
+    from omk_qad.ternary import HadamardBasis, hadamard_block
+
+    assert (hadamard_block(2560), hadamard_block(9216), hadamard_block(256)) == (512, 1024, 256)  # Qwen3.5-4B
+    for width in (256, 512, 2560):
+        b = HadamardBasis(width)
+        w = torch.randn(5, width, generator=torch.Generator().manual_seed(width))
+        assert torch.allclose(b.unfold(b.fold(w)), w, atol=1e-5)
+        assert torch.allclose(b.fold(w).norm(dim=-1), w.norm(dim=-1), rtol=1e-5)  # orthogonal
+
+
+def test_ternary_student_serves_ternary_with_exact_gradients(setup):
+    """Served = unfold(ternary); bypass = the original weights; the folded-latent gradient == fold(autograd)."""
+    from omk_qad import train as T
+    from omk_qad.ptq import load_text_causal_lm
+    from omk_qad.ternary import decode, unpack
+
+    model, lay = setup["dense_tied"]
+    tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
+    a = _args(model, ce_weight=0.3, loss_chunk=24, mtp="freeze", latent_dtype="fp32")
+    student, lats, fp, ctl, head = T.build_student(a, torch.load(tl, weights_only=False))
+    tern = {n for n, lat in lats.items() if lat.basis is not None}
+    assert head in tern and any(".mlp." in n for n in tern) and any(".linear_attn." in n for n in tern)
+    ref, _ = load_text_causal_lm(a.model, "cpu", torch.float32)
+    ref_w = dict(ref.named_parameters())
+
+    for n in tern:
+        lat = lats[n]
+        ctl.bypass = True
+        assert torch.allclose(lat.served(), ref_w[n].detach(), atol=1e-5), n  # fold is lossless
+        ctl.bypass = False
+        served = lat.served().reshape(lat.rows, lat.cols)
+        lat.payloads()
+        q = torch.zeros(lat.rows, lat.cols)  # folded ternary values placed at their latent rows (GGUF may reorder)
+        nnz, k = [], 0
+        for seg in lat.segments:
+            for rows, _, _ in seg.chunks:
+                t, d = unpack("PQ2_0", lat._cache[k][2], lat.cols)
+                q[rows] = decode(t, d)
+                nnz.append(t.reshape(t.shape[0], -1, 128).ne(0).sum(-1).reshape(-1))
+                k += 1
+        nnz = torch.cat(nnz)
+        # PrismML's top-86 in the folded basis; bf16 source weights can tie at the threshold (ties are kept)
+        assert bool((nnz >= 86).all()) and float((nnz == 86).float().mean()) > 0.9, n
+        assert torch.allclose(lat._to_latent(served), q, atol=1e-5 * float(q.abs().max())), n
+
+    sh = torch.load(setup["cache_tied"] / "train_0000.pt")
+    x, idx, val = sh["x"][:2].long(), sh["idx"][:2], sh["val"][:2]
+    cap = {}
+    for n, lat in lats.items():
+        lat.update = lambda g, n=n: cap.__setitem__(n, g.clone())
+    trunk = {n for n in lats if not n.startswith("mtp.")}
+    served = {n: lats[n].served().clone() for n in trunk}
+    T.train_step(student, lats, lats[head], fp, None, x, idx, val, a)
+    assert set(cap) == trunk and ctl.stats["undelivered"] == 0
+    named = dict(student.named_parameters())
+    fp_names = [n for n, p in named.items() if p.requires_grad and not n.startswith("mtp.")]
+    leaves = {n: t.clone().requires_grad_() for n, t in served.items()}
+    fpl = {n: named[n].detach().clone().requires_grad_() for n in fp_names}
+    lg = torch.func.functional_call(ref, {**leaves, **fpl}, (x,)).logits[:, :-1].float()
+    j, _, ce, _ = T.token_terms(lg.reshape(-1, lg.shape[-1]), idx.reshape(-1, idx.shape[-1]),
+                               val.reshape(-1, val.shape[-1]), x[:, 1:].reshape(-1))
+    ((j.sum() + a.ce_weight * ce.sum()) / j.numel()).backward()
+    for n, g in cap.items():
+        lat = lats[n]
+        r = leaves[n].grad
+        if lat.basis is not None:  # the update sees the folded gradient
+            r = lat._to_latent(r.reshape(lat.rows, lat.cols)).reshape(lat.shape)
+        assert r.norm() > 0, n
+        assert (g - r).norm() / r.norm() < 1e-4, n
+
+
+def test_ternary_student_descends_on_one_batch(setup):
+    from omk_qad import train as T
+
+    model, lay = setup["dense_tied"]
+    tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
+    a = _args(model, loss_chunk=64, loss="kl", mtp="freeze")
+    student, lats, fp, ctl, head = T.build_student(a, torch.load(tl, weights_only=False))
+    opt = torch.optim.AdamW(fp, lr=3e-3, betas=(0.9, 0.95), weight_decay=0.0)
+    sh = torch.load(setup["cache_tied"] / "train_0000.pt")
+    x, idx, val = sh["x"][:1].long(), sh["idx"][:1], sh["val"][:1]
+    ctl.lr = 3e-3
+    hist = []
+    for s in range(1, 16):
+        ctl.step = s
+        hist.append(T.train_step(student, lats, lats[head], fp, opt, x, idx, val, a))
+    assert np.mean(hist[-3:]) < 0.9 * hist[0], hist
+
+
+def test_ternary_train_cli_and_export_guard(setup):
+    """CLI: lossless gate passes through the fold, 2 steps train and checkpoint; export refuses until M4."""
+    import shutil
+
+    model, lay = setup["dense_tied"]
+    tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
+    run = WORK / "run_tied_ternary"
+    if run.exists():
+        shutil.rmtree(run)  # this test's own scratch
+    out = _run("omk_qad.train", *TRAIN, "--model", str(model), "--layout", str(tl), "--cache",
+               str(setup["cache_tied"]), "--out", str(run), "--steps", "2", "--eval-every", "2", "--save-every", "2",
+               "--lr", "6e-5", "--loss", "kl")
+    log = (run / "stage1" / "log.txt").read_text()
+    assert "LOSSLESS_GATE" in log and "STAGE_DONE" in log and "ternary" in out + log
+    proc = subprocess.run([sys.executable, "-m", "omk_qad.train", "--phase", "export", "--model", str(model),
+                           "--layout", str(tl), "--device", "cpu", "--load", str(run / "stage1" / "final.pt"),
+                           "--gguf", str(WORK / "tied_ternary.gguf")], capture_output=True, text=True, env=CPU_ENV,
+                          check=False)
+    assert proc.returncode != 0 and "plan M4" in proc.stdout + proc.stderr
+
+
+def test_ternary_stage2_branch_from_iq2_stage1(setup):
+    """A model-basis stage-1 checkpoint seeds a ternary stage-2 branch by folding; a basis mix is refused."""
+    import shutil
+
+    from omk_qad import train as T
+
+    model, lay = setup["dense_tied"]
+    tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
+    run = WORK / "run_iq2_to_ternary"
+    if run.exists():
+        shutil.rmtree(run)  # this test's own scratch
+    common = ("--model", str(model), "--cache", str(setup["cache_tied"]), "--out", str(run), "--eval-every", "2",
+              "--save-every", "2", "--steps", "2")
+    _run("omk_qad.train", *TRAIN, *common, "--layout", str(lay))
+    _run("omk_qad.train", *TRAIN, *common, "--layout", str(tl), "--stage", "2", "--branch", "ternary", "--loss", "kl")
+    assert (run / "stage2" / "ternary" / "final.pt").exists()
+
+    # the conversion itself: stage-1 latents folded into the ternary student == the stage-1 weights
+    s1 = torch.load(run / "stage1" / "final.pt", weights_only=False)
+    student, lats, _, _, _ = T.build_student(_args(model, latent_dtype="fp32"), torch.load(tl, weights_only=False))
+    T.load_state(str(run / "stage1" / "final.pt"), lats, student, None, weights_only=True)
+    for n, lat in lats.items():
+        if lat.basis is not None:
+            assert torch.allclose(lat.model_weight(), s1["latents"][n].float(), atol=1e-5), n
+
+    # a ternary checkpoint cannot be resumed / loaded into a model-basis (IQ2) student
+    student, lats, _, _, _ = T.build_student(_args(model, latent_dtype="fp16"), torch.load(lay, weights_only=False))
+    with pytest.raises(SystemExit, match="stored folded"):
+        T.load_state(str(run / "stage2" / "ternary" / "final.pt"), lats, student, None, weights_only=True)

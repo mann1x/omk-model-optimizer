@@ -32,19 +32,25 @@ import torch.nn as nn
 
 MODELOPT_TYPES = {"IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q8_0"}
 FLOAT_TYPES = {"F32", "F16", "BF16"}
+TERNARY_TYPES = {"PQ2_0", "PTQ1_0"}  # PrismML Bonsai 2 (omk_qad.ternary); the latent lives in the folded basis
 CHUNK_ELEMS = 64 * 2**20  # rows are encoded / updated in chunks of about this many values
 
 
 class Codec:
     """Encode/decode 2-D float32 row blocks to one GGML type with the encoder export will also use."""
 
-    def __init__(self, llama_cpp: Path):
-        """``llama_cpp`` provides libggml (non-ModelOpt types) and gguf-py's type enum."""
+    def __init__(self, llama_cpp: Path, ternary_method: str = "top:86"):
+        """``llama_cpp`` provides libggml (non-ModelOpt types) and gguf-py's type enum.
+
+        Ternary types (PQ2_0 / PTQ1_0, omk_qad.ternary) use ``ternary_method``; their payload is always the PQ2_0
+        packing (2.125 bpw, the same trits as PTQ1_0), repacked at :meth:`to_bytes` when the target is PTQ1_0.
+        """
         from .gguf_export import _import_llama_cpp
 
         self.gguf = _import_llama_cpp(Path(llama_cpp))[0]
         self.llama_cpp = Path(llama_cpp)
         self._ggml = None
+        self.ternary_method = ternary_method
 
     @property
     def ggml(self):
@@ -64,6 +70,10 @@ class Codec:
 
         ``importance`` is the encoder-convention vector from :func:`omk_qad.imatrix.importance_for` (or None).
         """
+        if qtype in TERNARY_TYPES:
+            from .ternary import pack, ternarize
+
+            return pack("PQ2_0", *ternarize(x.float(), self.ternary_method, importance))
         if qtype in MODELOPT_TYPES:
             from modelopt.torch.quantization.ggml import GGML_FORMAT_REGISTRY
 
@@ -75,6 +85,10 @@ class Codec:
 
     def decode(self, qtype: str, packed, rows: int, cols: int, device, dtype=torch.float32) -> torch.Tensor:
         """Inverse of :meth:`encode`, as a [rows, cols] tensor on ``device``."""
+        if qtype in TERNARY_TYPES:
+            from .ternary import decode, unpack
+
+            return decode(*unpack("PQ2_0", packed, cols)).to(device=device, dtype=dtype)
         if qtype in MODELOPT_TYPES:
             from modelopt.torch.quantization.ggml import GGML_FORMAT_REGISTRY
 
@@ -85,6 +99,10 @@ class Codec:
 
     def to_bytes(self, qtype: str, packed, rows: int) -> np.ndarray:
         """Payload as numpy uint8 [rows, row_bytes] (GGUF row layout)."""
+        if qtype == "PTQ1_0":
+            from .ternary import pack, unpack
+
+            packed = pack("PTQ1_0", *unpack("PQ2_0", packed.cpu(), packed.shape[-1] // 34 * 128))
         arr = packed.detach().cpu().numpy() if isinstance(packed, torch.Tensor) else packed
         return np.ascontiguousarray(arr, dtype=np.uint8).reshape(rows, -1)
 
@@ -155,10 +173,16 @@ class Latent:
         """Convert ``param`` in place to ``latent_dtype`` storage; it no longer requires grad."""
         self.name, self.param, self.segments, self.ctl, self.codec = name, param, segments, ctl, codec
         param.requires_grad_(False)
-        param.data = param.data.to(latent_dtype)
         self.shape = tuple(param.shape)
         self.cols = self.shape[-1]
         self.rows = param.numel() // self.cols
+        self.latent_dtype = latent_dtype
+        self.basis = None  # ternary: the latent is H(s * W) in GGUF column order (omk_qad.ternary.HadamardBasis)
+        self.colperm = self.inv = None
+        if any(seg.qtype in TERNARY_TYPES for seg in segments):
+            self._init_folded()
+        else:
+            param.data = param.data.to(latent_dtype)
         b = self.shape[0] if param.ndim == 3 else 1
         dev = param.device
         self.r = torch.zeros(b, self.rows // b, device=dev)
@@ -171,10 +195,81 @@ class Latent:
         self.msq: torch.Tensor | None = None  # imatrix E[x^2] per expert [E, C] (set_imatrix)
         self._imp: dict = {}
 
+    def _init_folded(self) -> None:
+        """Ternary weight: every row is in a ternary segment sharing one column order; store the folded latent."""
+        from .ternary import HadamardBasis
+
+        segs = self.segments
+        if any(seg.qtype not in TERNARY_TYPES for seg in segs):
+            raise ValueError(f"{self.name}: ternary and non-ternary segments in one weight are not supported")
+        perms = {None if seg.colperm is None else tuple(seg.colperm.tolist()) for seg in segs}
+        if len(perms) != 1:
+            raise ValueError(f"{self.name}: ternary segments with different column orders")
+        if sum(seg.n_rows for seg in segs) != self.rows:
+            raise ValueError(f"{self.name}: a ternary weight must be covered by its segments row for row")
+        self.colperm, self.inv = segs[0].colperm, segs[0].inv
+        self.basis = HadamardBasis(self.cols, self.param.device)
+        w = self.param.data.float().reshape(self.rows, self.cols)
+        if self.colperm is not None:
+            w = w[:, self.colperm.to(w.device)]
+        self.param.data = self.basis.fold(w).reshape(self.shape).to(self.latent_dtype)
+
+    def _to_model(self, y: torch.Tensor) -> torch.Tensor:
+        """Folded rows [n, cols] (GGUF column order) -> model basis in the model's column order (float32)."""
+        u = self.basis.unfold(y)
+        return u[:, self.inv.to(u.device)] if self.inv is not None else u
+
+    def _to_latent(self, g: torch.Tensor) -> torch.Tensor:
+        """Model-basis gradient [rows, cols] -> folded basis (orthogonal: the exact latent gradient)."""
+        g = g.float()
+        if self.colperm is not None:
+            g = g[:, self.colperm.to(g.device)]
+        return self.basis.fold(g)
+
+    @torch.no_grad()
+    def set_model_weight(self, w: torch.Tensor) -> None:
+        """Write a model-basis weight (e.g. another format's checkpoint) into this latent, folding if ternary."""
+        w = w.to(self.param.device).float().reshape(self.rows, self.cols)
+        if self.basis is not None:
+            if self.colperm is not None:
+                w = w[:, self.colperm.to(w.device)]
+            w = self.basis.fold(w)
+        self.param.data.copy_(w.reshape(self.shape).to(self.param.dtype))
+        self.touch()
+
+    @torch.no_grad()
+    def model_weight(self) -> torch.Tensor:
+        """The latent in the model's basis and layout, float32 (what a converter / checkpoint writer must see)."""
+        if self.basis is None:
+            return self.param.data.float()
+        return self._to_model(self.param.data.reshape(self.rows, self.cols)).reshape(self.shape)
+
+    @torch.no_grad()
+    def _served_folded(self, dtype: torch.dtype) -> torch.Tensor:
+        w = self.param.data.reshape(self.rows, self.cols)
+        if self.ctl.bypass:
+            return self._to_model(w).to(dtype).reshape(self.shape)
+        out = torch.empty(self.rows, self.cols, dtype=dtype, device=w.device)
+        k = 0
+        for seg in self.segments:
+            for rows, n, expert in seg.chunks:
+                hit = self._cache.get(k)
+                if hit is not None and hit[0] == self.version:
+                    payload = hit[2]
+                else:
+                    payload = self.codec.encode(seg.qtype, w[rows].float(), self.importance(seg, expert))
+                    self._cache[k] = (self.version, self.ctl.step, payload)
+                    self.ctl.stats["encodes"] += 1
+                out[rows] = self._to_model(self.codec.decode(seg.qtype, payload, n, self.cols, w.device)).to(dtype)
+                k += 1
+        return out.reshape(self.shape)
+
     def set_imatrix(self, msq: torch.Tensor | None) -> None:
         """E[x^2] [E, C] of this weight's inputs (omk_qad.imatrix.mean_sq); invalidates cached encodings."""
         if msq is not None and msq.shape[-1] != self.cols:
             raise ValueError(f"{self.name}: imatrix width {msq.shape[-1]} != {self.cols}")
+        if self.basis is not None:  # the model-basis diagonal is not the folded one (the rotation mixes columns)
+            msq = None
         self.msq, self._imp, self._cache = msq, {}, {}
 
     def importance(self, seg: Segment, expert: int) -> torch.Tensor | None:
@@ -196,6 +291,8 @@ class Latent:
     def served(self, dtype: torch.dtype | None = None) -> torch.Tensor:
         """The weight the model runs with: latent with every quantized segment encoded/decoded."""
         dtype = dtype or self.ctl.compute_dtype
+        if self.basis is not None:
+            return self._served_folded(dtype)
         lat = self.param.data
         if self.ctl.bypass or not self.segments:
             return lat.to(dtype)
@@ -248,6 +345,8 @@ class Latent:
     def on_grad(self, g: torch.Tensor) -> None:
         """Gradient of one use of the served weight; the update runs when the last pending use arrives."""
         g = g.detach().float().reshape(self.shape)
+        if self.basis is not None:
+            g = self._to_latent(g.reshape(self.rows, self.cols)).reshape(self.shape)
         self.gbuf = g if self.gbuf is None else self.gbuf.add_(g)
         self.uses -= 1
         if self.uses <= 0:

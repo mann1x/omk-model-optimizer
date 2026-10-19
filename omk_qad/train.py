@@ -201,7 +201,7 @@ def build_student(a, layout: dict):
 
     ctl = Control(compute_dtype=torch.bfloat16 if cuda else torch.float32, beta2=a.beta2, clip=a.clip,
                   ggml_refresh=a.ggml_refresh, dummy=torch.zeros((), requires_grad=True, device=a.device))
-    codec = Codec(Path(layout["llama_cpp"]))
+    codec = Codec(Path(layout["llama_cpp"]), ternary_method=getattr(a, "ternary_method", "top:86"))
     latent_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[a.latent_dtype]
     export_only = set(a.export_only.split(",")) if a.export_only else set()
     head_param = student.get_output_embeddings().weight
@@ -224,15 +224,19 @@ def build_student(a, layout: dict):
         for n, lat in latents.items():
             if lat.segments and n in rec["entries"]:
                 lat.set_imatrix(mean_sq(rec["entries"][n]).to(a.device))
-        say(f"imatrix {a.imatrix}: {len(latents) - len(missing)} latents weighted; without data: {missing[:6]}")
+        folded = [n for n, lat in latents.items() if lat.basis is not None]
+        say(f"imatrix {a.imatrix}: {len(latents) - len(missing) - len(folded)} latents weighted; without data: "
+            f"{missing[:6]}; ternary (folded basis, model-basis imatrix not applicable): {len(folded)}")
     tied = head_param is student.get_input_embeddings().weight
     install(student, latents, skip=set() if tied else {head_name})
     student.config.use_cache = False
     student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     n_q = sum(lat.param.numel() for lat in latents.values() if lat.segments)
+    n_t = sum(lat.param.numel() for lat in latents.values() if lat.basis is not None)
     say(f"student: {len(latents)} latents ({sum(lat.param.numel() for lat in latents.values()) / 1e9:.3f}B as "
         f"{a.latent_dtype}; {n_q / 1e9:.3f}B fake-quantized), fp params {sum(p.numel() for p in fp_params) / 1e6:.2f}M,"
-        f" head {head_name} ({'tied' if tied else 'untied'})")
+        f" head {head_name} ({'tied' if tied else 'untied'}); ternary {n_t / 1e9:.3f}B"
+        f" ({getattr(a, 'ternary_method', 'top:86') if n_t else '-'})")
     return student, latents, fp_params, ctl, head_name
 
 
@@ -377,6 +381,7 @@ def save_state(path: Path, step: int, latents, student, opt, a, ctl=None, result
           "adafactor": adafactor_state(latents), "adamw": opt.state_dict() if opt else None,
           "fp": {n: p.detach().cpu() for n, p in named.items() if n not in latents},
           "rng": _rng_state(), "stats": dict(ctl.stats) if ctl else {}, "results": results or [],
+          "folded": {n: lat.basis.block for n, lat in latents.items() if lat.basis is not None},
           "saved_at": time.time(), **(extra or {})}
     path = Path(path)
     torch.save(sd, str(path) + ".tmp")
@@ -393,9 +398,18 @@ def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = 
     ck = torch.load(path, map_location="cpu", weights_only=False)
     if set(ck["latents"]) != set(latents):
         raise SystemExit(f"{path}: latent set differs from this student's")
+    was = ck.get("folded", {})  # latents stored in the ternary (Hadamard-folded) basis, with their block
     for n, lat in latents.items():
-        lat.param.data.copy_(ck["latents"][n])
-        lat.touch()
+        now = lat.basis is not None
+        if (n in was) == now and (not now or was[n] == lat.basis.block):
+            lat.param.data.copy_(ck["latents"][n])
+            lat.touch()
+        elif now and n not in was and weights_only:  # e.g. a stage-2 ternary branch from a model-basis stage 1
+            lat.set_model_weight(ck["latents"][n])
+        else:
+            raise SystemExit(f"{path}: {n} is stored {'folded' if n in was else 'in the model basis'} but this "
+                             f"student holds it {'folded' if now else 'in the model basis'}"
+                             f"{'' if weights_only else ' (a resume must use the same layout)'}")
     named = dict(student.named_parameters())
     for n, v in ck["fp"].items():
         named[n].data.copy_(v)
@@ -551,6 +565,8 @@ def phase_export(a) -> None:
     elif a.imatrix in ("", "auto"):
         a.imatrix = "none"
     student, latents, fp_params, _, _ = build_student(a, layout)
+    if any(lat.basis is not None for lat in latents.values()):
+        raise SystemExit("ternary (PQ2_0 / PTQ1_0) GGUF export is not implemented yet (plan M4); training works")
     if a.load:
         load_state(a.load, latents, student, None, weights_only=True)
     from .imatrix import load as load_imatrix
@@ -605,6 +621,7 @@ def main(argv=None) -> None:
     ap.add_argument("--mtp-weight", type=float, default=0.3, help="weight of the MTP distillation loss")
     ap.add_argument("--latent-dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--latent-min", type=int, default=1 << 20, help="2-D+ tensors at least this big are latents")
+    ap.add_argument("--ternary-method", default="top:86", help="ternarizer of PQ2_0 / PTQ1_0 tensors: top:K | opt")
     ap.add_argument("--export-only", default="embedding", help="classes quantized at export only, not in training")
     ap.add_argument("--ggml-refresh", type=int, default=1, help="re-encode libggml-typed segments every N steps")
     ap.add_argument("--gate", type=float, default=0.01, help="max top-K KL of the unquantized student (lossless gate)")

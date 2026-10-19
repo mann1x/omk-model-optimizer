@@ -244,3 +244,16 @@ def test_prismml_file_round_trips_bitwise():
         t_re, d_re = ternarize(decode(trits, d), "top:86")
         assert torch.equal(t_re, trits) and torch.equal(d_re, d), name
     assert k86 / groups > 0.9, f"only {k86}/{groups} groups carry exactly 86 nonzeros"
+
+
+def test_trainer_codec_ptq1_0_repacks_the_same_trits():
+    from omk_qad.fakequant import Codec
+
+    llama_cpp = Path(os.environ.get("OMK_LLAMA_CPP", "/opt/llama.cpp"))
+    codec = Codec(llama_cpp)
+    x = _weights(rows=4)
+    payload = codec.encode("PTQ1_0", x)  # held as PQ2_0 bytes
+    t, d = ternarize(x)
+    assert np.array_equal(codec.to_bytes("PQ2_0", payload, 4), pack("PQ2_0", t, d).numpy())
+    assert np.array_equal(codec.to_bytes("PTQ1_0", payload, 4), pack("PTQ1_0", t, d).numpy())
+    assert torch.equal(codec.decode("PTQ1_0", payload, 4, x.shape[1], "cpu"), decode(t, d))

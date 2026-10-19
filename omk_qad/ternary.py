@@ -34,6 +34,7 @@ the stored fp16 number, so ``decode(encode(x))`` is exactly what the GGUF holds.
 
 from __future__ import annotations
 
+import math
 import struct
 from typing import TYPE_CHECKING
 
@@ -140,12 +141,12 @@ def unpack(fmt: str, raw: torch.Tensor | np.ndarray, n: int) -> tuple[torch.Tens
     if fmt == "PQ2_0":
         d = _d_from(blk[..., :2])
         q = blk[..., 2:].to(torch.int32)
-        shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32)
+        shifts = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=raw.device)
         t = ((q[..., None] >> shifts) & 3).reshape(rows, nb, G)
     elif fmt == "PTQ1_0":
         d = _d_from(blk[..., 26:])
         q = blk[..., :26].to(torch.int32)
-        p5 = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32)
+        p5 = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32, device=raw.device)
         trit = (((q[..., None] * p5) & 0xFF) * 3) >> 8  # [rows, nb, 26 bytes, 5 trits]: trit n of each byte
         a = trit[..., :16, :].transpose(-1, -2).reshape(rows, nb, 80)
         b = trit[..., 16:24, :].transpose(-1, -2).reshape(rows, nb, 40)
@@ -233,3 +234,54 @@ def gguf_raw_rows(path: Path, info: dict, fmt: str, rows: slice | None = None) -
     rb = n // G * BLOCK_BYTES[fmt]
     mm = np.memmap(path, dtype=np.uint8, mode="r", offset=info["offset"], shape=(nrows, rb))
     return np.array(mm[rows] if rows is not None else mm)
+
+
+# --- Hadamard basis (the Bonsai 2 runtime contract: y = W_s . H(s * x), H blockwise normalized Sylvester WHT) ------
+
+def fwht(x: torch.Tensor, block: int) -> torch.Tensor:
+    """Normalized Walsh-Hadamard transform over the last axis in independent blocks (its own inverse)."""
+    shape = x.shape
+    x = x.reshape(-1, shape[-1] // block, block)
+    h = 1
+    while h < block:
+        x = x.reshape(x.shape[0], x.shape[1], block // (2 * h), 2, h)
+        a, b = x[..., 0, :], x[..., 1, :]
+        x = torch.stack((a + b, a - b), dim=-2)
+        h *= 2
+    return x.reshape(shape) / math.sqrt(block)
+
+
+def hadamard_block(width: int) -> int:
+    """Block for an input width: 1024 where it divides, else 512 (PrismML / bonsai rule), else 256 (tiny models)."""
+    for b in (1024, 512, 256):
+        if width % b == 0:
+            return b
+    raise ValueError(f"input width {width} is not a multiple of 256: no Hadamard block fits")
+
+
+def seeded_signs(width: int, device=None) -> torch.Tensor:
+    """+-1 per input column, from a fixed generator per width (omnimergekit bonsai_tern_lib's seeded basis)."""
+    g = torch.Generator().manual_seed(1234 + width)
+    return (torch.randint(0, 2, (width,), generator=g) * 2 - 1).float().to(device)
+
+
+class HadamardBasis:
+    """fold / unfold along the input (last) axis of [rows, width] tensors in GGUF column order.
+
+    fold(w) = H(w * s) is the latent (ternary) basis; unfold(y) = H(y) * s maps back. Both are orthogonal, so the
+    gradient of a folded latent is fold(gradient of the served weight).
+    """
+
+    def __init__(self, width: int, device=None, signs: torch.Tensor | None = None, block: int | None = None):
+        """Seeded signs and the standard block unless given (a PrismML reference supplies its own)."""
+        self.width = width
+        self.block = block or hadamard_block(width)
+        self.signs = (signs if signs is not None else seeded_signs(width)).float().to(device)
+
+    def fold(self, w: torch.Tensor) -> torch.Tensor:
+        """Model basis -> latent basis (float32)."""
+        return fwht(w.float() * self.signs.to(w.device), self.block)
+
+    def unfold(self, y: torch.Tensor) -> torch.Tensor:
+        """Latent basis -> model basis (float32)."""
+        return fwht(y.float(), self.block) * self.signs.to(y.device)
