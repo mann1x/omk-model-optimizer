@@ -55,7 +55,12 @@ def _sharp(tiny: Path, sharp: Path) -> None:
 
 def _cache(model: Path, layout: Path, cache: Path, text: Path) -> Path:
     """Small teacher cache + imatrix (resumes an older cache that has no imatrix yet)."""
-    if not all((cache / f).exists() for f in ("cache.json", "imatrix.pt", "imatrix.folded.pt")):  # M3 backfills
+    from omk_qad.imatrix import folded_candidates
+
+    _, block = folded_candidates(torch.load(layout, weights_only=False))
+    fresh = all((cache / f).exists() for f in ("cache.json", "imatrix.pt", "imatrix.folded.pt")) and {
+        e["block"] for e in torch.load(cache / "imatrix.folded.pt", weights_only=False)["entries"].values()} == {block}
+    if not fresh:  # the cache phase backfills (a stale-block folded statistic is set aside, never deleted)
         _run("omk_qad.train", "--phase", "cache", "--model", str(model), "--cache", str(cache), "--layout", str(layout),
              "--device", "cpu", "--data", str(text), "--eval-data", str(text), "--n-seq", "8", "--n-eval", "2",
              "--seq", "64", "--shard", "4", "--llama-cpp", str(LLAMA_CPP))
@@ -453,19 +458,20 @@ TERNARY_CLASSES = ("attention", "linear_attn", "dense_mlp", "lm_head")  # bonsai
 
 
 def _ternary_layout(lay_path: Path, out: Path, qtype: str = "PQ2_0") -> Path:
-    """The IQ2_M-rest layout with every quantized tensor of TERNARY_CLASSES set to a ternary type (M4 stand-in)."""
-    lay = torch.load(lay_path, weights_only=False)
-    for t in lay["targets"].values():
-        if t["cls"] in TERNARY_CLASSES and t["type"] not in ("F32", "F16", "BF16"):
-            t["type"] = qtype
-    torch.save(lay, out)
+    """The IQ2_M-rest layout with TERNARY_CLASSES retyped to a ternary type (one model-wide Hadamard block)."""
+    from omk_qad.layout import retype
+
+    torch.save(retype(torch.load(lay_path, weights_only=False), dict.fromkeys(TERNARY_CLASSES, qtype)), out)
     return out
 
 
 def test_hadamard_basis():
-    from omk_qad.ternary import HadamardBasis, hadamard_block
+    from omk_qad.ternary import HadamardBasis, hadamard_block, model_block
 
-    assert (hadamard_block(2560), hadamard_block(9216), hadamard_block(256)) == (512, 1024, 256)  # Qwen3.5-4B
+    assert (hadamard_block(2560), hadamard_block(9216), hadamard_block(256)) == (512, 1024, 256)
+    assert model_block([2560, 9216]) == 512 and model_block([5120, 17408]) == 1024  # Qwen3.5-4B / 27B: one block
+    with pytest.raises(ValueError):
+        model_block([2560, 2688])
     for width in (256, 512, 2560):
         b = HadamardBasis(width)
         w = torch.randn(5, width, generator=torch.Generator().manual_seed(width))
@@ -535,29 +541,77 @@ def test_ternary_student_serves_ternary_with_exact_gradients(setup):
 
 
 def test_ternary_student_descends_on_one_batch(setup):
+    """Started away from the teacher (seeded noise on the folded latents), the ternary student descends.
+
+    The sharp tied teacher is saturated on these rows (top-1 p >= 0.9998), so the unperturbed ternary student already
+    sits at KL ~6e-5, the IQ2 student's floor: there is nothing to descend from (bug-815).
+    """
     from omk_qad import train as T
 
     model, lay = setup["dense_tied"]
     tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
     a = _args(model, loss_chunk=64, loss="kl", mtp="freeze")
     student, lats, fp, ctl, head = T.build_student(a, torch.load(tl, weights_only=False))
-    opt = torch.optim.AdamW(fp, lr=3e-3, betas=(0.9, 0.95), weight_decay=0.0)
+    g = torch.Generator().manual_seed(0)
+    for lat in lats.values():
+        if lat.basis is not None:
+            p = lat.param.data
+            p.add_(p.std() * torch.randn(p.shape, generator=g))
+            lat.touch()
+    opt = torch.optim.AdamW(fp, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.0)
     sh = torch.load(setup["cache_tied"] / "train_0000.pt")
     x, idx, val = sh["x"][:1].long(), sh["idx"][:1], sh["val"][:1]
-    ctl.lr = 3e-3
+    ctl.lr = 3e-4
     hist = []
     for s in range(1, 16):
         ctl.step = s
         hist.append(T.train_step(student, lats, lats[head], fp, opt, x, idx, val, a))
-    assert np.mean(hist[-3:]) < 0.9 * hist[0], hist
+    assert hist[0] > 0.5, hist  # the start really is away from the teacher (a zero needs a nonzero floor)
+    assert np.mean(hist[-3:]) < 0.1 * hist[0], hist
 
 
-def test_ternary_train_cli_and_export_guard(setup):
-    """CLI: lossless gate passes through the fold, 2 steps train and checkpoint; export refuses until M4."""
+def test_ternary_layout_plan_and_refusals(setup):
+    """--fixed / --override ternary: planned through an IQ2_XXS placeholder, sized at 34 B / 128, one block.
+
+    Weights the runtime does not fold and regex-set ternary types are refused.
+    """
+    from omk_qad.layout import plan_layout, probe_model, summary
+
+    model, _ = setup["dense_tied"]
+    probe = probe_model(model, LLAMA_CPP, WORK / "lay_ternary")
+    iq2, tern = plan_layout(probe, "IQ2_M"), plan_layout(probe, "IQ2_M", fixed={"dense_mlp": "PQ2_0"})
+    s = summary(tern)
+    assert set(s["per_class"]["dense_mlp"]) == {"PQ2_0"} and s["hadamard_block"] == 256
+    assert summary(iq2)["hadamard_block"] is None
+    n = sum(int(np.prod(t["shape"])) for t in tern["targets"].values() if t["type"] == "PQ2_0")
+    want = iq2["sizes_mib"]["quant"] + n * (34 / 128 - 66 / 256) / 2**20  # same rest plan, other bytes per weight
+    assert abs(tern["sizes_mib"]["quant"] - want) < 0.02
+    with pytest.raises(SystemExit, match="does not fold"):
+        plan_layout(probe, "IQ2_M", overrides={"small_proj": "PQ2_0"})
+    with pytest.raises(SystemExit, match="not by --override-regex"):
+        plan_layout(probe, "IQ2_M", regex={r".*ffn_up.*": "PQ2_0"})
+
+
+def test_ternary_train_export_ships_the_trained_trits(setup):
+    """Ternary train -> GGUF: types 142 / 143, prism.hadamard KV, bytes == training payloads, both formats agree.
+
+    The unfold control (omk_qad.ternary_gate) == the student's served weights, so an engine that matches its
+    perplexity on the ternary file serves what training served; stock llama.cpp loads the control. The flip
+    control only negates the signs.
+    """
     import shutil
 
+    sys.path.insert(0, str(LLAMA_CPP / "gguf-py"))
+    import gguf
+
+    from omk_qad import train as T
+    from omk_qad.ternary import decode, register_gguf_types, seeded_signs, unpack
+    from omk_qad.ternary_gate import build
+
+    register_gguf_types(gguf)
     model, lay = setup["dense_tied"]
     tl = _ternary_layout(lay, WORK / "layout_tied_ternary.pt")
+    tl1 = _ternary_layout(lay, WORK / "layout_tied_ptq1.pt", "PTQ1_0")
     run = WORK / "run_tied_ternary"
     if run.exists():
         shutil.rmtree(run)  # this test's own scratch
@@ -566,11 +620,70 @@ def test_ternary_train_cli_and_export_guard(setup):
                "--lr", "6e-5", "--loss", "kl")
     log = (run / "stage1" / "log.txt").read_text()
     assert "LOSSLESS_GATE" in log and "STAGE_DONE" in log and "ternary" in out + log
-    proc = subprocess.run([sys.executable, "-m", "omk_qad.train", "--phase", "export", "--model", str(model),
-                           "--layout", str(tl), "--device", "cpu", "--load", str(run / "stage1" / "final.pt"),
-                           "--gguf", str(WORK / "tied_ternary.gguf")], capture_output=True, text=True, env=CPU_ENV,
-                          check=False)
-    assert proc.returncode != 0 and "plan M4" in proc.stdout + proc.stderr
+    final = run / "stage1" / "final.pt"
+    files = {}
+    for fmt, layout in (("PQ2_0", tl), ("PTQ1_0", tl1)):
+        files[fmt] = WORK / f"tied_{fmt.lower()}.gguf"
+        _run("omk_qad.train", "--phase", "export", "--model", str(model), "--layout", str(layout), "--device", "cpu",
+             "--load", str(final), "--gguf", str(files[fmt]), "--latent-dtype", "fp16", "--latent-min", "65536")
+        rep = json.loads(files[fmt].with_suffix(".export.json").read_text())
+        assert rep["verify_failures"] == [] and rep["type_mismatches"] == [] and rep["export_only"] == []
+        assert rep["type_counts"][fmt] > 0
+
+    reader = gguf.GGUFReader(files["PQ2_0"])
+    kv = {k[len("prism.hadamard."):]: f.contents() for k, f in reader.fields.items() if k.startswith("prism.")}
+    tern = sorted(t.name for t in reader.tensors if t.tensor_type == 142)
+    assert kv["version"] == 2 and kv["tied_output"] and kv["block_size"] == 256 and kv["sign_mode"] == "explicit"
+    assert kv["inverse_weight_names"] == ["token_embd.weight"] and "output.weight" not in tern
+    assert sorted(kv["weight_names"] + kv["inverse_weight_names"]) == tern
+    assert kv["sign_values"] == [int(v) for w in kv["sign_widths"] for v in seeded_signs(w).tolist()]
+
+    a = _args(model, latent_dtype="fp16", loss="kl", imatrix=str(setup["cache_tied"] / "imatrix.pt"))
+    student, lats, _, _, _ = T.build_student(a, torch.load(tl, weights_only=False))
+    T.load_state(str(final), lats, student, None, weights_only=True)
+    tensors = {t.name: t for t in reader.tensors}
+    ptq1 = {t.name: t for t in gguf.GGUFReader(files["PTQ1_0"]).tensors}
+    by_gguf = {}
+    for n, lat in lats.items():
+        if lat.basis is not None:
+            for seg in lat.segments:
+                by_gguf.setdefault(seg.gguf, []).append((n, seg))
+    assert sorted(by_gguf) == tern
+    for g, segs in by_gguf.items():
+        assert len({n for n, _ in segs}) == 1, g
+        lat = lats[segs[0][0]]
+        want = np.concatenate([_flat(c) for c in lat.payloads()[g]])  # encode cache: PQ2_0 bytes per chunk
+        assert np.array_equal(np.asarray(tensors[g].data).reshape(-1), want), g
+        n_in = int(tensors[g].shape[0])
+        t2, d2 = unpack("PQ2_0", np.asarray(tensors[g].data), n_in)
+        t1, d1 = unpack("PTQ1_0", np.asarray(ptq1[g].data), n_in)
+        assert torch.equal(t1, t2) and torch.equal(d1, d2), g  # train once, ship either packing
+        assert torch.equal(decode(t2, d2), decode(t1, d1)), g
+
+    unfold, flip = WORK / "tied_pq2_0.unfold.gguf", WORK / "tied_pq2_0.flip.gguf"
+    assert build("unfold", files["PQ2_0"], unfold, LLAMA_CPP)["unfolded"] == len(tern)
+    build("flip", files["PQ2_0"], flip, LLAMA_CPP)
+    un = {t.name: t for t in gguf.GGUFReader(unfold).tensors}
+    assert not any(k.startswith("prism.") for k in gguf.GGUFReader(unfold).fields)
+    for g, segs in by_gguf.items():
+        lat = lats[segs[0][0]]
+        served = lat.served().reshape(lat.rows, lat.cols).float()
+        if lat.colperm is not None:
+            served = served[:, lat.colperm]
+        want = torch.cat([served[rows] for _, seg in segs for rows, _, _ in seg.chunks]).numpy()
+        got = np.asarray(un[g].data).reshape(want.shape)
+        assert np.allclose(got, want, rtol=0, atol=1e-6 * float(np.abs(want).max())), g
+    fl = gguf.GGUFReader(flip)
+    assert [-v for v in kv["sign_values"]] == fl.fields["prism.hadamard.sign_values"].contents()
+    for t in fl.tensors:
+        assert np.array_equal(np.asarray(t.data), np.asarray(tensors[t.name].data)), t.name
+
+    proc = subprocess.run(
+        [str(LLAMA_CPP / "build/bin/llama-perplexity"), "-m", str(unfold), "-f", str(setup["text"]), "-c", "128",
+         "--chunks", "2", "-t", "8", "-ngl", "0"],
+        capture_output=True, text=True, env=CPU_ENV, check=False,
+    )
+    assert proc.returncode == 0 and "Final estimate" in proc.stdout + proc.stderr, proc.stderr[-2000:]
 
 
 def test_ternary_stage2_branch_from_iq2_stage1(setup):
@@ -612,7 +725,8 @@ def test_folded_imatrix_is_the_folded_statistic(setup):
 
     model, lay = setup["dense_tied"]
     layout = torch.load(lay, weights_only=False)
-    cand = folded_candidates(layout)
+    cand, block = folded_candidates(layout)
+    assert block == 256  # tiny widths 256 / 512: the one model-wide block
     out_proj = next(n for n in cand if n.endswith("linear_attn.out_proj.weight"))
     assert cand[out_proj] is not None  # ssm_out: the converter's V-head column reorder is carried
     m, _ = load_text_causal_lm(str(model), "cpu", torch.float32)
@@ -620,7 +734,7 @@ def test_folded_imatrix_is_the_folded_statistic(setup):
     seen = {}
     mod = m.get_submodule(out_proj.rsplit(".", 1)[0])
     h = mod.register_forward_pre_hook(lambda _m, args: seen.setdefault("x", []).append(args[0].detach().clone()))
-    col = Collector(m, folded=cand)
+    col = Collector(m, folded=cand, block=block)
     x = torch.load(setup["cache_tied"] / "train_0000.pt")["x"][:2].long()
     with torch.no_grad():
         m(input_ids=x)

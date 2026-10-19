@@ -35,13 +35,14 @@ class Collector:
     """
 
     def __init__(self, model: nn.Module, names: set[str] | None = None,
-                 folded: dict[str, torch.Tensor | None] | None = None):
+                 folded: dict[str, torch.Tensor | None] | None = None, block: int | None = None):
         """Hook every Linear (and fused-experts module) whose weight name is in ``names`` (default: all)."""
         self.sums: dict[str, torch.Tensor] = {}
         self.counts: dict[str, torch.Tensor] = {}
         self.fsums: dict[str, torch.Tensor] = {}
         self.folded = {n: (None if perm is None else perm.long(), None) for n, perm in (folded or {}).items()}
         self._bases: dict = {}  # input width -> omk_qad.ternary.HadamardBasis
+        self.block = block  # the model's one Hadamard block (omk_qad.ternary.model_block)
         self.handles = []
         # transformers' fused experts default to grouped_mm (torch._grouped_mm, no F.linear): the per-expert
         # eager loop computes the same thing and is what F.linear interception sees; restored by close()
@@ -72,7 +73,7 @@ class Collector:
         from .ternary import HadamardBasis
 
         if width not in self._bases:
-            self._bases[width] = HadamardBasis(width)
+            self._bases[width] = HadamardBasis(width, block=self.block)
         return self._bases[width]
 
     def _add(self, name: str, x: torch.Tensor, expert: int, n_expert: int) -> None:
@@ -220,23 +221,26 @@ def load(path: Path) -> dict:
     return rec
 
 
-def folded_candidates(layout: dict) -> dict[str, torch.Tensor | None]:
-    """Weights a ternary student could fold.
+def folded_candidates(layout: dict) -> tuple[dict[str, torch.Tensor | None], int | None]:
+    """Weights a ternary student could fold, and the model's Hadamard block.
 
-    2-D+ sources of quantizable targets with one GGUF column order and an input width a Hadamard block fits
-    (omk_qad.ternary.hadamard_block).
+    2-D+ sources whose every GGUF target the runtime folds (omk_qad.ternary.foldable), with one GGUF column order;
+    the block is the one ``prism.hadamard.block_size`` that divides all their input widths.
     """
+    from .ternary import foldable, model_block
+
     out: dict[str, torch.Tensor | None] = {}
     for p, gs in layout["by_param"].items():
         shape = layout["params"][p]
-        if len(shape) < 2 or shape[-1] % 256:
+        if len(shape) < 2 or shape[-1] % 256 or not all(foldable(g) for g in gs):
             continue
         perms = {None if layout["targets"][g]["colperm"] is None else tuple(layout["targets"][g]["colperm"].tolist())
                  for g in gs}
         if len(perms) == 1:
             perm = next(iter(perms))
             out[p] = None if perm is None else torch.tensor(perm)
-    return out
+    block = model_block(layout["params"][p][-1] for p in out) if out else None
+    return out, block
 
 
 def save_folded(fimat: dict, out_dir: Path, datasets: list[str], chunk_size: int, chunks: int) -> Path:

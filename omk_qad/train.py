@@ -152,12 +152,23 @@ def phase_cache(a) -> None:
         f"{ev['val'].float().exp().sum(-1).mean().item():.4f}")
 
     srcs = [(q.split("=")[0], float(q.split("=")[1]) if "=" in q else 1.0) for q in a.data.split(",") if q]
-    want_folded = bool(a.layout) and not (Path(a.cache) / "imatrix.folded.pt").exists()
-    if a.imatrix_seqs and (not (Path(a.cache) / "imatrix.pt").exists() or want_folded):
-        from .imatrix import Collector, folded_candidates
+    folded, block = (None, None)
+    fpath = Path(a.cache) / "imatrix.folded.pt"
+    if a.layout:
+        from .imatrix import folded_candidates
 
-        folded = folded_candidates(torch.load(a.layout, weights_only=False)) if want_folded else None
-        imat["collector"] = Collector(teacher, folded=folded)  # training-stream rows only (eval rows done above)
+        folded, block = folded_candidates(torch.load(a.layout, weights_only=False))
+        if fpath.exists():  # computed under another Hadamard block (e.g. before the model-wide block): set aside
+            old = {e.get("block") for e in torch.load(fpath, weights_only=False)["entries"].values()}
+            if old != {block}:
+                stale = fpath.with_name(f"imatrix.folded.block{'-'.join(map(str, sorted(old)))}.stale.pt")
+                fpath.replace(stale)
+                say(f"imatrix.folded.pt had blocks {sorted(old)}, this layout folds with {block}: kept as {stale.name}")
+    want_folded = bool(folded) and not fpath.exists()
+    if a.imatrix_seqs and (not (Path(a.cache) / "imatrix.pt").exists() or want_folded):
+        from .imatrix import Collector
+
+        imat["collector"] = Collector(teacher, folded=folded if want_folded else None, block=block)
         if not a.layout:
             say("WARNING: no --layout: imatrix.pt only (no imatrix.gguf, no folded statistic for ternary students)")
     streams = [_packed(p, tok, a.seq, tok.eos_token_id, passes) for p, _ in srcs]
@@ -206,7 +217,8 @@ def build_student(a, layout: dict):
     from .fakequant import Codec
 
     ctl = Control(compute_dtype=torch.bfloat16 if cuda else torch.float32, beta2=a.beta2, clip=a.clip,
-                  ggml_refresh=a.ggml_refresh, dummy=torch.zeros((), requires_grad=True, device=a.device))
+                  ggml_refresh=a.ggml_refresh, dummy=torch.zeros((), requires_grad=True, device=a.device),
+                  hadamard_block=layout.get("hadamard_block"))
     codec = Codec(Path(layout["llama_cpp"]), ternary_method=getattr(a, "ternary_method", "top:86"))
     latent_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[a.latent_dtype]
     export_only = set(a.export_only.split(",")) if a.export_only else set()
@@ -589,14 +601,19 @@ def phase_export(a) -> None:
     elif a.imatrix in ("", "auto"):
         a.imatrix = "none"
     student, latents, fp_params, _, _ = build_student(a, layout)
-    if any(lat.basis is not None for lat in latents.values()):
-        raise SystemExit("ternary (PQ2_0 / PTQ1_0) GGUF export is not implemented yet (plan M4); training works")
     if a.load:
         load_state(a.load, latents, student, None, weights_only=True)
     from .imatrix import load as load_imatrix
 
     imatrix = load_imatrix(Path(a.imatrix)) if a.imatrix != "none" else None
-    report = export_gguf(student, layout, Path(a.gguf), device=a.device, imatrix=imatrix)
+    fpath = Path(a.imatrix).with_name("imatrix.folded.pt") if imatrix else None
+    imatrix_folded = load_imatrix(fpath) if fpath is not None and fpath.exists() else None
+    report = export_gguf(student, layout, Path(a.gguf), device=a.device, imatrix=imatrix, latents=latents,
+                         imatrix_folded=imatrix_folded)
+    if imatrix_folded is not None and report.get("prism_hadamard"):  # provenance of the ternary encodings
+        import shutil
+
+        shutil.copyfile(fpath, Path(a.gguf).with_suffix(".imatrix.folded.pt"))
     keys = ("type_counts", "verified", "verify_failures", "type_mismatches", "export_only", "with_imatrix",
             "size_bytes", "seconds")
     print(json.dumps({k: report[k] for k in keys}, indent=1))

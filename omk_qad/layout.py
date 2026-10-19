@@ -289,11 +289,55 @@ def probe_model(model_dir: Path, llama_cpp: Path, work: Path, mtp: bool = True) 
 
 
 def _check_type(t: str, llama_cpp: Path) -> str:
+    from .ternary import TYPES as TERNARY
+
+    if t.upper() in TERNARY:
+        return t.upper()
     gguf = _import_llama_cpp(Path(llama_cpp))[0]  # gguf-py must be llama.cpp's, never a pip gguf
     name = t.upper()
     if name not in gguf.GGMLQuantizationType.__members__:
         raise SystemExit(f"unknown GGML type {t!r}")
     return name
+
+
+TERNARY_TYPES = ("PQ2_0", "PTQ1_0")
+
+
+def _check_ternary(tern: dict[str, str], shapes: dict, sizes: dict | None = None) -> int | None:
+    """Validate ternary targets against the runtime contract; correct the plan size; return the model's block."""
+    from .ternary import BLOCK_BYTES, G, foldable, model_block
+
+    if not tern:
+        return None
+    bad = sorted(g for g in tern if not foldable(g))
+    if bad:
+        raise SystemExit(f"the runtime does not fold {bad[:5]}: ternary types apply only to attention / linear-"
+                         "attention ssm_out / FFN and expert weights / output / token_embd (omk_qad.ternary.foldable)")
+    odd = sorted(g for g in tern if len(shapes[g]) < 2 or shapes[g][-1] % G)
+    if odd:
+        raise SystemExit(f"ternary needs 2-D+ weights with an input width a multiple of {G}: {odd[:5]}")
+    if sizes is not None:  # the dry run counted IQ2_XXS (66 B / 256) for these tensors
+        delta = sum(int(np.prod(shapes[g])) * (BLOCK_BYTES[t] / G - 66 / 256) for g, t in tern.items())
+        sizes["quant"] = round(sizes["quant"] + delta / 2**20, 2)
+    return model_block(shapes[g][-1] for g in tern)
+
+
+def retype(layout: dict, cls_types: dict[str, str]) -> dict:
+    """A copy of ``layout`` with every quantized target of the given classes at a new type.
+
+    E.g. a ternary student from an IQ2 plan; validated as :func:`plan_layout` does; sizes are not recomputed.
+    """
+    import copy
+
+    out = copy.deepcopy(layout)
+    cls_types = {c: _check_type(t, Path(layout["llama_cpp"])) for c, t in cls_types.items()}
+    for t in out["targets"].values():
+        if t["cls"] in cls_types and t["type"] not in FLOAT_TYPES:
+            t["type"] = cls_types[t["cls"]]
+    tern = {g: t["type"] for g, t in out["targets"].items() if t["type"] in TERNARY_TYPES}
+    out["hadamard_block"] = _check_ternary(tern, {g: t["shape"] for g, t in out["targets"].items()})
+    out["fixed"] = {**out["fixed"], **{c: t for c, t in cls_types.items() if c in out["fixed"]}}
+    return out
 
 
 def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None = None,
@@ -327,8 +371,15 @@ def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None =
                 exact[g] = table[classes[p]]
     if not any(classes.get(source.get(g)) in fixed for g in exact):
         raise SystemExit(f"no tensor of the fixed classes {sorted(fixed)} exists in this model")
-    patterns = [(f"^{re.escape(g)}$", t) for g, t in exact.items()] + list(regex.items())
+    if any(t in TERNARY_TYPES for t in regex.values()):
+        raise SystemExit("ternary types are set per class (--fixed / --override), not by --override-regex")
+    tern = {g: t for g, t in exact.items() if t in TERNARY_TYPES}
+    # llama-quantize does not know the ternary types: plan them as an IQ2_XXS placeholder, then put them back
+    patterns = [(f"^{re.escape(g)}$", "IQ2_XXS" if t in TERNARY_TYPES else t) for g, t in exact.items()]
+    patterns += list(regex.items())
     plan, sizes = _dry_run(Path(probe["llama_cpp"]), probe["sparse"], rest_ftype, patterns, Path(probe["work"]))
+    plan.update(tern)
+    block = _check_ternary(tern, shapes, sizes)
     missing = sorted(set(shapes) - set(plan))
     if missing:
         raise SystemExit(f"llama-quantize plan lacks {len(missing)} tensors, e.g. {missing[:5]}")
@@ -364,6 +415,7 @@ def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None =
         "targets": targets,
         "by_param": dict(by_param),
         "sizes_mib": sizes,
+        "hadamard_block": block,
         "seconds": round(probe["seconds"] + time.time() - t0, 1),
     }
 
@@ -401,6 +453,7 @@ def summary(layout: dict) -> dict:
         ),
         "permuted_columns": sorted(g for g, t in layout["targets"].items() if t["colperm"] is not None),
         "sizes_mib": layout["sizes_mib"],
+        "hadamard_block": layout.get("hadamard_block"),
         "seconds": layout["seconds"],
     }
 

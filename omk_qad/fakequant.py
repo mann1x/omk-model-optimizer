@@ -161,6 +161,7 @@ class Control:
     bypass: bool = False  # serve the latent unquantized (lossless gate)
     step: int = 0
     ggml_refresh: int = 1  # re-encode libggml segments every N steps (1 = every change)
+    hadamard_block: int | None = None  # the model's one Hadamard block (layout["hadamard_block"]) for ternary latents
     dummy: torch.Tensor = field(default_factory=lambda: torch.zeros((), requires_grad=True))
     stats: dict = field(default_factory=lambda: {"encodes": 0, "updates": 0, "undelivered": 0})
 
@@ -207,8 +208,10 @@ class Latent:
             raise ValueError(f"{self.name}: ternary segments with different column orders")
         if sum(seg.n_rows for seg in segs) != self.rows:
             raise ValueError(f"{self.name}: a ternary weight must be covered by its segments row for row")
+        if not self.ctl.hadamard_block:  # a per-width block would train a basis the runtime cannot serve
+            raise ValueError(f"{self.name}: ternary layout without hadamard_block (plan it with plan_layout / retype)")
         self.colperm, self.inv = segs[0].colperm, segs[0].inv
-        self.basis = HadamardBasis(self.cols, self.param.device)
+        self.basis = HadamardBasis(self.cols, self.param.device, block=self.ctl.hadamard_block)
         w = self.param.data.float().reshape(self.rows, self.cols)
         if self.colperm is not None:
             w = w[:, self.colperm.to(w.device)]

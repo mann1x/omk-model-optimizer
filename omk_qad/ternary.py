@@ -285,3 +285,47 @@ class HadamardBasis:
     def unfold(self, y: torch.Tensor) -> torch.Tensor:
         """Latent basis -> model basis (float32)."""
         return fwht(y.float(), self.block) * self.signs.to(y.device)
+
+
+# --- runtime contract (opencoti 0588 / upstream #29600 loader) -----------------------------------------------------
+_FOLDABLE_KINDS = ("attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output", "ffn_gate", "ffn_up",
+                   "ffn_down", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps", "ffn_gate_shexp",
+                   "ffn_up_shexp", "ffn_down_shexp", "ssm_out")
+
+
+def foldable(gguf_name: str) -> bool:
+    """Whether the runtime applies the activation transform for this weight (its loader refuses any other).
+
+    ``output.weight``, ``token_embd.weight`` (as an inverse lookup) and ``blk.<n>.<kind>.weight`` of the kinds above.
+    """
+    if gguf_name in ("output.weight", "token_embd.weight"):
+        return True
+    parts = gguf_name.split(".")
+    return len(parts) == 4 and parts[0] == "blk" and parts[1].isdigit() and parts[2] in _FOLDABLE_KINDS \
+        and parts[3] == "weight"
+
+
+def model_block(widths) -> int:
+    """The one ``prism.hadamard.block_size`` of a model.
+
+    The largest of 1024 / 512 / 256 dividing every folded input width: the runtime has a single block for all.
+    """
+    widths = set(widths)
+    for b in (1024, 512, 256):
+        if all(w % b == 0 for w in widths):
+            return b
+    raise ValueError(f"no Hadamard block of 256..1024 divides every folded input width {sorted(widths)}")
+
+
+def register_gguf_types(gguf) -> None:
+    """Add PQ2_0 (142) / PTQ1_0 (143) to gguf-py's type enum and size table, in-process (idempotent)."""
+    qt = gguf.GGMLQuantizationType
+    for name, val in TYPES.items():
+        if val in qt._value2member_map_:
+            continue
+        member = int.__new__(qt, val)
+        member._name_, member._value_ = name, val
+        qt._member_map_[name] = member
+        qt._value2member_map_[val] = member
+        qt._member_names_.append(name)
+        gguf.GGML_QUANT_SIZES[member] = (G, BLOCK_BYTES[name])
