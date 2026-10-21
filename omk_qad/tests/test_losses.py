@@ -104,3 +104,54 @@ def test_masked_mean_and_module():
     assert math.isfinite(JaccardDistillationLoss()(s, t).item())
     with pytest.raises(ValueError):
         JaccardDistillationLoss(reduction="sum")
+
+
+def _kl_eps_form(s, ids, vals, eps=1e-12):  # the pre-bug-825 probability-space form, as a reference
+    p_s = F.softmax(s.float(), -1)
+    p_s_k, p_t_k = p_s.gather(-1, ids), vals.float().exp()
+    p_s_rest, p_t_rest = (1 - p_s_k.sum(-1)).clamp_min(0), (1 - p_t_k.sum(-1)).clamp_min(0)
+    return (p_t_k * ((p_t_k + eps).log() - (p_s_k + eps).log())).sum(-1) + \
+        p_t_rest * ((p_t_rest + eps).log() - (p_s_rest + eps).log())
+
+
+def test_kl_topk_rest_agrees_with_the_eps_form_off_the_floor():
+    torch.manual_seed(5)
+    s, t = torch.randn(64, 200) * 2, torch.randn(64, 200) * 2
+    vals, ids = F.log_softmax(t, -1).topk(16, dim=-1)
+    torch.testing.assert_close(kl_topk_rest(s, ids, vals), _kl_eps_form(s, ids, vals), atol=1e-5, rtol=1e-5)
+
+
+def test_kl_topk_rest_keeps_its_gradient_when_the_student_misses_every_topk_id():
+    # bug-825: a student with ~e-80 mass on the teacher's K ids sat on the eps form's -log(1e-12) plateau
+    torch.manual_seed(6)
+    t = torch.randn(8, 100) * 2
+    vals, ids = F.log_softmax(t, -1).topk(16, dim=-1)
+    s0 = torch.zeros(8, 100).scatter(-1, ids, -80.0)
+    old = s0.clone().requires_grad_()
+    _kl_eps_form(old, ids, vals).sum().backward()
+    new = s0.clone().requires_grad_()
+    loss = kl_topk_rest(new, ids, vals)
+    loss.sum().backward()
+    assert _kl_eps_form(s0, ids, vals).max() < -math.log(1e-12)  # the old loss was capped ...
+    assert loss.min() > -2 * math.log(1e-12)  # ... the true KL is not
+    assert old.grad.gather(-1, ids).abs().sum(-1).max() < 1e-6  # ... and the old gradient was gone
+    g = new.grad.gather(-1, ids).abs().sum(-1)
+    torch.testing.assert_close(g, vals.exp().sum(-1), atol=1e-5, rtol=1e-5)  # d/dz_i = p_s_i - p_t_i ~ -p_t_i
+    ends = {}
+    for name, fn in (("log", kl_topk_rest), ("eps", _kl_eps_form)):  # same optimizer, both forms
+        s = s0.clone().requires_grad_()
+        opt = torch.optim.Adam([s], lr=1.0)
+        for _ in range(200):
+            opt.zero_grad()
+            fn(s, ids, vals).mean().backward()
+            opt.step()
+        ends[name] = kl_topk_rest(s.detach(), ids, vals).mean().item()
+    assert ends["log"] < 1.0 and ends["eps"] > 50.0, ends  # only the log-space form leaves the dead zone
+
+
+def test_kl_topk_rest_full_k_backward_is_finite():
+    torch.manual_seed(7)
+    s = torch.randn(4, 20, requires_grad=True)
+    vals, ids = F.log_softmax(torch.randn(4, 20), -1).topk(20, dim=-1)
+    kl_topk_rest(s, ids, vals).sum().backward()
+    assert torch.isfinite(s.grad).all()

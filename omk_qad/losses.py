@@ -90,13 +90,26 @@ def kl_topk_rest(
     topk_ids: torch.Tensor,
     topk_logprobs_t: torch.Tensor,
     temperature: float = 1.0,
-    eps: float = 1e-12,
 ) -> torch.Tensor:
-    """Per-token KL(teacher || student) over K ids plus one rest bin (the bonsai27_qat.py control loss)."""
-    p_s_k, p_t_k, p_s_rest, p_t_rest = _topk_rest_probs(logits_s, topk_ids, topk_logprobs_t, temperature)
-    kl_k = (p_t_k * (torch.log(p_t_k + eps) - torch.log(p_s_k + eps))).sum(-1)
-    kl_rest = p_t_rest * (torch.log(p_t_rest + eps) - torch.log(p_s_rest + eps))
-    return kl_k + kl_rest
+    """Per-token KL(teacher || student) over K ids plus one rest bin (the bonsai27_qat.py control loss).
+
+    Computed in log space: the student's K log-probs are logits minus logsumexp and its rest log-mass is the
+    logsumexp over the ids outside the K, so d KL / d logit = p_s - p_t never vanishes. The earlier
+    ``log(p + 1e-12)`` form saturated at -log(1e-12) once the student's mass on the teacher's K ids fell
+    under 1e-12: a flat loss with a ~p / eps gradient that training could not leave (M6 tern, bug-825).
+    """
+    z = logits_s.float() / temperature
+    lse = torch.logsumexp(z, dim=-1)
+    ids = topk_ids.long()
+    lp_s_k = z.gather(-1, ids) - lse[..., None]
+    lp_t_k = topk_logprobs_t.float().detach()
+    p_t_k = lp_t_k.exp()
+    kl_k = (p_t_k * (lp_t_k - lp_s_k)).sum(-1)
+    if ids.shape[-1] >= z.shape[-1]:  # the K distinct ids are the whole vocabulary: no rest bin on either side
+        return kl_k
+    lp_s_rest = torch.logsumexp(z.scatter(-1, ids, float("-inf")), dim=-1) - lse
+    p_t_rest = (1.0 - p_t_k.sum(-1)).clamp_min(0.0)
+    return kl_k + torch.xlogy(p_t_rest, p_t_rest) - p_t_rest * lp_s_rest
 
 
 class JaccardDistillationLoss(_Loss):

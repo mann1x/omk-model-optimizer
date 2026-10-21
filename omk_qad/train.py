@@ -15,6 +15,7 @@ python -m omk_qad.train --phase export --model M --layout L.pt [--load O/state.p
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -504,6 +505,94 @@ class Pauser:
         return self.why
 
 
+class Guard:
+    """Divergence guard (bug-825): roll back to the last healthy state and cut the LR when the loss blows up.
+
+    A loss spike shows up AFTER the updates that caused it, so skipping a step cannot repair it. The guard
+    keeps a CPU snapshot of the whole training state (latents, Adafactor and AdamW state, fp params), taken
+    every ``every`` healthy steps; ``patience`` consecutive steps with a non-finite loss or a loss above
+    ``ratio`` x the EMA of healthy losses restore it and multiply the LR scale by ``cut``. More than ``max``
+    rollbacks end the run. ``ratio`` 0 turns it off (no snapshot, no cost).
+    """
+
+    def __init__(self, a, latents, student, opt):
+        """Read the --guard-* options; nothing is snapshotted until :meth:`take`."""
+        self.ratio, self.patience, self.every = a.guard_ratio, a.guard_patience, a.guard_every
+        self.cut, self.max = a.guard_cut, a.guard_max
+        self.latents, self.opt = latents, opt
+        self.fp = {n: p for n, p in student.named_parameters() if n not in latents}
+        self.scale, self.ema, self.bad, self.rollbacks, self.healthy = 1.0, None, 0, 0, 0
+        self.snap: dict | None = None
+
+    @property
+    def on(self) -> bool:
+        """Whether the guard is enabled."""
+        return self.ratio > 0
+
+    def state(self) -> dict:
+        """What a checkpoint keeps (the snapshot itself is not persisted: a resume snapshots the resumed state)."""
+        return {"scale": self.scale, "ema": self.ema, "rollbacks": self.rollbacks, "healthy": self.healthy}
+
+    def load(self, st: dict | None) -> None:
+        """Inverse of :meth:`state`."""
+        if st:
+            self.scale, self.ema = st["scale"], st["ema"]
+            self.rollbacks, self.healthy = st["rollbacks"], st["healthy"]
+
+    @torch.no_grad()
+    def take(self, step: int) -> None:
+        """Snapshot the training state to CPU."""
+        if not self.on:
+            return
+        self.snap = {"step": step,
+                     "latents": {n: lat.param.data.to("cpu", copy=True) for n, lat in self.latents.items()},
+                     "adafactor": {n: tuple(t.to("cpu", copy=True) for t in st)
+                                   for n, st in adafactor_state(self.latents).items()},
+                     "fp": {n: p.detach().to("cpu", copy=True) for n, p in self.fp.items()},
+                     "adamw": copy.deepcopy(self.opt.state_dict()) if self.opt is not None else None}
+
+    @torch.no_grad()
+    def _restore(self) -> None:
+        s = self.snap
+        assert s is not None
+        for n, lat in self.latents.items():
+            lat.param.data.copy_(s["latents"][n])
+            lat.touch()
+        load_adafactor_state(self.latents, s["adafactor"])
+        for n, p in self.fp.items():
+            p.data.copy_(s["fp"][n])
+            p.grad = None
+        if self.opt is not None:
+            self.opt.load_state_dict(copy.deepcopy(s["adamw"]))
+
+    def observe(self, step: int, loss: float) -> bool:
+        """Account one step's loss; True when it rolled the state back (the caller then skips this step's saves)."""
+        if not self.on:
+            return False
+        if not math.isfinite(loss) or (self.ema is not None and self.healthy >= self.every
+                                       and loss > self.ratio * self.ema):
+            self.bad += 1
+            say(f"GUARD step {step}: loss {loss:.5f} > {self.ratio} x ema {self.ema:.5f} ({self.bad}/{self.patience})")
+            if self.bad < self.patience:
+                return False
+            if self.snap is None or self.rollbacks >= self.max:
+                raise SystemExit(f"GUARD_FAIL step {step}: diverged after {self.rollbacks} rollbacks "
+                                 f"(LR scale {self.scale:g})")
+            self._restore()
+            self.rollbacks += 1
+            self.scale *= self.cut
+            self.bad = 0
+            say(f"GUARD_ROLLBACK step {step} -> state of step {self.snap['step']}, LR scale {self.scale:g} "
+                f"(rollback {self.rollbacks}/{self.max})")
+            return True
+        self.bad = 0
+        self.ema = loss if self.ema is None else 0.9 * self.ema + 0.1 * loss
+        self.healthy += 1
+        if step % self.every == 0:
+            self.take(step)
+        return False
+
+
 def run_dir_of(a) -> Path:
     """Stage 1: <out>/stage1 ; stage 2: <out>/stage2/<branch>."""
     if a.stage == 1:
@@ -544,11 +633,13 @@ def phase_train(a) -> None:
         origin["imatrix_folded"] = str(fpath)
     results: list = []
     start = 1
+    guard = Guard(a, latents, student, opt)
     resume = a.load or (str(last_ck) if last_ck.exists() else "")
     if resume:  # full state: continue exactly where it stopped
         ck = load_state(resume, latents, student, opt, ctl)
         start, results = int(ck["step"]) + 1, ck.get("results", [])
         origin["init_from"] = ck.get("init_from", "")
+        guard.load(ck.get("guard"))
         say(f"RESUME from step {ck['step']} ({resume})")
     else:
         if a.stage == 2:  # weights of the finished stage 1; optimizer, schedule and RNG start fresh
@@ -570,7 +661,8 @@ def phase_train(a) -> None:
     t0, t_save = time.time(), time.time()
 
     def checkpoint(step, path=last_ck):
-        save_state(path, step, latents, student, opt, a, ctl, results, origin)
+        save_state(path, step, latents, student, opt, a, ctl, results,
+                   {**origin, "guard": guard.state()} if guard.on else origin)
         say(f"CHECKPOINT step {step} -> {path}")
 
     def peak() -> str:  # read by omk_qad.multi preflight: what this student needs on its GPU
@@ -580,9 +672,10 @@ def phase_train(a) -> None:
                 f"reserved={torch.cuda.max_memory_reserved(a.device) / 2**30:.2f}GiB")
 
     step = start - 1
+    guard.take(step)
     for step in range(start, last + 1):
         ctl.step = step
-        ctl.lr = cosine_lr(step - 1, a.steps, a.lr, a.min_lr, a.warmup)
+        ctl.lr = cosine_lr(step - 1, a.steps, a.lr, a.min_lr, a.warmup) * guard.scale
         if opt is not None:
             for gq in opt.param_groups:
                 gq["lr"] = a.fp_lr * ctl.lr / a.lr
@@ -593,6 +686,7 @@ def phase_train(a) -> None:
         x = shard[1]["x"][j : j + a.bs].long().to(a.device)
         idx, val = shard[1]["idx"][j : j + a.bs].to(a.device), shard[1]["val"][j : j + a.bs].to(a.device)
         loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a)
+        rolled = guard.observe(step, loss)
         if step % a.log_every == 0 or step <= 3:
             mem = torch.cuda.max_memory_allocated(a.device) / 2**30 if a.device != "cpu" else 0.0
             say(f"step {step} loss={loss:.5f} lr={ctl.lr:.2e} {(time.time() - t0) / (step - start + 1):.2f}s/step "
@@ -604,7 +698,9 @@ def phase_train(a) -> None:
         if a.snapshot_every and step % a.snapshot_every == 0:
             checkpoint(step, run / f"ckpt_step{step:07d}.pt")
         why = pauser.requested()
-        if why or step % a.save_every == 0 or step == last or time.time() - t_save > a.save_minutes * 60:
+        if guard.bad and not why:  # never roll the saved state forward onto a step the guard suspects
+            continue
+        if why or rolled or step % a.save_every == 0 or step == last or time.time() - t_save > a.save_minutes * 60:
             checkpoint(step)
             t_save = time.time()
         if why:
@@ -704,6 +800,12 @@ def main(argv=None) -> None:
     ap.add_argument("--save-every", type=int, default=100, help="rolling last.pt every N steps")
     ap.add_argument("--save-minutes", type=float, default=20.0, help="... and at least every M minutes")
     ap.add_argument("--snapshot-every", type=int, default=0, help="also keep numbered ckpt_stepN.pt (0 = off)")
+    ap.add_argument("--guard-ratio", type=float, default=0.0, help="divergence guard: loss above this x the EMA "
+                    "of healthy losses counts as diverging (0 = off); see Guard")
+    ap.add_argument("--guard-patience", type=int, default=3, help="consecutive diverging steps before a rollback")
+    ap.add_argument("--guard-every", type=int, default=25, help="healthy steps between in-memory rollback snapshots")
+    ap.add_argument("--guard-cut", type=float, default=0.5, help="LR scale factor applied at each rollback")
+    ap.add_argument("--guard-max", type=int, default=4, help="rollbacks before the run fails (GUARD_FAIL)")
     ap.add_argument("--stage", type=int, choices=[1, 2], default=1)
     ap.add_argument("--branch", default="", help="stage-2 branch name (each variant of stage 2 is its own branch)")
     ap.add_argument("--init-from", default="", help="stage 2: stage-1 final.pt (default <out>/stage1/final.pt)")

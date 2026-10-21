@@ -930,3 +930,56 @@ def test_big_matrix_update_is_the_whole_matrix_step(monkeypatch):
     for x, y in ((big.param.data, whole.param.data), (big.r, whole.r), (big.c, whole.c), (big.t, whole.t)):
         torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-7)
     assert not torch.equal(big.param.data, w)
+
+
+def _train_spiked(monkeypatch, model, lay, cache, out, spike_at, *extra):
+    """omk_qad.train in-process with the loss of step ``spike_at`` reported x100 (the updates stay real)."""
+    from omk_qad import train as T
+
+    real, calls = T.train_step, [0]
+
+    def spiked(*a, **k):
+        calls[0] += 1
+        loss = real(*a, **k)
+        return loss * 100 if calls[0] == spike_at else loss
+
+    monkeypatch.setattr(T, "train_step", spiked)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    T.main([*TRAIN, "--model", str(model), "--layout", str(lay), "--cache", str(cache), "--out", str(out),
+            "--steps", "3", "--eval-every", "3", "--save-every", "1", *extra])
+
+
+def test_guard_rolls_back_to_the_last_healthy_state_and_cuts_the_lr(setup, monkeypatch):
+    """bug-825: a diverging loss restores the snapshot bitwise, halves the LR scale and keeps it across a save."""
+    import shutil
+
+    model, lay = setup["moe"]
+    ref, run = WORK / "run_guard_ref", WORK / "run_guard"
+    for d in (ref, run):
+        if d.exists():
+            shutil.rmtree(d)  # test scratch of this test only
+    _train(model, lay, setup["cache"], ref, "--stop-at", "1")
+    guard = ("--guard-ratio", "2", "--guard-patience", "1", "--guard-every", "1", "--stop-at", "2")
+    _train_spiked(monkeypatch, model, lay, setup["cache"], run, 2, *guard)
+    log = (run / "stage1" / "log.txt").read_text()
+    assert "GUARD_ROLLBACK step 2 -> state of step 1, LR scale 0.5" in log, log[-2000:]
+    a = torch.load(ref / "stage1" / "last.pt", weights_only=False)
+    b = torch.load(run / "stage1" / "last.pt", weights_only=False)
+    assert a["step"] == 1 and b["step"] == 2 and b["guard"]["scale"] == 0.5 and b["guard"]["rollbacks"] == 1
+    for k in ("latents", "fp"):
+        assert all(torch.equal(a[k][n], b[k][n]) for n in a[k]), k  # step 2's update was undone exactly
+    for n, (r, c, t) in a["adafactor"].items():
+        r2, c2, t2 = b["adafactor"][n]
+        assert torch.equal(r, r2) and torch.equal(c, c2) and torch.equal(t, t2), n
+
+
+def test_guard_fails_loud_past_its_rollback_budget(setup, monkeypatch):
+    import shutil
+
+    model, lay = setup["moe"]
+    run = WORK / "run_guard_fail"
+    if run.exists():
+        shutil.rmtree(run)  # test scratch of this test only
+    with pytest.raises(SystemExit, match="GUARD_FAIL step 2"):
+        _train_spiked(monkeypatch, model, lay, setup["cache"], run, 2, "--guard-ratio", "2", "--guard-patience", "1",
+                      "--guard-every", "1", "--guard-max", "0")
