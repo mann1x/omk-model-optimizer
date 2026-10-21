@@ -867,3 +867,27 @@ def test_multi_students_share_only_the_teacher(setup):
     gpu = {**spec, "students": [{**s, "gpu": 0} for s in spec["students"]]}  # sharing a GPU needs a measured peak
     with pytest.raises(SystemExit, match="run 'preflight' first"):
         multi.fit(gpu, gpu["students"], {})
+
+
+def test_big_matrix_update_is_the_whole_matrix_step(monkeypatch):
+    """A matrix above CHUNK_ELEMS updates in row chunks (bounded memory) and lands where the whole-matrix step does."""
+    from omk_qad import fakequant as fq
+
+    torch.manual_seed(0)
+    w = torch.randn(300, 64)
+    grads = [torch.randn(300, 64) for _ in range(3)]
+    grads[1][17:40] = 0  # rows without gradient keep their statistics apart from the decay
+
+    def run(chunk: int) -> fq.Latent:
+        monkeypatch.setattr(fq, "CHUNK_ELEMS", chunk)
+        ctl = fq.Control(lr=1e-2, beta2=0.99)
+        lat = fq.Latent("w", torch.nn.Parameter(w.clone()), [], ctl, None, torch.float32)
+        for g in grads:
+            lat.update(g.clone())
+        return lat
+
+    whole, big = run(10**9), run(1000)  # 1000 elements -> 15 rows per chunk, 20 chunks
+    assert big.ctl.stats["updates"] == whole.ctl.stats["updates"] == 3
+    for x, y in ((big.param.data, whole.param.data), (big.r, whole.r), (big.c, whole.c), (big.t, whole.t)):
+        torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-7)
+    assert not torch.equal(big.param.data, w)

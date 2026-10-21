@@ -379,6 +379,12 @@ class Latent:
         b = self.r.shape[0]
         g3 = grad.reshape(b, self.rows // b, self.cols)
         lat3 = self.param.data.reshape(b, self.rows // b, self.cols)
+        if g3[0].numel() > CHUNK_ELEMS:  # one matrix above a chunk (a 2-D embedding/head): rows in chunks
+            for e in range(b):
+                self._update_big(e, g3[e], lat3[e])
+            self.version += 1
+            ctl.stats["updates"] += 1
+            return
         per = max(1, CHUNK_ELEMS // max(1, g3[0].numel()))
         for s0 in range(0, b, per):
             sl = slice(s0, min(s0 + per, b))
@@ -402,6 +408,41 @@ class Latent:
             lat3[sl] = sr_cast(new, self.param.dtype)
         self.version += 1
         ctl.stats["updates"] += 1
+
+    def _update_big(self, e: int, g: torch.Tensor, lat: torch.Tensor) -> None:
+        """The :meth:`update` step of one [R, C] matrix, CHUNK_ELEMS rows at a time (bonsai27 ``Store.update``).
+
+        Three passes keep the result the whole-matrix step: second moments, then the unit-RMS norm of the
+        update over every chunk, then the write. Done whole, a 636M-weight tied head held ~10 float32 copies
+        at once (46 GiB peak for a 4B model).
+        """
+        ctl = self.ctl
+        n_r = g.shape[0]
+        step = max(1, CHUNK_ELEMS // self.cols)
+        spans = [(r0, min(r0 + step, n_r)) for r0 in range(0, n_r, step)]
+        if not any(bool(g[r0:r1].abs().amax() > 0) for r0, r1 in spans):
+            return
+        b2 = ctl.beta2
+        csum = torch.zeros_like(self.c[e])
+        for r0, r1 in spans:
+            g2 = g[r0:r1].square() + ctl.eps
+            self.r[e, r0:r1] = b2 * self.r[e, r0:r1] + (1 - b2) * g2.mean(-1)
+            csum += g2.sum(0)
+        self.c[e] = b2 * self.c[e] + (1 - b2) * csum / n_r
+        self.t[e] += 1
+        bc = 1 - ctl.beta2 ** self.t[e].clamp(min=1)
+        rh, ch = self.r[e] / bc, self.c[e] / bc
+        den = rh.mean().clamp(min=1e-30)
+
+        def u_of(r0: int, r1: int) -> torch.Tensor:
+            return g[r0:r1] / (rh[r0:r1, None] * ch[None, :] / den).sqrt().clamp(min=1e-15)
+
+        sq = torch.zeros((), device=g.device)
+        for r0, r1 in spans:
+            sq += u_of(r0, r1).square().sum()
+        scale = ((sq / g.numel()).sqrt() / ctl.clip).clamp(min=1.0)
+        for r0, r1 in spans:
+            lat[r0:r1] = sr_cast(lat[r0:r1].float() - ctl.lr * u_of(r0, r1) / scale, self.param.dtype)
 
 
 class _Served(torch.autograd.Function):
