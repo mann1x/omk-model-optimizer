@@ -226,7 +226,8 @@ def build_student(a, layout: dict):
     from .fakequant import Codec
 
     ctl = Control(compute_dtype=torch.bfloat16 if cuda else torch.float32, beta2=a.beta2, clip=a.clip,
-                  ggml_refresh=a.ggml_refresh, dummy=torch.zeros((), requires_grad=True, device=a.device),
+                  ggml_refresh=a.ggml_refresh, refresh=getattr(a, "refresh", 1),
+                  dummy=torch.zeros((), requires_grad=True, device=a.device),
                   hadamard_block=layout.get("hadamard_block"))
     codec = Codec(Path(layout["llama_cpp"]), ternary_method=getattr(a, "ternary_method", "top:86"))
     latent_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[a.latent_dtype]
@@ -433,6 +434,9 @@ def save_state(path: Path, step: int, latents, student, opt, a, ctl=None, result
           "fp": {n: p.detach().cpu() for n, p in named.items() if n not in latents},
           "rng": _rng_state(), "stats": dict(ctl.stats) if ctl else {}, "results": results or [],
           "folded": {n: lat.basis.block for n, lat in latents.items() if lat.basis is not None},
+          # a refresh window serves payloads older than the latent: a resume must serve the same ones
+          "payloads": {n: lat.cache_state() for n, lat in latents.items()}
+          if max(getattr(a, "refresh", 1), getattr(a, "ggml_refresh", 1)) > 1 else {},
           "saved_at": time.time(), **(extra or {})}
     path = Path(path)
     torch.save(sd, str(path) + ".tmp")
@@ -455,6 +459,8 @@ def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = 
         if (n in was) == now and (not now or was[n] == lat.basis.block):
             lat.param.data.copy_(ck["latents"][n])
             lat.touch()
+            if not weights_only and n in ck.get("payloads", {}):
+                lat.load_cache(ck["payloads"][n])
         elif now and n not in was and weights_only:  # e.g. a stage-2 ternary branch from a model-basis stage 1
             lat.set_model_weight(ck["latents"][n])
         else:
@@ -691,6 +697,8 @@ def main(argv=None) -> None:
     ap.add_argument("--ternary-method", default="top:86", help="ternarizer of PQ2_0 / PTQ1_0 tensors: top:K | opt")
     ap.add_argument("--export-only", default="embedding", help="classes quantized at export only, not in training")
     ap.add_argument("--ggml-refresh", type=int, default=1, help="re-encode libggml-typed segments every N steps")
+    ap.add_argument("--refresh", type=int, default=1,
+                    help="re-encode ModelOpt-typed segments (IQ1/IQ2/Q8_0) every N steps instead of every update")
     ap.add_argument("--gate", type=float, default=0.01, help="max top-K KL of the unquantized student (lossless gate)")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--save-every", type=int, default=100, help="rolling last.pt every N steps")

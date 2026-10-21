@@ -16,7 +16,9 @@ Served weights are swapped into ``module._parameters`` by a forward pre-hook and
 hook, so they exist for one module call at a time (gradient-checkpoint recompute runs the hooks again;
 the packed encoding is cached per latent version, so a recompute only decodes). The version is the
 latent's own counter, bumped by every write (``Latent.touch``): writes go through ``.data``, whose version
-counter is separate from the parameter's.
+counter is separate from the parameter's. ``Control.refresh`` / ``ggml_refresh`` let an optimizer update
+keep a payload for N steps (re-encoded at most every N steps); a write outside the optimizer
+(``touch``) always drops it. Checkpoints carry the payloads, so a resume serves what the straight run did.
 """
 
 from __future__ import annotations
@@ -161,6 +163,7 @@ class Control:
     bypass: bool = False  # serve the latent unquantized (lossless gate)
     step: int = 0
     ggml_refresh: int = 1  # re-encode libggml segments every N steps (1 = every change)
+    refresh: int = 1  # re-encode ModelOpt segments (IQ1/IQ2/Q8_0) every N steps (1 = every change)
     hadamard_block: int | None = None  # the model's one Hadamard block (layout["hadamard_block"]) for ternary latents
     dummy: torch.Tensor = field(default_factory=lambda: torch.zeros((), requires_grad=True))
     stats: dict = field(default_factory=lambda: {"encodes": 0, "updates": 0, "undelivered": 0})
@@ -315,10 +318,8 @@ class Latent:
                 if seg.colperm is not None:
                     x = x[:, seg.colperm.to(x.device)]
                 hit = self._cache.get(k)
-                fresh = hit is not None and (
-                    hit[0] == version
-                    or (seg.qtype not in MODELOPT_TYPES and self.ctl.step - hit[1] < self.ctl.ggml_refresh)
-                )
+                every = self.ctl.refresh if seg.qtype in MODELOPT_TYPES else self.ctl.ggml_refresh
+                fresh = hit is not None and (hit[0] == version or self.ctl.step - hit[1] < every)
                 if fresh:
                     payload = hit[2]
                 else:
@@ -343,8 +344,27 @@ class Latent:
         return out
 
     def touch(self) -> None:
-        """Mark the latent as written (any write outside :meth:`update`, e.g. a checkpoint load)."""
+        """Mark the latent as written (any write outside :meth:`update`, e.g. a checkpoint load).
+
+        Drops every cached payload: a refresh window only defers re-encoding across optimizer steps.
+        """
         self.version += 1
+        self._cache = {}
+
+    def cache_state(self) -> dict:
+        """Cached payloads {chunk: (step encoded, payload on CPU, encoded from the current latent)}."""
+        return {k: (s, p.cpu() if isinstance(p, torch.Tensor) else p, v == self.version)
+                for k, (v, s, p) in self._cache.items()}
+
+    def load_cache(self, state: dict) -> None:
+        """Restore :meth:`cache_state` after the latent itself was loaded (and touched).
+
+        Only a payload that was current stays current; a stale one gets a version no write reaches, so the
+        refresh window alone decides when it is re-encoded, as it did before the checkpoint.
+        """
+        dev = self.param.device
+        self._cache = {k: (self.version if cur else -1, s, p.to(dev) if isinstance(p, torch.Tensor) else p)
+                       for k, (s, p, cur) in state.items()}
 
     # ---------------------------------------------------------------- gradient delivery + update
     def add_use(self) -> None:

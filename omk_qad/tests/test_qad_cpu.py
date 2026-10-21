@@ -402,6 +402,45 @@ def test_pause_resume_is_bitwise_and_stage2_branches(setup):
     assert p.returncode != 0 and "--branch" in p.stdout + p.stderr
 
 
+def test_refresh_window_defers_encodes_and_resumes_bitwise(setup):
+    """--refresh / --ggml-refresh N: fewer encodes than every update; PAUSE + relaunch == straight run (bitwise)."""
+    import shutil
+
+    model, lay = setup["moe"]
+    every, win, paused = WORK / "run_refresh1", WORK / "run_refresh2", WORK / "run_refresh2_paused"
+    for d in (every, win, paused):
+        if d.exists():
+            shutil.rmtree(d)  # test scratch of this test only
+    w2 = ("--refresh", "2", "--ggml-refresh", "2")
+    _train(model, lay, setup["cache"], every)
+    _train(model, lay, setup["cache"], win, *w2)
+    (paused / "stage1").mkdir(parents=True)
+    (paused / "stage1" / "PAUSE").touch()
+    p = _train(model, lay, setup["cache"], paused, *w2)
+    assert "PAUSED at step 1" in p.stdout + p.stderr
+    p = _train(model, lay, setup["cache"], paused, *w2)
+    assert "RESUME from step 1" in p.stdout + p.stderr
+    fe, fw, fp = (torch.load(d / "stage1" / "final.pt", weights_only=False) for d in (every, win, paused))
+    assert fw["stats"]["encodes"] < fe["stats"]["encodes"], (fw["stats"], fe["stats"])
+    assert fw["payloads"] and not fe["payloads"]  # carried only when a window can serve a stale payload
+    for k in ("latents", "fp"):
+        assert all(torch.equal(fw[k][n], fp[k][n]) for n in fw[k]), k
+
+
+def test_touch_drops_cached_payloads():
+    """A write outside the optimizer is never served from a refresh window's cache."""
+    from omk_qad import fakequant as fq
+
+    ctl = fq.Control(refresh=100, ggml_refresh=100)
+    lat = fq.Latent("w", torch.nn.Parameter(torch.randn(8, 16)), [], ctl, None, torch.float32)
+    lat._cache = {0: (lat.version, 0, torch.zeros(4, dtype=torch.uint8))}
+    state = lat.cache_state()
+    lat.touch()
+    assert lat._cache == {}
+    lat.load_cache(state)
+    assert lat._cache[0][0] == lat.version and lat._cache[0][1] == 0
+
+
 def test_tied_train_export_verify_load(setup):
     """Tied embeddings + MTP (Qwen3.5-4B shape) train, export and load.
 
