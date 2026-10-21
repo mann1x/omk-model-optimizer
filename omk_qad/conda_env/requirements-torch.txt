@@ -1,0 +1,4 @@
+# omk-modelopt: torch from the CUDA 12.8 wheel index (installs 2.10.0+cu128, triton 3.6.0).
+# The CUDA toolkit that builds JIT/source extensions (CUDA_HOME) must be 12.8 to match -- see README.md.
+--index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0

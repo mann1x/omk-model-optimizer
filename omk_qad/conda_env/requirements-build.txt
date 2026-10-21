@@ -1,0 +1,5 @@
+# omk-modelopt: CUDA source builds. Installed with
+#   CUDA_HOME=<cuda 12.8> TORCH_CUDA_ARCH_LIST=<arch> CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+#   pip install --no-build-isolation --no-deps -r requirements-build.txt
+# (setup_conda_env.sh does this). No-build-isolation: it must compile against the env's torch.
+causal-conv1d==1.6.1

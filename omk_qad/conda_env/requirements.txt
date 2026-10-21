@@ -1,0 +1,38 @@
+# omk-modelopt: runtime + test requirements of omk_qad and the modelopt fork it imports.
+# Pinned to the solidpc env every omk_qad milestone (M1-M5) was validated on. Install AFTER
+# requirements-torch.txt; the repo itself goes in with `pip install --no-deps -e .` (these pins cover
+# modelopt's [project].dependencies). causal-conv1d is built separately: requirements-build.txt.
+
+# --- model loading / data
+transformers==5.5.0
+tokenizers==0.22.2
+sentencepiece==0.2.1
+safetensors==0.8.0
+huggingface_hub==1.33.0
+accelerate==1.13.0
+numpy==1.26.4
+pyarrow==24.0.0          # .parquet training sources
+gguf==0.18.0             # GGUF reader/writer (export, imatrix); llama.cpp's own conversion/ comes from --llama-cpp
+PyYAML==6.0.3            # omk_qad.multi specs
+
+# --- Qwen3.5 / Qwen3.6 linear attention fast path (transformers' is_fast_path_available)
+einops==0.8.2
+fla-core==0.5.0
+flash-linear-attention==0.5.0
+
+# --- modelopt core ([project].dependencies of pyproject.toml)
+ninja==1.13.0
+nvidia-ml-py==13.595.45
+packaging==24.2
+setuptools==82.0.1       # torch.utils.cpp_extension imports setuptools at load time; modelopt wants >=80
+tqdm==4.67.3
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3   # omegaconf 2.3's grammar needs 4.9.x: 4.11 breaks `import modelopt.torch`
+PuLP==3.3.2
+pydantic==2.13.4
+regex==2026.4.4
+rich==15.0.0
+scipy==1.17.1
+
+# --- tests
+pytest==9.0.3

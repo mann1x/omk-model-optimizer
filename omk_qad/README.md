@@ -24,8 +24,12 @@ Reference recipe: NVIDIA Nemotron 3.5 Bolt 74B-A9B 24GB (experts IQ2_XXS + QAD, 
 | `ternary_gate.py` | Engine-gate controls of a ternary GGUF: `unfold` (ternary tensors unfolded to F32, no prism keys: the weights the ternary file serves, as a plain model) and `flip` (signs negated: a negative control). An engine serves what training served if its KLD on the ternary file against the unfold control is ~0, and the flip control is far. Tiny tied model, both engines: 0.00075 vs 0.52. |
 | `multi.py` | Separate students over one shared teacher (e.g. an IQ2_XXS and a ternary student). A spec (YAML/JSON) lists the students, each with its own layout, hyper-parameters and GPU. Shared once: the layout probe, the teacher top-K cache, the eval rows and the imatrix pass. Per student: one `omk_qad.train` process each, run concurrently; each pauses, resumes and fails on its own. Phases: `plan` (one layout per student; an existing one is never replaced; ternary block == the shared folded imatrix's), `cache`, `preflight` (each student alone for a few steps: `PEAK_MEM`; students sharing a GPU must fit, or `train` refuses), `train`, `export`, `report` (one table, per eval family). |
 
+Environment: the `omk-modelopt` conda env, built and verified by `bash omk_qad/conda_env/setup_conda_env.sh`
+(pinned requirements, this repo editable, CUDA 12.x toolkit rules, `OMK_ENV_OK` check). See
+[`conda_env/README.md`](conda_env/README.md).
+
 ```bash
-ENV=/root/anaconda3/envs/omk-modelopt/bin/python
+ENV=$(conda info --base)/envs/omk-modelopt/bin/python
 $ENV -m omk_qad.census --model DIR                       # meta-device census, no weights read
 $ENV -m omk_qad.ptq --model DIR --out PACKED [--policy routed_experts=iq2_s,...] [--algorithm imatrix --calib-text F]
 $ENV -m omk_qad.gguf_export --src PACKED --out X.gguf [--llama-cpp /opt/llama.cpp] [--decoded-f32]
