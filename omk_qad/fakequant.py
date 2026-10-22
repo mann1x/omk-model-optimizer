@@ -95,7 +95,10 @@ class Codec:
             from modelopt.torch.quantization.ggml import GGML_FORMAT_REGISTRY
 
             shape = torch.tensor([rows, cols], dtype=torch.int64)
-            return GGML_FORMAT_REGISTRY[qtype.lower()].dequantize(packed, shape, dtype=dtype).reshape(rows, cols)
+            # ModelOpt dequantizes on the payload's device; honour ``device`` like the other branches
+            # (export encodes on the GPU and decodes to CPU for its numpy verification).
+            out = GGML_FORMAT_REGISTRY[qtype.lower()].dequantize(packed, shape, dtype=dtype)
+            return out.reshape(rows, cols).to(device=device)
         out = self.ggml.dequantize(int(self.qtype(qtype)), packed, cols)
         return torch.from_numpy(out).to(device=device, dtype=dtype)
 

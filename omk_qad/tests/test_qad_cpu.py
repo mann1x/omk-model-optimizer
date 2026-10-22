@@ -135,6 +135,22 @@ def test_ggml_codec_matches_gguf_py():
         assert np.array_equal(d, gguf.quants.dequantize(q, qt).reshape(d.shape)), name
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the payload must live on the GPU to show the bug")
+@pytest.mark.parametrize("qtype", ["IQ2_XXS", "IQ2_S", "Q4_K", "PQ2_0"])
+def test_codec_decode_honours_device(qtype):
+    """decode(..., "cpu") of a GPU-encoded payload is a CPU tensor for every codec branch.
+
+    Export verifies with numpy; the ModelOpt branch returned the payload's device, so the M6 export died on .numpy().
+    """
+    from omk_qad.fakequant import Codec
+
+    codec = Codec(LLAMA_CPP)
+    x = torch.randn(32, 512, device="cuda") * 0.02
+    payload = codec.encode(qtype, x, None)
+    d = codec.decode(qtype, payload, 32, 512, "cpu")
+    assert d.device.type == "cpu" and tuple(d.shape) == (32, 512)
+
+
 @pytest.mark.parametrize("kind", ["moe", "dense_tied"])
 def test_gradients_match_autograd(setup, kind):
     """Hook path (served weights, use counting, checkpoint recompute, chunked head) == plain autograd.
