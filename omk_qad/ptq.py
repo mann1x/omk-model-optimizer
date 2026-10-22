@@ -14,8 +14,50 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from .census import build_quant_cfg, run_census
+
+_TORCH_KERNELS = {  # linear-attention kernel attribute -> the modeling module's torch implementation
+    "causal_conv1d_update": "torch_causal_conv1d_update",
+    "chunk_gated_delta_rule": "torch_chunk_gated_delta_rule",
+    "recurrent_gated_delta_rule": "torch_recurrent_gated_delta_rule",
+}
+
+
+def use_torch_kernels(model: nn.Module) -> int:
+    """Bind the torch linear-attention kernels on a model that runs on the CPU; returns the layers rebound.
+
+    transformers binds causal-conv1d / fla (CUDA / Triton only) whenever CUDA is VISIBLE, not when the model is on
+    a GPU, so a CPU model in a process that sees a GPU dies in ``causal_conv1d_fwd`` (``x.is_cuda()``). Each
+    Qwen3.5-style mixer gets the torch functions of its own modeling module, and the fla FusedRMSNormGated its
+    torch RMSNormGated twin (same weight, eps, SiLU gate) -- exactly what transformers binds with CUDA hidden.
+    """
+    import sys
+
+    n = 0
+    for m in model.modules():
+        if not hasattr(m, "causal_conv1d_fn"):
+            continue
+        mod = sys.modules[type(m).__module__]
+        m.causal_conv1d_fn = None  # None = the module's own F.conv1d path
+        for attr, fn in _TORCH_KERNELS.items():
+            if hasattr(m, attr):
+                if not hasattr(mod, fn):
+                    raise RuntimeError(f"{type(m).__name__}.{attr}: {mod.__name__} has no {fn} to run on the CPU")
+                setattr(m, attr, getattr(mod, fn))
+        fused = getattr(mod, "FusedRMSNormGated", None)
+        norm = getattr(m, "norm", None)
+        if fused is not None and isinstance(norm, fused):
+            twin = [c for c in vars(mod).values()
+                    if isinstance(c, type) and c is not fused and c.__name__.endswith("RMSNormGated")]
+            if len(twin) != 1:
+                raise RuntimeError(f"{type(m).__name__}.norm: no unique torch RMSNormGated in {mod.__name__}")
+            cpu_norm = twin[0](norm.hidden_size, eps=norm.eps)
+            cpu_norm.weight = norm.weight  # the same Parameter: optimizers / state dicts are untouched
+            m.norm = cpu_norm
+        n += 1
+    return n
 
 
 def load_text_causal_lm(model_dir: str, device: str, dtype: torch.dtype = torch.bfloat16):
@@ -24,6 +66,8 @@ def load_text_causal_lm(model_dir: str, device: str, dtype: torch.dtype = torch.
 
     config = AutoConfig.from_pretrained(model_dir).get_text_config()
     model = AutoModelForCausalLM.from_pretrained(model_dir, config=config, dtype=dtype, device_map={"": device})
+    if torch.device(device).type == "cpu":
+        use_torch_kernels(model)
     model.eval()
     return model, AutoTokenizer.from_pretrained(model_dir)
 

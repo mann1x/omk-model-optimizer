@@ -69,6 +69,10 @@ def attach(model: nn.Module) -> MTPHead:
     """Create ``model.mtp`` (same device/dtype as the trunk's final norm) and return it."""
     ref = model.get_decoder().norm.weight
     head = MTPHead(model).to(device=ref.device, dtype=ref.dtype)
+    if ref.device.type == "cpu":  # same rule as the trunk (ptq.use_torch_kernels): no CUDA-only kernel on the CPU
+        from .ptq import use_torch_kernels
+
+        use_torch_kernels(head)
     model.mtp = head
     return head
 

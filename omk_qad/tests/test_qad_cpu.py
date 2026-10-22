@@ -151,6 +151,30 @@ def test_codec_decode_honours_device(qtype):
     assert d.device.type == "cpu" and tuple(d.shape) == (32, 512)
 
 
+def test_cpu_model_runs_torch_kernels_whether_or_not_a_gpu_is_visible(setup):
+    """A CPU model is bound to the torch linear-attention kernels even in a process that SEES a GPU.
+
+    transformers binds causal-conv1d / fla whenever CUDA is visible; on CPU tensors they die (x.is_cuda()). The
+    forward here must equal, bit for bit, the same forward in a process with no visible GPU.
+    """
+    from omk_qad.ptq import load_text_causal_lm
+
+    model, _ = setup["moe"]
+    m, _ = load_text_causal_lm(str(model), "cpu", torch.float32)
+    mixers = [x for x in m.modules() if hasattr(x, "causal_conv1d_fn")]
+    assert mixers and all(x.causal_conv1d_fn is None for x in mixers)
+    assert not any(type(x.norm).__name__ == "FusedRMSNormGated" for x in mixers)
+    with torch.no_grad():
+        here = m(torch.arange(1, 33)[None]).logits
+    ref = WORK / "cpu_kernels_ref.pt"
+    code = ("import torch; from omk_qad.ptq import load_text_causal_lm; "
+            f"m, _ = load_text_causal_lm({str(model)!r}, 'cpu', torch.float32); "
+            f"torch.save(m(torch.arange(1, 33)[None]).logits.detach(), {str(ref)!r})")
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=CPU_ENV, check=False)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert torch.equal(here, torch.load(ref))
+
+
 @pytest.mark.parametrize("kind", ["moe", "dense_tied"])
 def test_gradients_match_autograd(setup, kind):
     """Hook path (served weights, use counting, checkpoint recompute, chunked head) == plain autograd.
