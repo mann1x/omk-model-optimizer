@@ -14,6 +14,7 @@ part file exists. The gated Post-Training-v2 goes through `hf download`, which u
 login: no token is read or passed here. Stdlib only.
 """
 import argparse
+import fnmatch
 import hashlib
 import json
 import subprocess
@@ -46,8 +47,9 @@ GATED = ("Post-Training-Dataset-v2",
           "data/multilingual_it-00000-*", "data/multilingual_ja-00000-*", "README.md"])
 
 
-def api(kind, rid):
-    with urllib.request.urlopen(f"{HF}/api/{kind}/{rid}?blobs=true", timeout=60) as r:
+def api(kind, rid, rev=None):
+    rv = f"/revision/{rev}" if rev else ""
+    with urllib.request.urlopen(f"{HF}/api/{kind}/{rid}{rv}?blobs=true", timeout=60) as r:
         return json.load(r)
 
 
@@ -100,13 +102,25 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=Path("/mnt/sdc/omk-model-optimizer"))
     ap.add_argument("--only", default="models,fineweb,full,windowed,gated")
+    ap.add_argument("--sets", default="", help="full/windowed: only these Nemotron sets (comma list; default all)")
+    ap.add_argument("--files", default="", help="full: only files matching these globs (comma list; default all)")
     a = ap.parse_args()
     only = set(a.only.split(","))
+    sets = set(filter(None, a.sets.split(",")))
+    globs = [g for g in a.files.split(",") if g]
     logs = a.root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     nem = a.root / "data" / "nemotron"
     man_p = nem / "manifest.json"
     man = json.loads(man_p.read_text()) if man_p.exists() else {}
+
+    def info(n):
+        """A set already in the manifest is re-fetched at ITS revision: row offsets recorded by build_mix stay valid."""
+        rid = f"nvidia/Nemotron-{n}"
+        return rid, api("datasets", rid, (man.get(n) or {}).get("sha"))
+
+    def wanted(f):
+        return not globs or any(fnmatch.fnmatch(f, g) for g in globs)
 
     def save():
         nem.mkdir(parents=True, exist_ok=True)
@@ -135,19 +149,22 @@ def main():
     if "full" in only:
         ent = []
         for n in FULL:
-            rid = f"nvidia/Nemotron-{n}"
-            d = api("datasets", rid)
+            if sets and n not in sets:
+                continue
+            rid, d = info(n)
             for s in d["siblings"]:
-                ent.append((url("datasets", rid, s["rfilename"], d["sha"]), str(nem / n), s["rfilename"],
-                            (s.get("lfs") or {}).get("sha256")))
+                if wanted(s["rfilename"]):
+                    ent.append((url("datasets", rid, s["rfilename"], d["sha"]), str(nem / n), s["rfilename"],
+                                (s.get("lfs") or {}).get("sha256")))
             man[n] = {"repo": rid, "sha": d["sha"], "mode": "full",
                       "files": {s["rfilename"]: s.get("size") for s in d["siblings"]}}
         save()
         aria(ent, logs / "nemotron_full.log")
     if "windowed" in only:
         for n, (nwin, wbytes) in WINDOWED.items():
-            rid = f"nvidia/Nemotron-{n}"
-            d = api("datasets", rid)
+            if sets and n not in sets:
+                continue
+            rid, d = info(n)
             rec = man.setdefault(n, {"repo": rid, "sha": d["sha"], "mode": "windowed", "files": {}})
             small = []
             for s in d["siblings"]:

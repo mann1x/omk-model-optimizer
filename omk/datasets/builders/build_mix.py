@@ -30,7 +30,33 @@ SOURCES = {  # name -> (files under data/nemotron, train token budget)
     "cp_reasoning": ([f"{CP}/competitive_programming_{x}.jsonl.windows.jsonl"
                       for x in ("python_00", "python_01", "cpp_00", "cpp_01")], 1_500_000),
     "exercism_sql": ([f"{CP}/exercism.jsonl", f"{CP}/text_to_sql.jsonl"], 1_000_000),
+    # opt-in (not in mix_v1): agentic tool calling, for the families stage 1 fitted worst (bm-885)
+    "agentic": ([f"SFT-Agentic-v2/data/{x}.jsonl" for x in ("tool_calling", "interactive_agent")], 3_000_000),
 }
+MIX_V1 = "opencode,swe_agentless,cp_reasoning,exercism_sql"
+
+
+def excluded(paths: list[str]) -> tuple[set, set]:
+    """Rows of earlier mixes, never drawn again.
+
+    (file, byte offset) of every train AND eval row their manifests record, plus the sha256 of every document they
+    wrote: upstream sets repeat a conversation at another offset (bm-885: one such OpenCode duplicate).
+    """
+    rows, texts = set(), set()
+    for p in paths:
+        for name, s in json.loads(Path(p).read_text())["sources"].items():
+            for split in ("train", "eval"):
+                rows.update((s["files"][fi], off) for fi, off in s.get(split, {}).get("rows", []))
+                out = Path(p).parent / f"{name}.{split}.jsonl"
+                if out.exists():
+                    with out.open() as f:
+                        texts.update(text_sha(json.loads(ln)["text"]) for ln in f if ln.strip())
+    return rows, texts
+
+
+def text_sha(text: str) -> str:
+    """Identity of a rendered document."""
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def offsets(path: Path) -> list[int]:
@@ -131,26 +157,34 @@ def main():
     ap.add_argument("--margin", type=float, default=1.05)
     ap.add_argument("--n-eval", type=int, default=32)
     ap.add_argument("--seed", type=int, default=20261021)
-    ap.add_argument("--only", default=",".join(SOURCES))
+    ap.add_argument("--only", default=MIX_V1)
+    ap.add_argument("--name", default="mix_v1", help="output mix: ROOT/data/<name>")
+    ap.add_argument("--exclude", default="", help="comma list of earlier mix manifests whose rows must not be reused")
+    ap.add_argument("--budget", default="", help="train token budget overrides: name=tokens,...")
     ap.add_argument("--preview", type=int, default=0, help="print N rendered docs per source and stop")
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.tokenizer)
-    out_dir = a.root / "data" / "mix_v1"
+    skip, seen_text = excluded([p for p in a.exclude.split(",") if p])
+    budgets = {k: int(float(v)) for k, v in (kv.split("=") for kv in a.budget.split(",") if kv)}
+    out_dir = a.root / "data" / a.name
     out_dir.mkdir(parents=True, exist_ok=True)
     up = json.loads((a.root / NEM / "manifest.json").read_text())
     man_p = out_dir / "manifest.json"
     man = json.loads(man_p.read_text()) if man_p.exists() else {"sources": {}}
-    man.update(tokenizer=a.tokenizer, cap=a.cap, margin=a.margin, seed=a.seed)
+    man.update(tokenizer=a.tokenizer, cap=a.cap, margin=a.margin, seed=a.seed,
+               **({"excludes": a.exclude.split(",")} if skip else {}))
     for name in a.only.split(","):
         files, budget = SOURCES[name]
+        budget = budgets.get(name, budget)
         rng = random.Random(f"{a.seed}:{name}")
         pool = []
         for fi, f in enumerate(files):
             p = a.root / NEM / f
-            pool += [(fi, o) for o in offsets(p)]
-            print(f"{name}: {f} rows={len(pool)}", flush=True)
+            rows = offsets(p)
+            pool += [(fi, o) for o in rows if (f, o) not in skip]
+            print(f"{name}: {f} rows={len(rows)} usable={len(pool)}", flush=True)
         rng.shuffle(pool)
         handles = [open(a.root / NEM / f, "rb") for f in files]
         if a.preview:
@@ -169,7 +203,7 @@ def main():
         it = iter(pool)
         for split, target in (("eval", None), ("train", int(budget * a.margin))):
             path = out_dir / f"{name}.{split}.jsonl"
-            toks = docs = bad = long_prompt = 0
+            toks = docs = bad = long_prompt = dup = 0
             used = []
             with open(path, "w") as o:
                 for fi, off in it:
@@ -178,10 +212,13 @@ def main():
                     except PromptTooLong:
                         long_prompt += 1
                         continue
-                    except Exception as e:  # noqa: BLE001 - a row the template cannot render is skipped and counted
+                    except Exception as e:
                         bad += 1
                         if bad <= 3:
                             print(f"   skip {files[fi]}@{off}: {type(e).__name__}: {str(e)[:120]}", flush=True)
+                        continue
+                    if seen_text and text_sha(t) in seen_text:  # an earlier mix wrote this same document
+                        dup += 1
                         continue
                     o.write(json.dumps({"text": t}) + "\n")
                     toks += n
@@ -192,11 +229,14 @@ def main():
             if target is not None and toks < target:
                 raise SystemExit(f"{name}: only {toks} tokens < {target}")
             stats[split] = {"docs": docs, "tokens": toks, "skipped": bad, "skipped_long_prompt": long_prompt,
+                            **({"skipped_duplicate": dup} if seen_text else {}),
                             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "rows": used}
-            print(f"{name}.{split}: docs={docs} tokens={toks} skipped={bad} long_prompt={long_prompt}", flush=True)
+            print(f"{name}.{split}: docs={docs} tokens={toks} skipped={bad} long_prompt={long_prompt} duplicate={dup}",
+                  flush=True)
         upstream = {s: up[s.split("/")[0]]["sha"] for s in {f.split("/")[0] for f in files} if s in up}
         man["sources"][name] = {"files": files, "budget": budget, "drop_system": name in DROP_SYSTEM,
-                                "upstream_sha": upstream, **stats}
+                                "upstream_sha": upstream, **stats,
+                                **({"excluded_rows": sum(f in files for f, _ in skip)} if skip else {})}
         man_p.write_text(json.dumps(man, indent=1))
         for h in handles:
             h.close()
