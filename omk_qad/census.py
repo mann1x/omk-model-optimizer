@@ -41,10 +41,19 @@ FORMATS = {
     "iq2_xxs": (256, 2.0625),
     "iq2_xs": (256, 2.3125),
     "iq2_s": (256, 2.5625),
+    "iq3_xxs": (256, 3.0625),
+    "iq3_s": (256, 3.4375),
+    "iq4_nl": (32, 4.5),
+    "iq4_xs": (256, 4.25),
     "q8_0": (32, 8.5),
     "none": (1, 16.0),
 }
-FALLBACK = {"iq1_s": "q8_0", "iq1_m": "q8_0", "iq2_xxs": "q8_0", "iq2_xs": "q8_0", "iq2_s": "q8_0", "q8_0": "none"}
+FALLBACK = {
+    "iq1_s": "q8_0", "iq1_m": "q8_0", "iq2_xxs": "q8_0", "iq2_xs": "q8_0", "iq2_s": "q8_0",
+    "iq3_xxs": "iq4_nl", "iq3_s": "iq4_nl",  # llama-quantize's fallback for rows not a multiple of 256
+    "iq4_xs": "iq4_nl", "iq4_nl": "q8_0",  # llama-quantize's own IQ4_XS -> IQ4_NL fallback
+    "q8_0": "none",
+}
 # Bolt's map (report Table 2), with the Mamba-style NVFP4 layers held at Q8_0 until llama.cpp NVFP4 is verified here.
 DEFAULT_POLICY = {
     "routed_experts": "iq2_xxs",
@@ -230,6 +239,8 @@ def apply_policy(census: Census, policy: dict[str, str]) -> Census:
 
 
 def _numerics(fmt: str) -> dict:
+    if fmt in ("iq3_xxs", "iq3_s", "iq4_nl", "iq4_xs"):  # omk_qad's own encoders: QAD (layout.plan_layout) only
+        raise ValueError(f"{fmt} is not a ModelOpt ggml format: train it with omk_qad (fixed/policy), not ptq")
     block, bits = FORMATS[fmt]
     return {"num_bits": fmt, "block_sizes": {-1: block}, "backend": "ggml", "effective_bits": bits}
 

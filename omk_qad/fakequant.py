@@ -5,7 +5,8 @@ Every large weight is a *latent* (float16 on GPU, 2 bytes/weight; stochastic rou
 value is built when its module runs: for each GGUF tensor the layout maps to it, the latent rows the GGUF
 tensor holds are gathered in GGUF column order (so the GGML blocks are exactly the GGUF's), encoded to the
 planned type, decoded and scattered back. Encoders: ModelOpt (torch/CUDA) for IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/
-IQ2_S/Q8_0, libggml (the code llama-quantize runs) for everything else (IQ3_S, K-quants, ...). Export
+IQ2_S/Q8_0, omk_qad.iq4 / omk_qad.iq3 (CUDA, byte-identical to llama-quantize) for IQ4_XS/IQ4_NL/IQ3_XXS/
+IQ3_S, libggml (the code llama-quantize runs) for everything else (K-quants, ...). Export
 re-encodes the final latent with the same encoder, so the GGUF holds the blocks training served.
 
 The gradient of the served weight is the latent's gradient (straight-through). It is captured in the
@@ -33,9 +34,19 @@ import torch
 import torch.nn as nn
 
 MODELOPT_TYPES = {"IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q8_0"}
+# omk_qad's own CUDA encoders, byte-identical to llama-quantize (no CPU fallback on a CUDA device)
+NATIVE_TYPES = {"IQ4_XS": "iq4", "IQ4_NL": "iq4", "IQ3_XXS": "iq3", "IQ3_S": "iq3"}  # type -> omk_qad module
+GPU_TYPES = MODELOPT_TYPES | set(NATIVE_TYPES)  # encoded on the training device (``refresh``); the rest by libggml
 FLOAT_TYPES = {"F32", "F16", "BF16"}
 TERNARY_TYPES = {"PQ2_0", "PTQ1_0"}  # PrismML Bonsai 2 (omk_qad.ternary); the latent lives in the folded basis
 CHUNK_ELEMS = 64 * 2**20  # rows are encoded / updated in chunks of about this many values
+
+
+def _native(qtype: str):
+    """The omk_qad module (iq4 / iq3) that encodes and decodes a native type."""
+    import importlib
+
+    return importlib.import_module(f".{NATIVE_TYPES[qtype]}", __package__)
 
 
 class Codec:
@@ -82,6 +93,8 @@ class Codec:
             kw = {} if importance is None else {"importance": importance.to(x.device)}
             packed, _ = GGML_FORMAT_REGISTRY[qtype.lower()].quantize(x.float().contiguous(), **kw)
             return packed
+        if qtype in NATIVE_TYPES:  # CUDA kernel on a CUDA device (raises rather than fall back), torch on CPU
+            return _native(qtype).encode(qtype, x.float().contiguous(), importance)
         imat = None if importance is None else importance.detach().float().cpu().numpy()
         return self.ggml.quantize(int(self.qtype(qtype)), x.detach().float().cpu().numpy(), imat)
 
@@ -99,6 +112,8 @@ class Codec:
             # (export encodes on the GPU and decodes to CPU for its numpy verification).
             out = GGML_FORMAT_REGISTRY[qtype.lower()].dequantize(packed, shape, dtype=dtype)
             return out.reshape(rows, cols).to(device=device)
+        if qtype in NATIVE_TYPES:
+            return _native(qtype).decode(qtype, packed, rows, cols, dtype).to(device=device)
         out = self.ggml.dequantize(int(self.qtype(qtype)), packed, cols)
         return torch.from_numpy(out).to(device=device, dtype=dtype)
 
@@ -321,7 +336,7 @@ class Latent:
                 if seg.colperm is not None:
                     x = x[:, seg.colperm.to(x.device)]
                 hit = self._cache.get(k)
-                every = self.ctl.refresh if seg.qtype in MODELOPT_TYPES else self.ctl.ggml_refresh
+                every = self.ctl.refresh if seg.qtype in GPU_TYPES else self.ctl.ggml_refresh
                 fresh = hit is not None and (hit[0] == version or self.ctl.step - hit[1] < every)
                 if fresh:
                     payload = hit[2]
