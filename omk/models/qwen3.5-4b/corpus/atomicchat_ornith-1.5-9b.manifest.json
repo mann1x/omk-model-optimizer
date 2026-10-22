@@ -1,0 +1,213 @@
+{
+  "build": "ornith-1.5-9b",
+  "built_at": null,
+  "build_tool_version": "build.py/1.0",
+  "recipe": {
+    "path": "../recipes/ornith-1.5-9b.yaml",
+    "sha256": "0796e5ff6894c7edfc9111bf0df93d676daab78298b832444625cfa04ac2ad05",
+    "seed": 20260814
+  },
+  "model": {
+    "repo": "ornith-ai/Ornith-1.5-9B",
+    "tokenizer": "/src/tokenizer.json",
+    "gguf": "/gguf/ornith-1.5-9b-bf16.gguf",
+    "vocab_size": 248320,
+    "layers": 32,
+    "sliding_window": null,
+    "context_length": 262144,
+    "llama_cpp_commit": "FILLED_AT_BUILD_TIME"
+  },
+  "tokenizer": {
+    "path": "/src/tokenizer.json",
+    "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "rows": 248320,
+    "pre_tokenizer": "llama4"
+  },
+  "llama_cpp": {
+    "commit": "FILLED_AT_BUILD_TIME",
+    "note": "llama-imatrix must be given --parse-special or the chat markup in calib_train.txt is tokenised as literal text (parse_special defaults to false in that tool)"
+  },
+  "calib_train": {
+    "path": "calib_train.txt",
+    "sha256": "a47fdfeec1a1071ea542f4e77d619a567ab9e6002940262fe273223e105fb0be",
+    "bytes": 17670884,
+    "documents": 3079,
+    "tokens": 4958490,
+    "target_tokens": 5000000,
+    "document_separator": "\n\n",
+    "shares_requested_percent": {
+      "agentic": 24.51,
+      "code": 17.647,
+      "graphics": 2.941,
+      "longctx": 11.765,
+      "multilingual": 13.725,
+      "reasoning": 14.706,
+      "structured": 4.902,
+      "vocab_sweep": 9.804
+    },
+    "shares_actual_percent": {
+      "agentic": 24.746,
+      "code": 17.809,
+      "graphics": 2.988,
+      "longctx": 11.933,
+      "multilingual": 13.847,
+      "reasoning": 14.842,
+      "structured": 3.934,
+      "vocab_sweep": 9.902
+    },
+    "documents_by_category": {
+      "agentic": 418,
+      "code": 506,
+      "graphics": 112,
+      "longctx": 19,
+      "multilingual": 158,
+      "reasoning": 1211,
+      "structured": 450,
+      "vocab_sweep": 205
+    },
+    "tokens_by_category": {
+      "agentic": 1227007,
+      "code": 883045,
+      "graphics": 148144,
+      "longctx": 591721,
+      "multilingual": 686602,
+      "reasoning": 735934,
+      "structured": 195062,
+      "vocab_sweep": 490975
+    },
+    "synthetic_tokens": 2518169,
+    "synthetic_percent": 50.785,
+    "document_tokens": {
+      "p50": 689,
+      "p90": 3550,
+      "p95": 5510,
+      "p99": 14380,
+      "max": 54176,
+      "min": 60
+    }
+  },
+  "pool_sources": {
+    "pool/_quarantine/eval-residue.jsonl": {
+      "sha256": "8a41daa608d53b5438483be9e2d56bba507b4801c8a805babfa54af96806b5c6",
+      "bytes": 172308,
+      "documents": 2
+    },
+    "pool/_quarantine/removed.jsonl": {
+      "sha256": "28615d8080e4b3b95a29447402e8163786c42e23e6c5175a18783a591bde13d0",
+      "bytes": 8600246,
+      "documents": 1056
+    },
+    "pool/_quarantine/untokenizable.jsonl": {
+      "sha256": "8226d1b281ce13ceab909c06383d78176b3cc5c2d3f1a49094ef808e3f220335",
+      "bytes": 88848,
+      "documents": 2
+    },
+    "pool/agentic/synthetic/conversations.jsonl": {
+      "sha256": "40478e56fdee9bf965b0e56800e3d940e772db11e856f0170d92043d86861973",
+      "bytes": 5641610,
+      "documents": 531
+    },
+    "pool/agentic/synthetic/legacy-dsv4-rendered.jsonl": {
+      "sha256": "24e99d36930e6547e90058654b712ae50a1294a1cdc4da7b38ae688a97537dca",
+      "bytes": 948845,
+      "documents": 50
+    },
+    "pool/code/legacy-dsv4.jsonl": {
+      "sha256": "5122a4eb0af1a88bc5d0ed76ad6714fe82de91fb3ca8d92f555df5207361123f",
+      "bytes": 472956,
+      "documents": 120
+    },
+    "pool/code/repos.jsonl": {
+      "sha256": "cf68e87ff67d4bbcac0006df6f01ccb625c422f31048f53b5de2162707d9279b",
+      "bytes": 9196542,
+      "documents": 833
+    },
+    "pool/graphics/legacy-dsv4.jsonl": {
+      "sha256": "09e62f79a8859e2c0f275bc38b93dde63f5751660eb3e9fc8636782cb47d3689",
+      "bytes": 2068241,
+      "documents": 335
+    },
+    "pool/graphics/repos.jsonl": {
+      "sha256": "862600d1842bd530e65884d8bc4bfcfa8892ddd1e430a927f30d35651539b7d1",
+      "bytes": 6231338,
+      "documents": 827
+    },
+    "pool/longctx/legacy-dsv4.jsonl": {
+      "sha256": "1f17bf4553c25558953fd746ce3bce278e932690e02d926395f8ecf21dacc100",
+      "bytes": 591648,
+      "documents": 10
+    },
+    "pool/longctx/module-bundles.jsonl": {
+      "sha256": "767b0cb154af75a8e5023e948f39fb3cbef424c99ba643779c5bd3e289945bb5",
+      "bytes": 9837165,
+      "documents": 83
+    },
+    "pool/multilingual/legacy-dsv4-wikipedia.jsonl": {
+      "sha256": "aa0344e84c60e1c423ac543d205bad77e3c0cc475799ddcb76d4e338cbdfb266",
+      "bytes": 420903,
+      "documents": 14
+    },
+    "pool/multilingual/wikipedia.jsonl": {
+      "sha256": "df589b7c204d1e5839498b465f91d3cfa6a9d263acb6be3e8c904b0cfff828e8",
+      "bytes": 13586169,
+      "documents": 745
+    },
+    "pool/reasoning/synthetic/conversations.jsonl": {
+      "sha256": "9e890645baaad2045ac87ce9a9649082ccc37bec1c3d72b1da2a5b6c92af3e2f",
+      "bytes": 6724419,
+      "documents": 3015
+    },
+    "pool/reasoning/synthetic/legacy-dsv4-rendered.jsonl": {
+      "sha256": "e690d0acb22a427e0b17f57ee8f255a36c5550de23775a52c9117198b02e8f95",
+      "bytes": 440412,
+      "documents": 153
+    },
+    "pool/structured/legacy-dsv4.jsonl": {
+      "sha256": "e0a6537986934b5418b6d711c2712728979e1019eb6ca40885429fc068e8c6d4",
+      "bytes": 108168,
+      "documents": 19
+    },
+    "pool/structured/repos.jsonl": {
+      "sha256": "631c8fd66fa7fc1d60fe50e257385512c77e0c1d0e1a86f88a482c29e0b2f83c",
+      "bytes": 1226353,
+      "documents": 227
+    },
+    "pool/structured/synthetic/structured-in-chat.jsonl": {
+      "sha256": "435a1be5a7b8bd230105b85fbe708649fb2ddef5a65198bdd808bcff1b3d1b64",
+      "bytes": 395812,
+      "documents": 207
+    },
+    "pool/vocab_sweep/synthetic/legacy-dsv4-rendered.jsonl": {
+      "sha256": "e30414d83fc63d1a5bb293a50d174eb65385efa237111f7ae001f923a9498424",
+      "bytes": 745316,
+      "documents": 65
+    },
+    "pool/vocab_sweep/synthetic/muse-glimmer-30b.jsonl": {
+      "sha256": "4eb612024896df3b979fa74b92cc27ddbce56af100a14611bcfccd4ea9ce92c5",
+      "bytes": 2068343,
+      "documents": 172
+    },
+    "pool/vocab_sweep/synthetic/nemotron-3.5-lightning.jsonl": {
+      "sha256": "cd73220ef1ac82132a4c2b217f77af7b2eaea2c06939394fe36650221cc22a1d",
+      "bytes": 1269096,
+      "documents": 113
+    },
+    "pool/vocab_sweep/synthetic/ornith-1.5-9b.jsonl": {
+      "sha256": "2c66c16caf55ceff290cf6f200b7c17f5f0c5d648fd55ecb0ac6a7bfdbb38edd",
+      "bytes": 2508848,
+      "documents": 208
+    }
+  },
+  "calib_longctx": {
+    "path": "calib_longctx.txt",
+    "sha256": "59dc5cd37b07e9ce6fa721c663586baea9d862030203dfd090c8a6c700f1a2f1",
+    "documents": 30,
+    "tokens": 781430,
+    "document_tokens": {
+      "min": 16615,
+      "p50": 27888,
+      "max": 32538
+    },
+    "contiguous": true
+  }
+}

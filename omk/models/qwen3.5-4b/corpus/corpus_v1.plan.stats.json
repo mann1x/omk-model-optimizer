@@ -1,0 +1,73 @@
+{
+ "args": {
+  "corpus": "/mnt/sdc/ml/omnimerge-v6/calib_train.txt",
+  "code": "/mnt/sdc/opencoti-models/bonsai17/data/codefeedback/codefeedback.jsonl",
+  "general": "/mnt/sdc/opencoti-models/bonsai17/data/dolly/databricks-dolly-15k.jsonl",
+  "out": "/mnt/sdc/opencoti-scratch/bonsai4b/corpus_v1",
+  "max_prompt_chars": 5000,
+  "n": "tech:think=800,tech:nothink=0,code:think=5000,code:nothink=5000,general:think=2500,general:nothink=6000",
+  "n_eval": 48,
+  "n_eval_agent": 40,
+  "samplers": "tech:think=think_vendor,code:think=think_code|think_vendor,general:think=think_vendor",
+  "code_lang_cap": 0.4,
+  "seed": 0
+ },
+ "stats": {
+  "tools": {
+   "pool": 0
+  },
+  "tech": {
+   "pool": 1347
+  },
+  "code": {
+   "pool": 10096
+  },
+  "general": {
+   "pool": 14276
+  },
+  "plan_train": {
+   "tech:think:think_vendor": 800,
+   "general:nothink:nothink_vendor": 6000,
+   "code:nothink:nothink_vendor": 5000,
+   "code:think:think_vendor": 2467,
+   "general:think:think_vendor": 2500,
+   "code:think:think_code": 2533,
+   "tech:nothink:nothink_vendor": 451
+  },
+  "plan_eval": {
+   "tech:think:think_vendor": 48,
+   "tech:nothink:nothink_vendor": 48,
+   "code:think:think_code": 18,
+   "code:think:think_vendor": 30,
+   "code:nothink:nothink_vendor": 48,
+   "general:think:think_vendor": 48,
+   "general:nothink:nothink_vendor": 48
+  },
+  "agent_eval": {
+   "convs": 40,
+   "openings": 24,
+   "chars": 320603,
+   "assistant_turns": 204
+  },
+  "agent_train": {
+   "convs": 373,
+   "openings": 328,
+   "chars": 4074646,
+   "assistant_turns": 2229
+  },
+  "code_langs_train": {
+   "codefeedback-python": 3994,
+   "codefeedback-javascript": 1078,
+   "codefeedback-sql": 904,
+   "codefeedback-java": 896,
+   "codefeedback-cpp": 489,
+   "codefeedback-html": 397,
+   "codefeedback-shell": 329,
+   "codefeedback-csharp": 289,
+   "codefeedback-swift": 237,
+   "codefeedback-rust": 237,
+   "codefeedback-php": 227,
+   "codefeedback-c": 158
+  }
+ }
+}

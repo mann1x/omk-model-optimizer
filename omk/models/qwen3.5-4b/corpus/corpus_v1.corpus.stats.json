@@ -1,0 +1,71 @@
+{
+ "train_code": {
+  "convs": 9938,
+  "tokens": 16489620,
+  "think": 4942,
+  "nothink_tokens": 6212274,
+  "cjk": 54,
+  "odd_fences": 95,
+  "retried": 119,
+  "sha16": "0c483db592d04666"
+ },
+ "train_general": {
+  "convs": 8494,
+  "tokens": 8856293,
+  "think": 2496,
+  "nothink_tokens": 2552977,
+  "cjk": 47,
+  "odd_fences": 1,
+  "retried": 37,
+  "sha16": "7b08094ad0ce9ed8"
+ },
+ "train_tech": {
+  "convs": 1203,
+  "tokens": 12282650,
+  "think": 788,
+  "nothink_tokens": 1978663,
+  "cjk": 1,
+  "odd_fences": 23,
+  "retried": 106,
+  "sha16": "cab65293ccbdc277",
+  "eval_head_leak": 0
+ },
+ "eval_code": {
+  "convs": 95,
+  "tokens": 162673,
+  "think": 48,
+  "nothink_tokens": 66328,
+  "cjk": 0,
+  "odd_fences": 0,
+  "retried": 1,
+  "sha16": "b8289ec343c72d93"
+ },
+ "eval_general": {
+  "convs": 96,
+  "tokens": 119175,
+  "think": 48,
+  "nothink_tokens": 25895,
+  "cjk": 0,
+  "odd_fences": 0,
+  "retried": 0,
+  "sha16": "d579b375ea54862b"
+ },
+ "eval_tech": {
+  "convs": 93,
+  "tokens": 743516,
+  "think": 48,
+  "nothink_tokens": 152560,
+  "cjk": 0,
+  "odd_fences": 0,
+  "retried": 11,
+  "sha16": "206e16632c653656"
+ },
+ "agent_train": {
+  "sha16": "42532741dc7cbb86",
+  "convs": 373
+ },
+ "agent_eval": {
+  "sha16": "e100417fa315202b",
+  "convs": 40
+ }
+}

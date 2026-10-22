@@ -1,0 +1,69 @@
+{
+ "rows": [
+  {
+   "student": "iq2",
+   "status": "final",
+   "at": "step2400",
+   "lr": 1e-05,
+   "loss": "jaccard",
+   "fixed": {
+    "dense_mlp": "IQ2_XXS"
+   },
+   "teacher_ppl": 3.618656331603289,
+   "klk": 0.4835891318985444,
+   "jaccard": 0.20870952962197634,
+   "top1": 0.8488514173998045,
+   "ppl": 3.698511357417461,
+   "init_klk": 1.1657657320315304,
+   "init_jaccard": 0.42879680646829244,
+   "init_top1": 0.6712640518084066,
+   "init_ppl": 5.868030912084041,
+   "klk:eval_code": 0.26202456342859354,
+   "klk:eval_tech": 0.29526847082382307,
+   "klk:eval_general": 0.30116246918895495,
+   "klk:agent_eval": 1.1243774790684615,
+   "klk:opencode.eval": 0.8662727701815459,
+   "klk:swe_agentless.eval": 0.3492913726254759,
+   "klk:cp_reasoning.eval": 0.3378597923271351,
+   "klk:exercism_sql.eval": 0.3324561375443653,
+   "gguf_mib": 1580.8
+  },
+  {
+   "student": "tern",
+   "status": "final",
+   "at": "step2400",
+   "lr": 6e-05,
+   "loss": "kl",
+   "fixed": {
+    "dense_mlp": "PQ2_0"
+   },
+   "teacher_ppl": 3.618656331603289,
+   "klk": 0.46292327366266783,
+   "jaccard": 0.3043378636983832,
+   "top1": 0.7896887218963832,
+   "ppl": 4.001649498658661,
+   "init_klk": 8.028779329092972,
+   "init_jaccard": 0.9740370771868604,
+   "init_top1": 0.041070992179863146,
+   "init_ppl": 8344.213203345043,
+   "klk:eval_code": 0.49342616725410765,
+   "klk:eval_tech": 0.3626871109008789,
+   "klk:eval_general": 0.6371736106984427,
+   "klk:agent_eval": 0.40027269846299995,
+   "klk:opencode.eval": 0.5086996464435656,
+   "klk:swe_agentless.eval": 0.4551029391768857,
+   "klk:cp_reasoning.eval": 0.5090577935659757,
+   "klk:exercism_sql.eval": 0.33696622279848637,
+   "gguf_mib": 1144.3
+  }
+ ],
+ "same_eval_rows": true,
+ "caches": [
+  "/mnt/sdc/omk-model-optimizer/runs/m6_qwen35_4b/cache"
+ ],
+ "references": {
+  "bm860_r1": {
+   "note": "full-vocab KL code 0.732 / tech 0.382 / general 0.723 / agent 0.507; HE 10.37% (base 59.76%)"
+  }
+ }
+}

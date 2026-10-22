@@ -1,0 +1,331 @@
+{
+ "run": "/mnt/sdc/omk-model-optimizer/runs/m6_qwen35_4b",
+ "rows": [
+  {
+   "label": "Qwen3.5-4B F16",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-F16.gguf",
+   "bytes": 8665620288,
+   "engine": "llama.cpp",
+   "humaneval": 0.5792682926829268,
+   "humaneval_plus": 0.5304878048780488,
+   "kld": {
+    "ppl_q": 9.733265
+   }
+  },
+  {
+   "label": "Q4_K_M",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-Q4_K_M.gguf",
+   "bytes": 2783447136,
+   "engine": "llama.cpp",
+   "humaneval": 0.6280487804878049,
+   "humaneval_plus": 0.5426829268292683,
+   "kld": {
+    "kld_mean": 0.027055,
+    "same_top_p_pct": 92.404,
+    "ppl_q": 9.87026,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "Q4_K_M (opencoti engine control)",
+   "kind": "control",
+   "file": "compare/Qwen3.5-4B-Q4_K_M.gguf",
+   "bytes": 2783447136,
+   "engine": "opencoti",
+   "humaneval": 0.6036585365853658,
+   "humaneval_plus": 0.5548780487804879,
+   "kld": {
+    "kld_mean": 0.027191,
+    "same_top_p_pct": 92.569,
+    "ppl_q": 9.860687,
+    "tool": "opencoti perplexity kld-2610220831001"
+   }
+  },
+  {
+   "label": "Q4_K_S",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-Q4_K_S.gguf",
+   "bytes": null,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": null
+  },
+  {
+   "label": "Q3_K_L",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-Q3_K_L.gguf",
+   "bytes": 2482647136,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": null
+  },
+  {
+   "label": "Q3_K_M",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-Q3_K_M.gguf",
+   "bytes": 2318807136,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": {
+    "kld_mean": 0.09281,
+    "same_top_p_pct": 85.639,
+    "ppl_q": 10.41108,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "Q3_K_S",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-Q3_K_S.gguf",
+   "bytes": 2121748576,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": {
+    "kld_mean": 0.132395,
+    "same_top_p_pct": 83.133,
+    "ppl_q": 10.824535,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ3_M",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ3_M.gguf",
+   "bytes": 2216796256,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": {
+    "kld_mean": 0.090863,
+    "same_top_p_pct": 86.204,
+    "ppl_q": 10.394996,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ3_XS",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ3_XS.gguf",
+   "bytes": 2145464416,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": {
+    "kld_mean": 0.112198,
+    "same_top_p_pct": 84.51,
+    "ppl_q": 10.703444,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ3_XXS",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ3_XXS.gguf",
+   "bytes": 1972377696,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": {
+    "kld_mean": 0.151085,
+    "same_top_p_pct": 81.969,
+    "ppl_q": 11.040338,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "student IQ2_XXS core, IQ3_M packaging + Q8_0 head",
+   "kind": "student",
+   "file": "pack/iq3m_l/iq2-pack-iq3m_l.gguf",
+   "bytes": 1983211232,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": null
+  },
+  {
+   "label": "student IQ2_XXS core, Q3_K_M packaging",
+   "kind": "student",
+   "file": "pack/q3km/iq2-pack-q3km.gguf",
+   "bytes": 1834495712,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": null
+  },
+  {
+   "label": "student IQ2_XXS core, IQ3_M packaging",
+   "kind": "student",
+   "file": "pack/iq3m/iq2-pack-iq3m.gguf",
+   "bytes": 1829252832,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": null
+  },
+  {
+   "label": "IQ2_M",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ2_M.gguf",
+   "bytes": 1809438816,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": {
+    "kld_mean": 0.281815,
+    "same_top_p_pct": 75.718,
+    "ppl_q": 12.041002,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "student MLP re-encoded at IQ2_XS (off its trained grid)",
+   "kind": "student-offgrid",
+   "file": "xq/iq2xs/iq2-iq2xs.gguf",
+   "bytes": 1728337632,
+   "engine": "llama.cpp",
+   "humaneval": 0.2804878048780488,
+   "humaneval_plus": 0.23170731707317074,
+   "kld": {
+    "kld_mean": 0.323961,
+    "same_top_p_pct": 75.651,
+    "ppl_q": 12.409366,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ2_S",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ2_S.gguf",
+   "bytes": 1719859296,
+   "engine": "llama.cpp",
+   "humaneval": 0.23170731707317074,
+   "humaneval_plus": 0.18902439024390244,
+   "kld": {
+    "kld_mean": 0.40187,
+    "same_top_p_pct": 71.573,
+    "ppl_q": 14.1062,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ2_XS",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ2_XS.gguf",
+   "bytes": 1698478176,
+   "engine": "llama.cpp",
+   "humaneval": 0.20121951219512196,
+   "humaneval_plus": 0.18292682926829268,
+   "kld": {
+    "kld_mean": 0.43914,
+    "same_top_p_pct": 70.4,
+    "ppl_q": 14.38229,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "student IQ2_XXS core, IQ3_XXS packaging",
+   "kind": "student",
+   "file": "pack/iq3xxs/iq2-pack-iq3xxs.gguf",
+   "bytes": 1689261792,
+   "engine": "llama.cpp",
+   "humaneval": null,
+   "humaneval_plus": null,
+   "kld": null
+  },
+  {
+   "label": "**student IQ2_XXS (as trained, IQ2_M packaging)**",
+   "kind": "student",
+   "file": "iq2/iq2.gguf",
+   "bytes": 1657558752,
+   "engine": "llama.cpp",
+   "humaneval": 0.38414634146341464,
+   "humaneval_plus": 0.3170731707317073,
+   "kld": {
+    "kld_mean": 0.350268,
+    "same_top_p_pct": 75.655,
+    "ppl_q": 12.481237,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ2_XXS",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ2_XXS.gguf",
+   "bytes": 1606277216,
+   "engine": "llama.cpp",
+   "humaneval": 0.10365853658536585,
+   "humaneval_plus": 0.0975609756097561,
+   "kld": {
+    "kld_mean": 0.618052,
+    "same_top_p_pct": 65.58,
+    "ppl_q": 16.726773,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "student MLP re-encoded at IQ1_M (off its trained grid)",
+   "kind": "student-offgrid",
+   "file": "xq/iq1m/iq2-iq1m.gguf",
+   "bytes": 1569085152,
+   "engine": "llama.cpp",
+   "humaneval": 0.1402439024390244,
+   "humaneval_plus": 0.12195121951219512,
+   "kld": {
+    "kld_mean": 0.628342,
+    "same_top_p_pct": 67.114,
+    "ppl_q": 16.454956,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "IQ1_M",
+   "kind": "stock",
+   "file": "compare/Qwen3.5-4B-IQ1_M.gguf",
+   "bytes": 1494302816,
+   "engine": "llama.cpp",
+   "humaneval": 0.024390243902439025,
+   "humaneval_plus": 0.018292682926829267,
+   "kld": {
+    "kld_mean": 1.227541,
+    "same_top_p_pct": 53.824,
+    "ppl_q": 30.36014,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "**student ternary (PQ2_0)**",
+   "kind": "student",
+   "file": "tern/tern.gguf",
+   "bytes": 1199880160,
+   "engine": "opencoti",
+   "humaneval": 0.17682926829268292,
+   "humaneval_plus": 0.15853658536585366,
+   "kld": {
+    "kld_mean": 0.911711,
+    "same_top_p_pct": 58.576,
+    "ppl_q": 22.41528,
+    "tool": "opencoti perplexity kld-2610220831001"
+   }
+  }
+ ]
+}

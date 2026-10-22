@@ -1,5 +1,7 @@
 # omk_qad — model-agnostic 2-bit QAD (IQ2 family) → GGUF
 
+Repo overview, recipes, datasets, evaluations and per-model results: [`.github/README.md`](../.github/README.md).
+
 omk additions on top of NVIDIA Model-Optimizer (this repo is a private mirror of `NVIDIA/Model-Optimizer`;
 `upstream` remote = NVIDIA, push disabled). Everything omk lives in `omk_qad/`; upstream files are untouched,
 so rebases on `upstream/main` stay clean.
@@ -53,7 +55,8 @@ $ENV -m omk_qad.train --phase train  --model M --layout L.pt --cache C --out O -
 $ENV -m omk_qad.train --phase export --model M --layout L.pt --load O/stage1/final.pt --gguf X.gguf   # no --load = PTQ floor
 ```
 
-**Layout.** The fixed (trained) classes default to routed/shared experts + dense MLP at IQ2_XXS (`--fixed`).
+**Layout.** The fixed classes (type set by hand) default to routed/shared experts + dense MLP at IQ2_XXS
+(`--fixed`). Fixed or not, every quantized tensor trains at its planned type (except `train --export-only` classes).
 Everything else follows a llama.cpp preset's rules (`--rest`: IQ2_M default, IQ2_S, IQ2_XS, IQ3_XXS, IQ3_XS,
 IQ3_S, IQ3_M, Q2_K(_S), Q3_K_S/M, Q4_K_S/M, or `bolt` = Q8_0). `--override class=type` and
 `--override-regex 'pattern=type'` refine it, in the precedence fixed > class > regex > preset. A layout with

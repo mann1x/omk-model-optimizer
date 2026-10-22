@@ -1,0 +1,39 @@
+# M6 (plan_omk_qad_multi_student.md, bm-878): Qwen3.5-4B, an IQ2_XXS and a ternary student on ONE GPU.
+# Launched 2026-10-21 on bs2 GPU0 (owner: use bs2 GPUs; opencoti has GPU1 and precedence). Every path lives under the single root /mnt/sdc/omk-model-optimizer (user rule 2026-10-21).
+# Data = mix_v1 (bm-877, user choice 2026-10-21 "code-heavy 20M"), weights proportional to token budgets:
+#   AtomicChat builds/ornith-1.5-9b calib_train.txt 4.96M (tokenizer sha 5f9e4d49 + chat_template a4aee8af identical to Qwen3.5-4B)
+#   FineWeb-edu sample/10BT 000_00000 4.0M | corpus_v1 (Qwen3.5-4B's own rollouts) 4.0M: code 1.6 / tech .8 / general 1.0 / agent .6
+#   Nemotron code (data/mix_v1, rendered with the Qwen3.5 template, <=4096 tok/doc): opencode 3.0 / swe_agentless 1.5 /
+#   cp_reasoning 1.5 / exercism_sql 1.0 (SQL under-represented: 70 of 561 docs, long schema prompts skipped)
+# ~20M tokens: n_seq 19500 x seq 1024; 2400 steps x bs 8 = 19.7M tokens = one pass. Previous r1-mirroring draft:
+# qwen35_4b_smoke.bm860mix.yaml.
+model: /mnt/sdc/omk-model-optimizer/models/Qwen3.5-4B
+out: /mnt/sdc/omk-model-optimizer/runs/m6_qwen35_4b
+llama_cpp: /opt/llama.cpp
+layout: {rest: IQ2_M}
+cache:
+  gpu: 0
+  data: >-
+    /mnt/sdc/omk-model-optimizer/data/atomicchat/ornith-1.5-9b/calib_train.txt=0.248,/mnt/sdc/omk-model-optimizer/data/fineweb/sample_10BT_000_00000.parquet=0.20,/mnt/sdc/omk-model-optimizer/data/corpus_v1/train_code.jsonl=0.08,/mnt/sdc/omk-model-optimizer/data/corpus_v1/train_tech.jsonl=0.04,/mnt/sdc/omk-model-optimizer/data/corpus_v1/train_general.jsonl=0.05,/mnt/sdc/omk-model-optimizer/data/corpus_v1/agent_train.jsonl=0.03,/mnt/sdc/omk-model-optimizer/data/mix_v1/opencode.train.jsonl=0.15,/mnt/sdc/omk-model-optimizer/data/mix_v1/swe_agentless.train.jsonl=0.075,/mnt/sdc/omk-model-optimizer/data/mix_v1/cp_reasoning.train.jsonl=0.075,/mnt/sdc/omk-model-optimizer/data/mix_v1/exercism_sql.train.jsonl=0.05
+  eval_data: >-
+    /mnt/sdc/omk-model-optimizer/data/corpus_v1/eval_code.jsonl,/mnt/sdc/omk-model-optimizer/data/corpus_v1/eval_tech.jsonl,/mnt/sdc/omk-model-optimizer/data/corpus_v1/eval_general.jsonl,/mnt/sdc/omk-model-optimizer/data/corpus_v1/agent_eval.jsonl,/mnt/sdc/omk-model-optimizer/data/mix_v1/opencode.eval.jsonl,/mnt/sdc/omk-model-optimizer/data/mix_v1/swe_agentless.eval.jsonl,/mnt/sdc/omk-model-optimizer/data/mix_v1/cp_reasoning.eval.jsonl,/mnt/sdc/omk-model-optimizer/data/mix_v1/exercism_sql.eval.jsonl
+  n_seq: 19500
+  n_eval: 16
+  seq: 1024
+  shard: 1000
+  topk: 64
+preflight_steps: 5
+students:
+  - name: iq2
+    gpu: 0
+    layout: {fixed: {dense_mlp: iq2_xxs}}
+    train: {lr: 1.0e-5, loss: jaccard, steps: 2400, bs: 8, warmup: 50, eval_every: 300, save_every: 100}
+  - name: tern
+    gpu: 0
+    # bonsai4b's ternary set: attention, linear attention, MLP, tied embedding (= head). Block 512 model-wide.
+    layout: {fixed: {dense_mlp: pq2_0}, override: {attention: pq2_0, linear_attn: pq2_0, lm_head: pq2_0}}
+    train: {lr: 6.0e-5, loss: kl, steps: 2400, bs: 8, warmup: 50, eval_every: 300, save_every: 100, ternary_method: "top:86"}
+references:
+  # bm-860 r1 (bonsai4b_qat, strict top-86): FULL-vocab KL per family on its own eval windows and a different data mix
+  # (FineWeb 75% + corpus_v1 25%). NOT the same metric as klk (top-64 KL), nor the same windows or data: orientation only.
+  bm860_r1: {note: "full-vocab KL code 0.732 / tech 0.382 / general 0.723 / agent 0.507; HE 10.37% (base 59.76%)"}

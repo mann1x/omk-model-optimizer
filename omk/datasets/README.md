@@ -1,0 +1,42 @@
+# Datasets
+
+Catalogue of every training / eval source used by an omk_qad run. Each model section
+(`omk/models/<model>/README.md`) lists the exact mix it trained on (weights, token counts) and carries the
+manifests that pin every file by sha256. This page is the source catalogue across models.
+
+Raw data is **not** stored in this repo: the builders below fetch and render it, and the manifests say exactly
+what was used. Licenses are the sources' own; check each dataset card before redistributing.
+
+## Sources
+
+| source | upstream | revision used | used by | rendered as |
+|---|---|---|---|---|
+| AtomicChat calibration corpora, `builds/ornith-1.5-9b/calib_train.txt` | [`AtomicChat/calib-corpora`](https://huggingface.co/datasets/AtomicChat/calib-corpora) | manifest sha `a47fdfee…` (file), tokenizer sha `5f9e4d49` | Qwen3.5-4B M6 | ready-made text, used as is |
+| FineWeb-edu `sample/10BT/000_00000.parquet` | [`HuggingFaceFW/fineweb-edu`](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) | `87f09149` (file sha256 `b1ba7b2c…`) | Qwen3.5-4B M6 | plain text |
+| `corpus_v1`: the student's own rollouts | generated (omnimergekit `scripts/bonsai_corpus_plan.py`, `bonsai_gen_corpus_srv2.py`) | per-file sha16 in `corpus_v1.corpus.stats.json` | Qwen3.5-4B M6 | chat template of the model that generated it |
+| Nemotron `SFT-OpenCode-v1` | [`nvidia/Nemotron-SFT-OpenCode-v1`](https://huggingface.co/datasets/nvidia/Nemotron-SFT-OpenCode-v1) | `556d5237` | Qwen3.5-4B M6 (`mix_v1/opencode`) | student chat template, system turn dropped |
+| Nemotron `SFT-SWE-v2` agentless | [`nvidia/Nemotron-SFT-SWE-v2`](https://huggingface.co/datasets/nvidia/Nemotron-SFT-SWE-v2) | `bd151f3f` | Qwen3.5-4B M6 (`mix_v1/swe_agentless`) | student chat template |
+| Nemotron `SFT-Competitive-Programming-v2` | [`nvidia/Nemotron-SFT-Competitive-Programming-v2`](https://huggingface.co/datasets/nvidia/Nemotron-SFT-Competitive-Programming-v2) | `778afc98` | Qwen3.5-4B M6 (`mix_v1/cp_reasoning`, `exercism_sql`) | student chat template |
+| wikitext-2-raw `wiki.test.raw` | wikitext-2 | — | every KLD measurement | plain text (eval only) |
+| HumanEval / HumanEval+ | lm-eval-harness tasks `humaneval`, `humaneval_plus` (`evalplus/humanevalplus`) | harness-pinned | every model's eval | eval only |
+
+The stager also fetched further Nemotron sets (RL Super/Ultra blends, SFT Agentic v2, Instruction-Following, Math,
+Science, …; full list with repo shas and sizes in `omk/models/qwen3.5-4b/corpus/nemotron.manifest.json`) for the
+planned stage-2 runs. They were not part of M6's training mix.
+
+## Builders
+
+| script | does |
+|---|---|
+| [`builders/stage_assets.py`](builders/stage_assets.py) | stages HF model repos, FineWeb shards and Nemotron files under one root, sha256-checked (LFS oid); huge JSONLs as evenly spaced byte windows trimmed to whole lines; writes `data/nemotron/manifest.json`. Stdlib only; gated sets go through `hf download` with the host's own login (no token read or passed). |
+| [`builders/build_mix.py`](builders/build_mix.py) | builds `mix_v1`: seeded random whole-row samples per source, rendered with the student's chat template (tools included), capped per document, filled to budget × margin; eval rows drawn first and disjoint; writes `manifest.json` with row indices and sha256 of every output. |
+| [`builders/extract_stage2_prompts.py`](builders/extract_stage2_prompts.py) | keeps the stage-2 prompt sets (RL blends, IFBench, …) before raw downloads are trimmed: whole files plus seeded samples, with a verifier census. |
+
+The builders here are the files as run (host paths included); they are kept byte-identical to what produced the
+manifests.
+
+## Adding a source
+
+1. Stage it with `stage_assets.py` (or document the fetch) so its revision and sha256 land in a manifest.
+2. Add a row above: upstream, revision, which model sections use it, how it is rendered.
+3. In the model section, list its weight and real token count from the run's manifest.

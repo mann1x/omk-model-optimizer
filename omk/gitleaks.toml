@@ -1,0 +1,31 @@
+# gitleaks configuration for mann1x/omk-model-optimizer (omk additions; the root stays upstream's).
+# Used by the pre-commit hook (omk/scripts/install-git-hooks.sh) and .github/workflows/omk-gitleaks.yml.
+#
+# Never hardcode a secret, never write a `${VAR:-<literal>}` convenience fallback for one: fail loud with
+# `export HF_TOKEN="${HF_TOKEN:?HF_TOKEN must be exported}"`. Origin: 2026-05-23, a live HF token leaked from
+# omnimergekit through exactly such a fallback; the stock ruleset does not catch it (the provider rules anchor
+# the secret on a preceding delimiter, and inside `${VAR:-...}` that character is `-`).
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "secret-var-literal-fallback"
+description = "A secret-named shell variable with a literal fallback: ${HF_TOKEN:-...}. Use ${VAR:?msg} instead."
+regex = '''\$\{[A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIALS?):-[^}\s]{6,}\}'''
+tags = ["secret", "fallback"]
+
+[[rules]]
+id = "gated-eval-gpqa-canary"
+description = "GPQA canary string: raw GPQA rows are in the file (gated benchmark content)."
+regex = '''gpqa:[0-9a-f]{4}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'''
+tags = ["gated-dataset", "contamination"]
+
+[allowlist]
+description = "Placeholders and env indirection that are not secrets"
+regexes = [
+    '''hf_(xxx+|XXX+|placeholder|your_token_here)''',
+    '''\$\{[A-Za-z_]+:\?[^}]*\}''',            # ${VAR:?msg} fails loud, holds no value
+    # transformers class names are high-entropy CamelCase and trip generic-api-key on import lines
+    '''\b[A-Z][A-Za-z0-9]*For(CausalLM|ConditionalGeneration|SequenceClassification|TokenClassification|MaskedLM|QuestionAnswering)\b''',
+]

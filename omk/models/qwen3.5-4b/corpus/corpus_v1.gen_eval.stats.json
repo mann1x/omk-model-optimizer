@@ -1,0 +1,27 @@
+{
+ "args": {
+  "url": "http://127.0.0.1:8142",
+  "expect_model": "Qwen3.5-4B",
+  "plan": "/mnt/sdc/opencoti-scratch/bonsai4b/corpus_v1/plan_eval.jsonl",
+  "out": "/mnt/sdc/opencoti-scratch/bonsai4b/corpus_v1/gen_eval",
+  "max_new_think": 32768,
+  "max_new_nothink": 16384,
+  "retries": 1,
+  "workers": 192,
+  "limit": 0,
+  "seed": 0
+ },
+ "model": "/mnt/sdc/opencoti-models/bonsai4b/Qwen3.5-4B",
+ "generated_now": 288,
+ "kept_tokens_now": 1025364,
+ "outcome_now": {
+  "tech:think:ok": 48,
+  "tech:nothink:ok": 45,
+  "tech:nothink:malformed": 3,
+  "code:think:ok": 48,
+  "code:nothink:ok": 47,
+  "code:nothink:cap": 1,
+  "general:think:ok": 48,
+  "general:nothink:ok": 48
+ }
+}
