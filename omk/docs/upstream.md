@@ -41,6 +41,14 @@ broken, or if an upstream workflow is active). The watch list today: `modelopt/t
    queue forever, and schedules burn Actions minutes). A merge can add new ones, active by default;
    `upstream_status.sh` flags them. Only `omk-gitleaks` runs.
 
-Status at the time of writing (2026-10-22): `omk-main` is based on upstream `8a8dceb60`; upstream is 45 commits ahead,
-10 of them on the watch list, including changes to the IQ1/IQ2/Q8_0 encoders and `f1d68fd4d` (Megatron-Bridge GGML
-PTQ, QAD and fake-quant export). Not merged yet.
+## Merge log
+
+- **2026-10-22, upstream `d4f2c671f`** (merge `44b3cee29`, from `8a8dceb60`): 45 commits, 10 on the watch list (all
+  GGML encoders, `ggml/common.py`, `f1d68fd4d` Megatron-Bridge GGML PTQ/QAD/export). No conflicts; the only pin change
+  is a docs extra (no env rebuild). CPU suite 74 passed / 4 skipped (same as before the merge). Bit-exactness: the M6
+  Qwen3.5-4B iq2 (IQ2_XXS) stage-1 student re-exported with the pre-merge code (control) and with the merged code:
+  both byte-identical to the shipped GGUF, 441/441 tensors and every metadata key. Only the IQ2_XXS export path is
+  covered by that byte check; the other encoders by the CPU suite.
+
+  The checks: `omk_qad_work/m6/upstream_bytecheck*.sh` + `gguf_bytes_diff.py` in backup_models. Do **not** nest a
+  `resource-lock.sh` claim inside a `claude-hooks-res run` job: it is a wrapper over the same claims and deadlocks.
