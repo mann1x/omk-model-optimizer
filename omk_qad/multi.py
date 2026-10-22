@@ -283,7 +283,7 @@ def phase_preflight(spec: dict, students: list[dict]) -> None:
         if p["preflight"].exists():
             shutil.rmtree(p["preflight"])  # the preflight's own scratch run, never a student run
         cmd, env = _train_cmd(spec, s, p["preflight"], {"steps": n, "eval_every": n, "save_every": n,
-                                                        "snapshot_every": 0})
+                                                        "snapshot_every": 0, "no_wandb": True})
         res = _launch([(s["name"], cmd, env, p["preflight"] / "train.out")])[s["name"]]
         if res["rc"]:
             raise SystemExit(f"preflight of {s['name']} failed (rc {res['rc']}): see {res['log']}")

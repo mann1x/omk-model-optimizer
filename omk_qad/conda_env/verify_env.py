@@ -28,8 +28,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 REQS = ("requirements-torch.txt", "requirements.txt", "requirements-build.txt")
 IMPORTS = ("torch", "transformers", "safetensors", "numpy", "gguf", "pyarrow", "huggingface_hub", "accelerate",
-           "yaml", "omegaconf", "pytest", "omk_qad.train", "omk_qad.multi", "omk_qad.layout", "omk_qad.fakequant",
-           "omk_qad.gguf_export", "omk_qad.ptq", "modelopt.torch.quantization.ggml")
+           "yaml", "omegaconf", "pytest", "wandb", "omk_qad.train", "omk_qad.multi", "omk_qad.layout",
+           "omk_qad.fakequant", "omk_qad.gguf_export", "omk_qad.ptq", "modelopt.torch.quantization.ggml")
 
 
 def _norm(name: str) -> str:

@@ -16,8 +16,10 @@ python -m omk_qad.train --phase export --model M --layout L.pt [--load O/state.p
 
 import argparse
 import copy
+import hashlib
 import json
 import math
+import netrc
 import os
 import random
 import time
@@ -94,6 +96,89 @@ def _packed(path: str, tok, seq: int, eos: int, passes: list):
         passes.append(path)
         if n_docs == 0:
             raise SystemExit(f"{path}: no documents")
+
+
+# ===================================================================================================== telemetry
+# The API key IS the switch (omnimergekit's gepo_brevity / train_grpo_efficiency pattern): WANDB_API_KEY, else the
+# api.wandb.ai entry of ~/.netrc. A key anywhere on the host means the run logs to W&B with nothing to remember on
+# the command line. A key with no wandb package is an incomplete omk-modelopt env (wandb is pinned there): refused.
+# Asking for W&B explicitly (any --wandb-* value) without a key or a reachable W&B refuses too; on the automatic
+# path a W&B outage only warns, so it can never kill a training run.
+WANDB_HOST = "api.wandb.ai"
+
+
+def _wandb_key() -> tuple[str, str]:
+    """(key, source), or ("", "") when no credential exists."""
+    key = os.environ.get("WANDB_API_KEY", "").strip()
+    if key:
+        return key, "env:WANDB_API_KEY"
+    try:
+        auth = netrc.netrc().authenticators(WANDB_HOST)
+        if auth and auth[2]:
+            return auth[2].strip(), f"netrc:{WANDB_HOST}"
+    except (OSError, netrc.NetrcParseError):
+        pass
+    return "", ""
+
+
+class Telemetry:
+    """One W&B run per training run dir; its id comes from the dir, so a relaunch (resume) reattaches to it."""
+
+    def __init__(self, a, run: Path, config: dict):
+        """Start (or reattach to) the run, or stay off, per the rules above."""
+        self.wb = None
+        explicit = bool(a.wandb_project or a.wandb_name or a.wandb_entity)
+        if a.no_wandb or os.environ.get("WANDB_MODE") == "disabled":
+            say(f"WANDB off ({'--no-wandb' if a.no_wandb else 'WANDB_MODE=disabled'})")
+            return
+        key, source = _wandb_key()
+        if not key:
+            msg = f"WANDB_API_KEY unset and no {WANDB_HOST} entry in ~/.netrc"
+            if explicit:
+                raise SystemExit(f"--wandb-* asks for W&B, but {msg}")
+            say(f"WANDB off ({msg})")
+            return
+        try:
+            import wandb
+        except ImportError:
+            raise SystemExit("a W&B key is present but the wandb package is not: the omk-modelopt env is incomplete "
+                             "(omk_qad/conda_env/setup_conda_env.sh --update)") from None
+        os.environ["WANDB_API_KEY"] = key
+        project = a.wandb_project or os.environ.get("WANDB_PROJECT") or "omk-qad"
+        stage = "stage1" if a.stage == 1 else f"stage2-{a.branch}"
+        name = a.wandb_name or f"{Path(a.out).parent.name}-{Path(a.out).name}-{stage}"
+        rid = hashlib.sha1(str(run.resolve()).encode()).hexdigest()[:16]
+        try:
+            self.wb = wandb.init(project=project, entity=a.wandb_entity or os.environ.get("WANDB_ENTITY") or None,
+                                 name=name, id=rid, resume="allow", config=config, dir=str(run))
+        except Exception as e:  # any W&B failure: refuse when asked for, else train without it
+            if explicit:
+                raise SystemExit(f"wandb.init failed: {type(e).__name__}: {e}") from None
+            say(f"WANDB off -- wandb.init failed: {type(e).__name__}: {e}")
+            return
+        say(f"WANDB on key={source} project={project} name={name} id={rid} url={self.wb.url}")
+
+    def log(self, data: dict, step: int) -> None:
+        """Log numeric values at a training step (a failed upload is reported, never fatal)."""
+        if self.wb is None:
+            return
+        try:
+            self.wb.log({k: v for k, v in data.items() if isinstance(v, int | float)}, step=step)
+        except Exception as e:  # telemetry must not stop training
+            say(f"WANDB log failed at step {step}: {type(e).__name__}: {e}")
+
+    def eval(self, r: dict, step: int) -> None:
+        """One evaluate() result: overall metrics plus every eval family."""
+        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "tag")}
+        for fam, m in (r.get("families") or {}).items():
+            flat.update({f"eval/{fam}/{k}": v for k, v in m.items()})
+        self.log(flat, step)
+
+    def finish(self) -> None:
+        """Close the run (a paused run is finished too; its relaunch resumes the same id)."""
+        if self.wb is not None:
+            self.wb.finish()
+            self.wb = None
 
 
 def phase_cache(a) -> None:
@@ -656,6 +741,10 @@ def phase_train(a) -> None:
             if g["klk"] > a.gate:
                 raise SystemExit("unquantized student does not reproduce the teacher cache")
         results.append(evaluate(student, head, ev, a, "init", dict(ctl.stats)))
+    tel = Telemetry(a, run, {**vars(a), "origin": origin, "cache_meta": {k: meta[k] for k in ("n_seq", "seq", "topk")
+                                                                         if k in meta}})
+    if not resume:  # a resumed run's W&B run already holds its init eval
+        tel.eval(results[-1], start - 1)
     pauser = Pauser(run)
     shard = (-1, None)
     t0, t_save = time.time(), time.time()
@@ -687,12 +776,18 @@ def phase_train(a) -> None:
         idx, val = shard[1]["idx"][j : j + a.bs].to(a.device), shard[1]["val"][j : j + a.bs].to(a.device)
         loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a)
         rolled = guard.observe(step, loss)
+        row = {"train/loss": loss, "train/lr": ctl.lr, **({"train/guard_rollback": 1} if rolled else {})}
         if step % a.log_every == 0 or step <= 3:
             mem = torch.cuda.max_memory_allocated(a.device) / 2**30 if a.device != "cpu" else 0.0
-            say(f"step {step} loss={loss:.5f} lr={ctl.lr:.2e} {(time.time() - t0) / (step - start + 1):.2f}s/step "
+            sps = (time.time() - t0) / (step - start + 1)
+            say(f"step {step} loss={loss:.5f} lr={ctl.lr:.2e} {sps:.2f}s/step "
                 f"{mem:.1f}GiB {json.dumps(ctl.stats)}")
+            row.update({"train/s_per_step": sps, "train/peak_mem_gib": mem,
+                        **{f"quant/{k}": v for k, v in ctl.stats.items()}})
+        tel.log(row, step)
         if step % a.eval_every == 0 or step == last:
             results.append(evaluate(student, head, ev, a, f"step{step}", dict(ctl.stats)))
+            tel.eval(results[-1], step)
             (run / "summary.json").write_text(json.dumps({"args": vars(a), "origin": origin, "results": results},
                                                           indent=1))
         if a.snapshot_every and step % a.snapshot_every == 0:
@@ -709,6 +804,7 @@ def phase_train(a) -> None:
             pauser.file.unlink(missing_ok=True)
             say(f"PAUSED at step {step} ({why}); relaunch the same command to resume from {last_ck}")
             say(peak())
+            tel.finish()
             return
     if step == a.steps and step >= start:
         save_state(final, step, latents, student, opt, a, ctl, results, origin)
@@ -717,6 +813,7 @@ def phase_train(a) -> None:
         say(f"STAGE_DONE stage {a.stage}{' branch ' + a.branch if a.branch else ''}: {final}")
     say(peak())
     say(f"QAD_DONE at step {step} in {time.time() - t0:.0f}s")
+    tel.finish()
 
 
 def phase_export(a) -> None:
@@ -814,6 +911,11 @@ def main(argv=None) -> None:
     ap.add_argument("--branch", default="", help="stage-2 branch name (each variant of stage 2 is its own branch)")
     ap.add_argument("--init-from", default="", help="stage 2: stage-1 final.pt (default <out>/stage1/final.pt)")
     ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--wandb-project", default="", help="W&B project (default $WANDB_PROJECT or omk-qad). W&B is on "
+                    "by itself when a key exists (WANDB_API_KEY or ~/.netrc); naming any --wandb-* makes it required")
+    ap.add_argument("--wandb-name", default="", help="W&B run name (default <run>-<student>-<stage>)")
+    ap.add_argument("--wandb-entity", default="", help="W&B entity (default $WANDB_ENTITY)")
+    ap.add_argument("--no-wandb", action="store_true", help="no W&B even when a key exists")
     ap.add_argument("--load", default="", help="train: resume from this full checkpoint (default: <run>/last.pt "
                     "if present); export: checkpoint whose weights to export")
     a = ap.parse_args(argv)

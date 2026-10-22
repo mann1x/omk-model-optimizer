@@ -20,7 +20,7 @@ import torch
 _DEFAULT_WORK = "/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/omk_qad_work/pytest"
 WORK = Path(os.environ.get("OMK_QAD_WORK", _DEFAULT_WORK)) / "qad"
 LLAMA_CPP = Path(os.environ.get("OMK_LLAMA_CPP", "/opt/llama.cpp"))
-CPU_ENV = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+CPU_ENV = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "WANDB_MODE": "disabled"}  # tests never open W&B runs
 TRAIN = ("--phase", "train", "--device", "cpu", "--bs", "2", "--lr", "1e-3", "--warmup", "1", "--latent-dtype", "fp16",
          "--latent-min", "65536", "--loss-chunk", "32")
 
@@ -369,13 +369,44 @@ def test_mtp_layout_imatrix_and_export(setup):
     assert proc.returncode == 0, (proc.stdout + proc.stderr)[-2000:]
 
 
-def _train(model: Path, lay: Path, cache: Path, out: Path, *extra: str, check: bool = True):
+def _train(model: Path, lay: Path, cache: Path, out: Path, *extra: str, check: bool = True, env: dict | None = None):
     cmd = [sys.executable, "-m", "omk_qad.train", *TRAIN, "--model", str(model), "--layout", str(lay),
            "--cache", str(cache), "--out", str(out), "--steps", "3", "--eval-every", "3", "--save-every", "1", *extra]
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=CPU_ENV, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env or CPU_ENV, check=False)
     if check:
         assert proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
     return proc
+
+
+def test_a_wandb_key_turns_on_a_real_wandb_run(setup):
+    """A key in the env and nothing on the command line: a real (offline) W&B run in the run dir, train + eval rows."""
+    import shutil
+
+    model, lay = setup["moe"]
+    out = WORK / "run_wandb"
+    if out.exists():
+        shutil.rmtree(out)  # test scratch of this test only
+    env = {**CPU_ENV, "WANDB_MODE": "offline", "WANDB_API_KEY": "x" * 40, "WANDB_SILENT": "true"}
+    p = _train(model, lay, setup["cache"], out, env=env)
+    assert "WANDB on key=env:WANDB_API_KEY project=omk-qad" in p.stdout
+    runs = list((out / "stage1" / "wandb").glob("offline-run-*/run-*.wandb"))
+    assert len(runs) == 1, runs
+    from wandb.proto import wandb_internal_pb2 as pb
+    from wandb.sdk.internal import datastore
+
+    ds, steps = datastore.DataStore(), {}
+    ds.open_for_scan(str(runs[0]))
+    while (raw := ds.scan_data()) is not None:  # the run's own record log: what W&B would upload
+        r = pb.Record()
+        r.ParseFromString(raw)
+        if r.WhichOneof("record_type") == "history":
+            row = {i.key or "/".join(i.nested_key): json.loads(i.value_json) for i in r.history.item}
+            if "_step" in row:  # W&B may also emit auxiliary history records (e.g. a bare timestamp)
+                steps.setdefault(row["_step"], {}).update(row)
+    assert sorted(steps) == [0, 1, 2, 3]  # init eval, then every step
+    assert "eval/klk" in steps[0] and "train/loss" not in steps[0]
+    assert all({"train/loss", "train/lr"} <= set(steps[s]) for s in (1, 2, 3))
+    assert "eval/klk" in steps[3]  # the step-3 eval lands on its training step
 
 
 def test_pause_resume_is_bitwise_and_stage2_branches(setup):

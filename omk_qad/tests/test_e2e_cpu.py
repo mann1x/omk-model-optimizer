@@ -17,7 +17,7 @@ import pytest
 _DEFAULT_WORK = "/srv/dev-disk-by-uuid-f8b1803e-334f-4f4b-af3b-f802bb6883c5/backup_models/omk_qad_work/pytest"
 WORK = Path(os.environ.get("OMK_QAD_WORK", _DEFAULT_WORK))
 LLAMA_CPP = Path(os.environ.get("OMK_LLAMA_CPP", "/opt/llama.cpp"))
-CPU_ENV = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+CPU_ENV = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "WANDB_MODE": "disabled"}  # tests never open W&B runs
 
 
 def _run(*args: str) -> str:
