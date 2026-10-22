@@ -288,6 +288,8 @@ def phase_preflight(spec: dict, students: list[dict]) -> None:
         if res["rc"]:
             raise SystemExit(f"preflight of {s['name']} failed (rc {res['rc']}): see {res['log']}")
         pf[s["name"]] = {"gpu": s.get("gpu"), "steps": n, **_peak(p["preflight"] / "stage1" / "log.txt")}
+        for ck in (p["preflight"] / "stage1").glob("*.pt"):  # a full student checkpoint per preflight: never reused
+            ck.unlink()
         print(f"preflight {s['name']}: {pf[s['name']]}")
     _save_state(spec, st)
     fit(spec, spec["students"], st)

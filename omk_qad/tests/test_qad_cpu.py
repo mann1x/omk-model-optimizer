@@ -396,6 +396,7 @@ def test_pause_resume_is_bitwise_and_stage2_branches(setup):
     assert not (b / "stage1" / "PAUSE").exists()  # consumed: the relaunch is not paused again
     p = _train(model, lay, setup["cache"], b)
     assert "RESUME from step 1" in p.stdout + p.stderr
+    assert (b / "stage1" / "last.pt").exists() is False  # finished: final.pt only, no second full copy
     fa = torch.load(a / "stage1" / "final.pt", weights_only=False)
     fb = torch.load(b / "stage1" / "final.pt", weights_only=False)
     assert fa["step"] == fb["step"] == 3
@@ -898,8 +899,9 @@ def test_multi_students_share_only_the_teacher(setup):
     pre = _run("omk_qad.multi", "preflight", "--spec", str(sp), "--students", "tern")
     pf = json.loads((out / "multi.json").read_text())["preflight"]["tern"]
     assert pf["reserved_gib"] == 0.0 and "no GPU is shared" in pre
-    assert not (out / "tern" / "stage1" / "last.pt").exists() or (out / "tern" / "stage1" / "final.pt").exists()
-    assert (out / "_preflight" / "tern" / "stage1" / "final.pt").exists()  # its own scratch run, not the student's
+    assert (out / "tern" / "stage1" / "final.pt").exists() and not (out / "tern" / "stage1" / "last.pt").exists()
+    scratch = out / "_preflight" / "tern" / "stage1"  # its own scratch run, not the student's
+    assert (scratch / "log.txt").exists() and not list(scratch.glob("*.pt"))  # measured, then no checkpoint kept
 
     changed = json.loads(sp.read_text())
     changed["students"][0]["layout"] = {"fixed": {"dense_mlp": "iq2_xs"}}

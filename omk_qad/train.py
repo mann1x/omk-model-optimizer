@@ -700,7 +700,9 @@ def phase_train(a) -> None:
         why = pauser.requested()
         if guard.bad and not why:  # never roll the saved state forward onto a step the guard suspects
             continue
-        if why or rolled or step % a.save_every == 0 or step == last or time.time() - t_save > a.save_minutes * 60:
+        finishing = step == a.steps and not why  # final.pt is written right after the loop: no second copy
+        if not finishing and (why or rolled or step % a.save_every == 0 or step == last
+                              or time.time() - t_save > a.save_minutes * 60):
             checkpoint(step)
             t_save = time.time()
         if why:
@@ -710,6 +712,8 @@ def phase_train(a) -> None:
             return
     if step == a.steps and step >= start:
         save_state(final, step, latents, student, opt, a, ctl, results, origin)
+        for f in (last_ck, last_ck.with_suffix(".json")):  # a finished stage never resumes (final.pt is immutable)
+            f.unlink(missing_ok=True)
         say(f"STAGE_DONE stage {a.stage}{' branch ' + a.branch if a.branch else ''}: {final}")
     say(peak())
     say(f"QAD_DONE at step {step} in {time.time() - t0:.0f}s")
