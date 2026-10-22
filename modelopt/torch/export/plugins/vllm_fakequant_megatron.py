@@ -322,7 +322,15 @@ class VllmFqGPTModelExporter(GPTModelExporter):
             index: self._get_quantizer_state(state_dict)
             for index, state_dict in enumerate([*self.layer_state_dicts.values(), self._state_dict])
         }
+
+        # The weights are written in BF16, so a source checkpoint's own quantization (e.g. FP8)
+        # no longer describes them.
+        if hasattr(self._hf_config, "quantization_config"):
+            del self._hf_config.quantization_config
+
         super().save_pretrained(save_directory, pretrained_model_name_or_path)
+        # The base exporter copies a pre-quantized source's hf_quant_config.json along with it.
+        (Path(save_directory) / "hf_quant_config.json").unlink(missing_ok=True)
 
         # Save fresh quantizer files after the base exporter copies source files.
         recipe = self._extract_quantizer_recipe_markers(quantizer_state_dicts)
@@ -501,6 +509,10 @@ def export_mcore_gpt_to_hf_vllm_fq(
             pretrained model hosted inside a model repo on huggingface.co; or
             a *directory* containing model weights saved using
             [`~PreTrainedModel.save_pretrained`], e.g., `./my_model_directory/`.
+            The source's non-model files (tokenizer, processor, generation config, remote code)
+            are copied into the export from a local directory only; for a model ID they are
+            skipped with a warning. Get a local copy first with
+            `modelopt.torch.export.ensure_local_checkpoint` to include them.
         export_extra_modules: If True, export extra modules like medusa_heads or
             eagle_module. Otherwise, only export the base model.
         dtype: The weights data type to export the unquantized layers.

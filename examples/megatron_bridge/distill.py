@@ -74,6 +74,7 @@ from transformers import AutoTokenizer
 
 import modelopt.torch.distill as mtd
 import modelopt.torch.utils.distributed as dist
+from modelopt.torch.export import ensure_local_checkpoint
 from modelopt.torch.opt.conversion import ModeloptStateManager
 from modelopt.torch.utils import print_args, print_rank_0, warn_rank_0
 from modelopt.torch.utils.mlflow import Tool, masked_args
@@ -178,6 +179,15 @@ def get_args():
     parser.add_argument("--pp_size", type=int, default=1, help="Pipeline parallel size")
     parser.add_argument("--cp_size", type=int, default=1, help="Context parallel size")
     parser.add_argument("--ep_size", type=int, default=1, help="Expert parallel size")
+    parser.add_argument(
+        "--dsa_kernel_backend",
+        choices=["none", "tilelang", "cudnn"],
+        default=None,
+        help=(
+            "Fused kernels for DeepSeek sparse attention (e.g. GLM-5.x). The unfused fallback "
+            "builds dense [seq, seq] scores per head, which does not fit at long sequence lengths."
+        ),
+    )
 
     # Dataset arguments
     parser.add_argument(
@@ -238,6 +248,13 @@ def get_args():
         "or the whole conversation. Multi-turn records train all of their responses under "
         "'assistant'.",
     )
+    parser.add_argument(
+        "--sft_in_batch_packing",
+        action="store_true",
+        help="Pack each micro-batch's --sft_hf_dataset conversations into one THD sequence (attention "
+        "restarts per conversation) instead of padding every conversation to --seq_length. --mbs "
+        "then sets the conversations per pack.",
+    )
     # Training & Eval arguments
     parser.add_argument(
         "--output_dir", type=str, required=True, help="Folder for logging and checkpoint saving"
@@ -263,6 +280,13 @@ def get_args():
         "--freeze_mtp",
         action="store_true",
         help="Keep the student's MTP head at its input weights: skip its loss and freeze it.",
+    )
+    parser.add_argument(
+        "--moe_aux_loss_coeff",
+        type=float,
+        default=None,
+        help="Override the MoE load-balancing loss weight (e.g. 0 to drop it). It is computed over every "
+        "token, so with --sft padding it also sends gradient into the padded positions.",
     )
     parser.add_argument(
         "--no_async_save",
@@ -421,8 +445,10 @@ def get_args():
             )
         if args.eval_iters > 0 and not args.sft_hf_validation:
             raise ValueError("--sft_hf_dataset with --eval_iters > 0 needs --sft_hf_validation.")
-    elif args.sft_hf_validation or args.sft_loss_mode != "assistant":
-        raise ValueError("--sft_hf_validation / --sft_loss_mode require --sft_hf_dataset.")
+    elif args.sft_hf_validation or args.sft_loss_mode != "assistant" or args.sft_in_batch_packing:
+        raise ValueError(
+            "--sft_hf_validation / --sft_loss_mode / --sft_in_batch_packing require --sft_hf_dataset."
+        )
     if args.sft and (args.data_paths or args.use_mock_data):
         raise ValueError(
             "--sft is mutually exclusive with --data_paths / --use_mock_data: the SFT branch wins "
@@ -472,6 +498,12 @@ def _tokenizer_prepends_bos(args) -> bool:
 
 
 def main(args: argparse.Namespace, owns_the_run: bool = True):
+    # --student_hf_path stays as given. The student is built and exported from the local copy of
+    # the whole checkpoint in student_local_checkpoint_path, since the HF export reads the source's
+    # files from local disk only; student_hub_model_id is the Hub ID, or None for a local path.
+    args.student_hub_model_id, args.student_local_checkpoint_path = ensure_local_checkpoint(
+        args.student_hf_path
+    )
     student_has_modelopt_state = args.student_megatron_path is not None and has_modelopt_state(
         args.student_megatron_path
     )
@@ -480,7 +512,7 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
     # reads either layout, so it keeps the faster grouped GEMM.
     moe_grouped_gemm = (
         use_moe_grouped_gemm(
-            args.student_hf_path,
+            args.student_local_checkpoint_path,
             trust_remote_code=args.trust_remote_code,
             force_sequential=args.no_moe_grouped_gemm,
         )
@@ -508,7 +540,11 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
         provider.expert_model_parallel_size = args.ep_size
         provider.expert_tensor_parallel_size = 1  # Expert tensor parallelism is not supported
         provider.seq_length = args.seq_length
+        if args.dsa_kernel_backend is not None:
+            provider.dsa_kernel_backend = args.dsa_kernel_backend
         set_moe_expert_layout(provider, moe_grouped_gemm)
+        if args.moe_aux_loss_coeff is not None:
+            provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
         if per_token_loss:
             provider.calculate_per_token_loss = True
         if args.recompute_granularity is not None:
@@ -524,7 +560,7 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
     # the built student inside the patched provide() below).
     # Only the student's layout is pinned -- it must match --student_megatron_path (see quantize.py).
     student_provider = _build_model_provider(
-        args.student_hf_path,
+        args.student_local_checkpoint_path,
         load_weights=args.student_megatron_path is None,
         moe_grouped_gemm=moe_grouped_gemm,
     )
@@ -562,7 +598,9 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
 
     # HF VLM configs expose ``vision_config``; Megatron-Bridge nests the text model under
     # ``language_model`` (used as ``distill_submodule`` below).
-    is_vlm = is_vlm_config(args.student_hf_path, trust_remote_code=args.trust_remote_code)
+    is_vlm = is_vlm_config(
+        args.student_local_checkpoint_path, trust_remote_code=args.trust_remote_code
+    )
 
     if is_vlm:
         warn_rank_0(
@@ -632,9 +670,14 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
                 _hf_source(args.sft_hf_validation) if args.sft_hf_validation else None
             ),
             preprocessing=ChatSFTPreprocessingConfig(loss_mode=args.sft_loss_mode),
-            dataloader_type="batch",
+            # "batch" collates a rank's whole global batch at once and then splits it into
+            # micro-batches, which a packed THD batch cannot be; packing collates per micro-batch.
+            dataloader_type="single" if args.sft_in_batch_packing else "batch",
             do_validation=args.eval_iters > 0,
             do_test=False,
+            enable_in_batch_packing=args.sft_in_batch_packing,
+            # Each packed conversation must split evenly across the 2 * CP context-parallel chunks.
+            in_batch_packing_pad_to_multiple_of=2 * args.cp_size if args.cp_size > 1 else 1,
         )
     elif args.sft:
         # SFT-masked distillation via Bridge's FinetuningDatasetConfig -> NeMo-style GPTSFTDataset,
@@ -774,7 +817,7 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
         save_vlm_to_hf(
             full_student,
             args.hf_export_path,
-            args.student_hf_path,
+            args.student_local_checkpoint_path,
             trust_remote_code=args.trust_remote_code,
         )
         print_rank_0(f"Saved distilled VLM to {args.hf_export_path} in HF format")
@@ -791,7 +834,7 @@ def main(args: argparse.Namespace, owns_the_run: bool = True):
             export_llm_to_hf(
                 megatron_path=f"{checkpoint_dir}/iter_{args.train_iters:07d}",
                 hf_export_path=args.hf_export_path,
-                student_hf_path=args.student_hf_path,
+                student_hf_path=args.student_local_checkpoint_path,
                 template_hf=args.student_hf_model,
                 trust_remote_code=args.trust_remote_code,
             )

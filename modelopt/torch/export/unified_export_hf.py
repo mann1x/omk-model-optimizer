@@ -64,6 +64,13 @@ try:
 except ImportError:
     HAS_DIFFUSERS = False
 
+try:
+    from transformers import PreTrainedModel
+
+    _TRANSFORMERS_MODEL_TYPES: tuple[type, ...] = (PreTrainedModel,)
+except ImportError:
+    _TRANSFORMERS_MODEL_TYPES = ()
+
 
 from modelopt.torch.opt.conversion import ModeloptStateManager, modelopt_state
 from modelopt.torch.opt.plugins.huggingface import _MODELOPT_STATE_SAVE_NAME
@@ -72,7 +79,10 @@ from modelopt.torch.quantization.ggml import GGML_FORMAT_REGISTRY
 from modelopt.torch.quantization.nn import SequentialQuantizer, TensorQuantizer
 from modelopt.torch.quantization.qtensor import MXFP8QTensor, NVFP4QTensor
 from modelopt.torch.quantization.qtensor.base_qtensor import QTensorWrapper
-from modelopt.torch.quantization.qtensor.nvfp4_tensor import _cast_per_block_scale_to_fp8
+from modelopt.torch.quantization.qtensor.nvfp4_tensor import (
+    _cast_per_block_scale_to_fp8,
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+)
 from modelopt.torch.quantization.utils import (
     fsdp2_aware_weight_update,
     module_name_maps,
@@ -591,15 +601,6 @@ def _compressed_per_block_scale(
     scale = getattr(weight_quantizer, "_scale", None)
     if scale is None or not (scale.dtype == torch.uint8 and scale.ndim == 1):
         return scale
-    try:
-        from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
-            cutlass_fp4_scale_to_modelopt_fp4_scale,
-        )
-    except ImportError as e:
-        raise ImportError(
-            "This weight was compressed by TensorRT-LLM, so its NVFP4 block scale is "
-            "cutlass-swizzled, but tensorrt_llm cannot be imported to convert it for export."
-        ) from e
     return cutlass_fp4_scale_to_modelopt_fp4_scale(scale, weight.metadata["shape"][-2:])
 
 
@@ -1242,6 +1243,7 @@ def _export_diffusers_checkpoint(
     export_dir: Path,
     components: list[str] | None,
     max_shard_size: int | str = "10GB",
+    export_attention_quantizers: bool | None = None,
     **kwargs,
 ) -> None:
     """Internal: Export diffusion(-like) model/pipeline checkpoint.
@@ -1259,6 +1261,10 @@ def _export_diffusers_checkpoint(
         max_shard_size: Maximum size of each shard file. If the model exceeds this size,
             it will be sharded into multiple files and a .safetensors.index.json will be
             created. Use smaller values like "5GB" or "2GB" to force sharding.
+        export_attention_quantizers: Preserve enabled Q/K/V BMM quantizer state for
+            runtimes that consume legacy attention ``_amax`` keys, such as static FP8 FLUX.
+            None preserves these keys for FLUX.1 and omits them for other diffusion
+            components. Transformers components always retain them for KV-cache scales.
         **kwargs: Runtime-specific post-processing options forwarded to
             :func:`_postprocess_safetensors`. See its docstring for details.
     """
@@ -1303,6 +1309,14 @@ def _export_diffusers_checkpoint(
 
         # Infer dtype if not provided
         component_dtype = dtype if dtype is not None else infer_dtype_from_model(component)
+        is_transformers_component = isinstance(component, _TRANSFORMERS_MODEL_TYPES)
+        # TRT-LLM's static FP8 FLUX.1 path consumes the legacy Q/K/V amax keys.
+        # Transformers components need these keys for their declared KV-cache scheme.
+        keep_attention_quantizers = is_transformers_component or (
+            isinstance(component, diffusers.FluxTransformer2DModel)
+            if export_attention_quantizers is None
+            else export_attention_quantizers
+        )
 
         if is_quantized:
             # Fuse QKV linears that share the same input (unify amax values)
@@ -1329,7 +1343,12 @@ def _export_diffusers_checkpoint(
             # promoted buffers are always removed, even if save / post-process / config
             # update raises (keeps the live module reusable for a repeated export).
             try:
-                quant_config = get_quant_config(component, is_modelopt_qlora=False)
+                quant_config = get_quant_config(
+                    component,
+                    is_modelopt_qlora=False,
+                    # Native diffusion components (including LTX-2) have no KV cache.
+                    include_kv_cache=is_transformers_component,
+                )
                 if quant_config:
                     quantization_details = quant_config.get("quantization", {})
                     # Record the SVDQuant low-rank size so consumers know the LoRA shape.
@@ -1345,12 +1364,12 @@ def _export_diffusers_checkpoint(
                 # - diffusers ModelMixin.save_pretrained does NOT accept state_dict parameter
                 # - for non-diffusers modules (e.g., LTX-2 transformer), fall back to torch.save
                 if hasattr(component, "save_pretrained"):
-                    with hide_quantizers_from_state_dict(component):
+                    with hide_quantizers_from_state_dict(component, keep_attention_quantizers):
                         component.save_pretrained(
                             component_export_dir, max_shard_size=max_shard_size
                         )
                 else:
-                    with hide_quantizers_from_state_dict(component):
+                    with hide_quantizers_from_state_dict(component, keep_attention_quantizers):
                         _save_component_state_dict_safetensors(component, component_export_dir)
 
                 # Post-process — merge, metadata, padding, swizzle
@@ -1750,6 +1769,14 @@ def unplaced_keys_for(model: nn.Module, ckpt: "str | Path") -> list[str]:
     module scope. Where those are absent the recorded set stands alone -- degraded, but no worse
     than before this function existed.
     """
+    # Local import breaks the cycle: layerwise_export imports this module.
+    from .layerwise_export import LAYERWISE_EXPORTER_ATTR
+
+    exporter = getattr(model, LAYERWISE_EXPORTER_ATTR, None)
+    snapshot = getattr(exporter, "_source_key_snapshot", None)
+    if snapshot is not None and snapshot[0] == str(ckpt):
+        return list(snapshot[1])
+
     recorded = getattr(model, "_modelopt_unplaced_source_keys", None) or []
     structural: list[str] = []
     try:
@@ -1897,7 +1924,12 @@ def export_hf_checkpoint(
         max_shard_size: Maximum size of each safetensors shard file. Defaults to "10GB".
         **kwargs: Runtime-specific post-processing options forwarded to
             :func:`_postprocess_safetensors` for diffusion model exports.
-            See its docstring for supported keys.
+            See its docstring for supported keys. Diffusion exports also accept
+            ``export_attention_quantizers=True`` to retain enabled Q/K/V BMM quantizer
+            state for runtimes using legacy ``*_bmm_quantizer._amax`` keys, or False
+            to omit it. When unspecified, FLUX.1 retains enabled Q/K/V quantizers for
+            runtime compatibility; other diffusion components omit them.
+            Transformers components always retain them for KV-cache scales.
     """
     # Weights the model never loaded (MTP head, auxiliary tower, ...) are copied straight from the
     # source so the exported checkpoint is the complete model. Merged here, ahead of the path
