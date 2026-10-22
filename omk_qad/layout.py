@@ -10,8 +10,8 @@ Two questions, both answered by llama.cpp itself rather than re-implemented here
      block covers 256 consecutive values of one row, so (rows, column order) is exactly what the trainer
      needs to fake-quantize the SAME blocks the GGUF will hold.
   2. Which type does each GGUF tensor get?  A shape-only sparse GGUF (header + tensor info, no data on
-     disk) is written and ``llama-quantize --dry-run <ftype>`` prints its per-tensor plan. Classes trained
-     at a fixed format (e.g. experts at IQ2_XXS) are passed as ``--tensor-type`` overrides, so llama.cpp's
+     disk) is written and ``llama-quantize --dry-run <ftype>`` prints its per-tensor plan. Classes given a
+     fixed format (e.g. experts at IQ2_XXS) are passed as ``--tensor-type`` overrides, so llama.cpp's
      own counters (first n/8 ffn_down, ...) behave as in a real llama-quantize run with those overrides.
 
   python -m omk_qad.layout --model DIR --out LAYOUT.pt [--rest IQ2_M|IQ2_S|IQ3_XXS|Q2_K|...|bolt]
@@ -19,7 +19,9 @@ Two questions, both answered by llama.cpp itself rather than re-implemented here
                            [--override linear_attn=q4_k] [--override-regex 'attn_v\.weight$=q6_k']
                            [--compare IQ2_M,IQ2_S,IQ3_XXS,Q2_K,bolt]
 
-The fixed (QAD-trained) classes are mandatory: there is no pure llama.cpp-mix mode.
+At least one fixed class is mandatory: there is no pure llama.cpp-mix mode. "Fixed" only means the type is set
+by hand instead of by the --rest ftype's rules. It does not decide what trains: omk_qad.train fake-quantizes and
+trains EVERY quantized tensor at its planned type, fixed or rest, except the classes in its --export-only.
 
 DIR needs config.json and the tokenizer files only. LAYOUT.pt (torch) holds the index arrays; a JSON
 summary (types, sizes, per-class formats, unsupported tensors) is written beside it.
