@@ -474,6 +474,39 @@ def test_pause_resume_is_bitwise_and_stage2_branches(setup):
     assert p.returncode != 0 and "--branch" in p.stdout + p.stderr
 
 
+def test_a_resumed_run_trains_in_train_mode(setup, monkeypatch):
+    """bm-888: every training step runs in train mode, also after a resume.
+
+    The init eval (skipped on resume) ended with the only student.train(); a resumed student stayed in eval mode, so
+    HF gradient checkpointing (active only while training) was off: 25 -> 80 GiB on Qwen3.5-4B. The loss is the same
+    in both modes on these models (no dropout), so only the mode itself shows it.
+    """
+    import shutil
+
+    from omk_qad import train as T
+
+    model, lay = setup["moe"]
+    out = WORK / "run_train_mode"
+    if out.exists():
+        shutil.rmtree(out)  # test scratch of this test only
+    (out / "stage1").mkdir(parents=True)
+    (out / "stage1" / "PAUSE").touch()
+    real, modes = T.train_step, []
+
+    def spy(student, *a, **k):
+        modes.append(student.training)
+        return real(student, *a, **k)
+
+    monkeypatch.setattr(T, "train_step", spy)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    args = [*TRAIN, "--model", str(model), "--layout", str(lay), "--cache", str(setup["cache"]), "--out", str(out),
+            "--steps", "3", "--eval-every", "3", "--save-every", "1"]
+    T.main(args)  # paused after step 1
+    assert (out / "stage1" / "last.pt").exists() and modes == [True]
+    T.main(args)  # resumes from last.pt: steps 2 and 3 without an init eval
+    assert modes == [True, True, True], modes
+
+
 def test_refresh_window_defers_encodes_and_resumes_bitwise(setup):
     """--refresh / --ggml-refresh N: fewer encodes than every update; PAUSE + relaunch == straight run (bitwise)."""
     import shutil

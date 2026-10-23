@@ -762,6 +762,9 @@ def phase_train(a) -> None:
 
     step = start - 1
     guard.take(step)
+    # bm-888: from_pretrained returns an eval-mode model and HF gradient checkpointing only runs while training; the
+    # init eval's trailing train() is skipped on resume, which left a resumed run without checkpointing (25 -> 80 GiB)
+    student.train()
     for step in range(start, last + 1):
         ctl.step = step
         ctl.lr = cosine_lr(step - 1, a.steps, a.lr, a.min_lr, a.warmup) * guard.scale
