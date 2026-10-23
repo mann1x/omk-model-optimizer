@@ -9,6 +9,10 @@ applied inside backward (omk_qad.fakequant), small fp tensors on AdamW;
 --phase export  latents -> GGUF at the plan with the encoders training served (omk_qad.qad_export).
 Without --load this exports the untrained base: the PTQ floor at the same plan.
 
+--mode bf16 (omk_qad.recovery): no quantizer and no layout. The student's own bf16 weights in
+--train-scope (e.g. gemma4) train against the cache's teacher, which may be another model of the same
+tokenizer; export writes the source HF checkpoint back with only the trained tensors replaced (--out-hf).
+
 python -m omk_qad.train --phase cache  --model M --cache C --data a.jsonl=3,b.parquet=1 --eval-data e.txt
 python -m omk_qad.train --phase train  --model M --layout L.pt --cache C --out O [--load O/state.pt]
 python -m omk_qad.train --phase export --model M --layout L.pt [--load O/state.pt] --gguf X.gguf
@@ -39,6 +43,7 @@ from .fakequant import (
 )
 from .losses import jaccard_topk_rest, kl_topk_rest
 from .ptq import load_text_causal_lm
+from .recovery import softcap, softcap_of
 
 LOG = [None]
 
@@ -96,6 +101,31 @@ def _packed(path: str, tok, seq: int, eos: int, passes: list):
         passes.append(path)
         if n_docs == 0:
             raise SystemExit(f"{path}: no documents")
+
+
+def _role_rows(path: str, seq: int, passes: list):
+    """Endless stream of (ids, role) rows of a ``.roles.jsonl`` source (omk_qad.rollouts windows, ``seq`` long)."""
+    while True:
+        n = 0
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if len(row["ids"]) != seq or len(row["role"]) != seq:
+                    raise SystemExit(f"{path}: a row of {len(row['ids'])} tokens, the cache runs --seq {seq}")
+                n += 1
+                yield torch.tensor(row["ids"]), torch.tensor(row["role"], dtype=torch.int8)
+        passes.append(path)
+        if n == 0:
+            raise SystemExit(f"{path}: no rows")
+
+
+def _stream(path: str, tok, seq: int, eos: int, passes: list):
+    """(ids, role or None) rows of one training source: role windows, or packed text (no role)."""
+    if path.endswith(".roles.jsonl"):
+        return _role_rows(path, seq, passes)
+    return ((x, None) for x in _packed(path, tok, seq, eos, passes))
 
 
 # ===================================================================================================== telemetry
@@ -187,8 +217,11 @@ def phase_cache(a) -> None:
     LOG[0] = open(os.path.join(a.cache, "cache.log"), "a")
     say("args", json.dumps(vars(a)))
     dtype = torch.float32 if a.device == "cpu" else torch.bfloat16
+    if getattr(a, "anchor", False):
+        return anchor_pass(a, dtype)
     teacher, tok = load_text_causal_lm(a.model, a.device, dtype)
     teacher.requires_grad_(False)
+    cap = softcap_of(teacher)  # Gemma-4: the teacher's distribution is the soft-capped one
     from .mtp import attach, checkpoint_mtp_keys, load_weights, mtp_layers
 
     if a.imatrix_seqs and mtp_layers(teacher.config) and checkpoint_mtp_keys(Path(a.model)):
@@ -202,7 +235,7 @@ def phase_cache(a) -> None:
         h = teacher.get_decoder()(input_ids=x).last_hidden_state
         if imat["collector"] is not None and getattr(teacher, "mtp", None) is not None:
             teacher.mtp(teacher.get_input_embeddings()(x[:, 1:]), h[:, :-1], teacher.get_decoder().rotary_emb)
-        lp = F.log_softmax(teacher.get_output_embeddings()(h[:, :-1]).float(), -1)
+        lp = F.log_softmax(softcap(teacher.get_output_embeddings()(h[:, :-1]).float(), cap), -1)
         v, i = lp.topk(a.topk, -1)
         nll = -lp.gather(-1, x[:, 1:, None]).sum().item()
         if imat["collector"] is not None:
@@ -266,13 +299,17 @@ def phase_cache(a) -> None:
         imat["collector"] = Collector(teacher, folded=folded if want_folded else None, block=block)
         if not a.layout:
             say("WARNING: no --layout: imatrix.pt only (no imatrix.gguf, no folded statistic for ternary students)")
-    streams = [_packed(p, tok, a.seq, tok.eos_token_id, passes) for p, _ in srcs]
+    streams = [_stream(p, tok, a.seq, tok.eos_token_id, passes) for p, _ in srcs]
     rng, n_src = random.Random(a.seed), [0] * len(srcs)
     t0 = time.time()
     for s0 in range(0, a.n_seq, a.shard):
         fn = os.path.join(a.cache, f"train_{s0 // a.shard:04d}.pt")
         picks = rng.choices(range(len(srcs)), [w for _, w in srcs], k=min(a.shard, a.n_seq - s0))
-        x = torch.stack([next(streams[k]) for k in picks])  # always drawn, so a resume stays aligned
+        rows = [next(streams[k]) for k in picks]  # always drawn, so a resume stays aligned
+        x = torch.stack([q[0] for q in rows])
+        role = None
+        if any(q[1] is not None for q in rows):  # role data: text rows are teacher-trained everywhere
+            role = torch.stack([q[1] if q[1] is not None else torch.ones(a.seq, dtype=torch.int8) for q in rows])
         for k in picks:
             n_src[k] += 1
         if os.path.exists(fn):
@@ -284,7 +321,8 @@ def phase_cache(a) -> None:
             continue
         parts = [topk_of(x[i : i + a.cache_bs]) for i in range(0, len(x), a.cache_bs)]
         torch.save({"x": x.to(torch.int32), "idx": torch.cat([q[0] for q in parts]),
-                    "val": torch.cat([q[1] for q in parts])}, fn + ".tmp")
+                    "val": torch.cat([q[1] for q in parts]), **({"role": role} if role is not None else {})},
+                   fn + ".tmp")
         os.replace(fn + ".tmp", fn)
         say(f"cached {s0 + len(x)}/{a.n_seq} sequences [{time.time() - t0:.0f}s] rows per source {n_src}")
     if imat["collector"] is not None:  # fewer sequences than --imatrix-seqs
@@ -293,6 +331,50 @@ def phase_cache(a) -> None:
             "rows_per_source": dict(zip([p for p, _ in srcs], n_src)), "source_passes": passes}
     json.dump(meta, open(os.path.join(a.cache, "cache.json"), "w"), indent=1)
     say("CACHE_DONE")
+
+
+def anchor_pass(a, dtype) -> None:
+    """Add the ANCHOR model's top-K (``aidx``/``aval``) to every cached shard holding anchor-role positions.
+
+    Runs over the very rows the teacher pass cached (read back from the shards), so the two targets can never
+    misalign. ``--model`` is the anchor (bf16 recovery: the original student, whose coding is kept).
+    """
+    from .rollouts import ANCHOR
+
+    meta_p = Path(a.cache) / "cache.json"
+    if not meta_p.exists():
+        raise SystemExit(f"--anchor needs a finished teacher cache in {a.cache}")
+    meta = json.loads(meta_p.read_text())
+    if meta.get("anchor_model") not in (None, a.model):
+        raise SystemExit(f"{a.cache} already holds anchor targets of {meta['anchor_model']}")
+    model, _ = load_text_causal_lm(a.model, a.device, dtype)
+    model.requires_grad_(False)
+    cap = softcap_of(model)
+    n_sh, done = math.ceil(meta["n_seq"] / meta["shard"]), 0
+    for s in range(n_sh):
+        fn = Path(a.cache) / f"train_{s:04d}.pt"
+        sh = torch.load(fn)
+        if "role" not in sh:
+            raise SystemExit(f"{fn}: no role data (the anchor targets only positions of role {ANCHOR})")
+        if "aidx" in sh or not (sh["role"] == ANCHOR).any():
+            continue
+        ai, av = [], []
+        with torch.no_grad():
+            for i in range(0, len(sh["x"]), a.cache_bs):
+                x = sh["x"][i : i + a.cache_bs].long().to(a.device)
+                h = model.get_decoder()(input_ids=x).last_hidden_state
+                lp = F.log_softmax(softcap(model.get_output_embeddings()(h[:, :-1]).float(), cap), -1)
+                v, k = lp.topk(meta["topk"], -1)
+                ai.append(k.to(torch.int32).cpu())
+                av.append(v.to(torch.float16).cpu())
+        sh.update(aidx=torch.cat(ai), aval=torch.cat(av))
+        torch.save(sh, str(fn) + ".tmp")
+        os.replace(str(fn) + ".tmp", fn)
+        done += 1
+        say(f"anchor {fn.name}: {int((sh['role'] == ANCHOR).sum())} anchor positions")
+    meta["anchor_model"] = a.model
+    meta_p.write_text(json.dumps(meta, indent=1))
+    say(f"ANCHOR_DONE {done} shards from {a.model}")
 
 
 # ===================================================================================================== student
@@ -358,6 +440,7 @@ def build_student(a, layout: dict):
             f"{fpath.name if weighted_f else '- (no folded statistic)'}")
     tied = head_param is student.get_input_embeddings().weight
     install(student, latents, skip=set() if tied else {head_name})
+    a.softcap = softcap_of(student)
     student.config.use_cache = False
     student.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     n_q = sum(lat.param.numel() for lat in latents.values() if lat.segments)
@@ -419,7 +502,7 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
             for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
-                    lg = F.linear(h[i, c0:c1], wh)
+                    lg = softcap(F.linear(h[i, c0:c1], wh), getattr(a, "softcap", None))
                 j, k, ce, t1 = token_terms(lg, ev["idx"][i0 + i, c0:c1].to(a.device),
                                            ev["val"][i0 + i, c0:c1].to(a.device), x[i, c0 + 1 : c1 + 1])
                 terms = {"jac": j.sum().item(), "klk": k.sum().item(), "nll": ce.sum().item(), "top1": t1.sum().item()}
@@ -434,7 +517,7 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
                 for c0 in range(0, x.shape[1] - 2, a.loss_chunk):
                     c1 = min(c0 + a.loss_chunk, x.shape[1] - 2)
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
-                        lg = F.linear(z[i, c0:c1], wh)
+                        lg = softcap(F.linear(z[i, c0:c1], wh), getattr(a, "softcap", None))
                     j, k, _, t1 = token_terms(lg, ev["idx"][i0 + i, c0 + 1 : c1 + 1].to(a.device),
                                               ev["val"][i0 + i, c0 + 1 : c1 + 1].to(a.device), x[i, c0 + 2 : c1 + 2])
                     tot["jac_m"] += j.sum().item()
@@ -454,20 +537,51 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
     return res
 
 
-def train_step(student, latents, head, fp_params, opt, x, idx, val, a) -> float:
-    """One update: body forward, head + loss per chunk, head gradient, body backward (latents update inside)."""
+def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
+    """Per-token loss of one chunk under roles (omk_qad.rollouts): 1 teacher, 2 anchor, 3 teacher + unlikelihood."""
+    j, k, _, _ = token_terms(lg, idx, val, x_next)
+    per = (j if a.loss == "jaccard" else k) * ((r == 1) | (r == 3))
+    if (r == 2).any():
+        if aidx is None:
+            raise SystemExit("anchor-role positions without anchor targets (run --phase cache --anchor)")
+        ja, ka, _, _ = token_terms(lg, aidx, aval, x_next)
+        per = per + a.anchor_weight * (ja if a.loss == "jaccard" else ka) * (r == 2)
+    if (r == 3).any():  # push down the repeated token the student produced: -log(1 - p_s(x_next))
+        p = F.log_softmax(lg.float(), -1).gather(-1, x_next[:, None]).squeeze(-1).exp()
+        per = per + a.ul_weight * -torch.log((1 - p).clamp_min(1e-6)) * (r == 3)
+    return per
+
+
+def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None, aidx=None, aval=None) -> float:
+    """One update: body forward, head + loss per chunk, head gradient, body backward (latents update inside).
+
+    With ``role`` (role data, omk_qad.rollouts) only scored positions count: teacher / anchor / loop losses per
+    the target token's role, normalised by the number of scored positions.
+    """
     cuda = a.device != "cpu"
     h = hidden_of(student, x, cuda)
     hd = h.detach().requires_grad_()
+    frozen = getattr(head, "frozen", False)  # bf16 mode: a head outside the scope gets no weight gradient
     head.add_use()
-    wh = head.served().requires_grad_()
-    n_tok = x.shape[0] * (x.shape[1] - 1)
+    wh = head.served() if frozen else head.served().requires_grad_()
+    n_tok = x.shape[0] * (x.shape[1] - 1) if role is None else max(1, int((role[:, 1:] > 0).sum()))
     tot = 0.0
     for i in range(x.shape[0]):
         for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
             c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
+            if role is not None and not (role[i, c0 + 1 : c1 + 1] > 0).any():
+                continue  # nothing scored in this chunk (prompt / tool output / padding)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
-                lg = F.linear(hd[i, c0:c1], wh)
+                lg = softcap(F.linear(hd[i, c0:c1], wh), getattr(a, "softcap", None))
+            if role is not None:
+                r = role[i, c0 + 1 : c1 + 1].long()
+                per = role_loss(lg, x[i, c0 + 1 : c1 + 1], r, idx[i, c0:c1], val[i, c0:c1],
+                                None if aidx is None else aidx[i, c0:c1], None if aval is None else aval[i, c0:c1], a)
+                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * (r > 0)
+                loss = (per.sum() + a.ce_weight * ce.sum()) / n_tok
+                loss.backward()
+                tot += loss.item()
+                continue
             j, k, ce, _ = token_terms(lg, idx[i, c0:c1], val[i, c0:c1], x[i, c0 + 1 : c1 + 1])
             loss = ((j if a.loss == "jaccard" else k).sum() + a.ce_weight * ce.sum()) / n_tok
             loss.backward()
@@ -481,13 +595,14 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a) -> float:
             for c0 in range(0, x.shape[1] - 2, a.loss_chunk):
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 2)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
-                    lg = F.linear(zd[i, c0:c1], whd)
+                    lg = softcap(F.linear(zd[i, c0:c1], whd), getattr(a, "softcap", None))
                 j, k, ce, _ = token_terms(lg, idx[i, c0 + 1 : c1 + 1], val[i, c0 + 1 : c1 + 1], x[i, c0 + 2 : c1 + 2])
                 loss = a.mtp_weight * ((j if a.loss == "jaccard" else k).sum() + a.ce_weight * ce.sum()) / n_m
                 loss.backward()
                 tot += loss.item()
         z.backward(zd.grad)
-    head.on_grad(wh.grad)
+    if not frozen:
+        head.on_grad(wh.grad)
     h.backward(hd.grad)
     for lat in latents.values():
         lat.flush()
@@ -517,7 +632,8 @@ def save_state(path: Path, step: int, latents, student, opt, a, ctl=None, result
     named = dict(student.named_parameters())
     sd = {"step": step, "args": vars(a), "latents": {n: lat.param.data.cpu() for n, lat in latents.items()},
           "adafactor": adafactor_state(latents), "adamw": opt.state_dict() if opt else None,
-          "fp": {n: p.detach().cpu() for n, p in named.items() if n not in latents},
+          # trainable non-latents only (bf16 mode freezes everything outside its scope: never written here)
+          "fp": {n: p.detach().cpu() for n, p in named.items() if n not in latents and p.requires_grad},
           "rng": _rng_state(), "stats": dict(ctl.stats) if ctl else {}, "results": results or [],
           "folded": {n: lat.basis.block for n, lat in latents.items() if lat.basis is not None},
           # a refresh window serves payloads older than the latent: a resume must serve the same ones
@@ -605,7 +721,7 @@ class Guard:
         self.ratio, self.patience, self.every = a.guard_ratio, a.guard_patience, a.guard_every
         self.cut, self.max = a.guard_cut, a.guard_max
         self.latents, self.opt = latents, opt
-        self.fp = {n: p for n, p in student.named_parameters() if n not in latents}
+        self.fp = {n: p for n, p in student.named_parameters() if n not in latents and p.requires_grad}
         self.scale, self.ema, self.bad, self.rollbacks, self.healthy = 1.0, None, 0, 0, 0
         self.snap: dict | None = None
 
@@ -678,6 +794,19 @@ class Guard:
         return False
 
 
+def same_model(p: str, q: str) -> bool:
+    """Whether two model dirs are the same checkpoint (same path, or identical config + weight index)."""
+    a, b = Path(p).resolve(), Path(q).resolve()
+    if a == b:
+        return True
+
+    def sig(d: Path) -> tuple:
+        files = [d / "config.json", d / "model.safetensors.index.json"]
+        return tuple(f.read_bytes() if f.exists() else b"" for f in files)
+
+    return sig(a) == sig(b) and (a / "model.safetensors.index.json").exists()
+
+
 def run_dir_of(a) -> Path:
     """Stage 1: <out>/stage1 ; stage 2: <out>/stage2/<branch>."""
     if a.stage == 1:
@@ -705,11 +834,18 @@ def phase_train(a) -> None:
     if final.exists():
         raise SystemExit(f"{final} exists: this stage/branch is finished and immutable (use a new --branch)")
     ev = torch.load(os.path.join(a.cache, "eval.pt"))
-    if a.imatrix == "auto":
-        a.imatrix = str(Path(a.cache) / "imatrix.pt") if (Path(a.cache) / "imatrix.pt").exists() else "none"
-    layout = torch.load(a.layout, weights_only=False)
-    student, latents, fp_params, ctl, head_name = build_student(a, layout)
-    head = latents[head_name]
+    bf16 = a.mode == "bf16"
+    if a.imatrix == "auto":  # bf16 mode encodes nothing: no imatrix
+        a.imatrix = str(Path(a.cache) / "imatrix.pt") if (Path(a.cache) / "imatrix.pt").exists() and not bf16 \
+            else "none"
+    if bf16:
+        from .recovery import build_student_bf16
+
+        student, latents, fp_params, ctl, head = build_student_bf16(a, load_text_causal_lm, say)
+    else:
+        layout = torch.load(a.layout, weights_only=False)
+        student, latents, fp_params, ctl, head_name = build_student(a, layout)
+        head = latents[head_name]
     opt = torch.optim.AdamW(fp_params, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0) if fp_params else None
     last_ck = run / "last.pt"
     origin = {"cache": a.cache, "layout": a.layout, "imatrix": a.imatrix}
@@ -733,6 +869,8 @@ def phase_train(a) -> None:
                 raise SystemExit(f"stage 2 needs a finished stage 1: {src} not found")
             load_state(src, latents, student, None, weights_only=True)
             origin["init_from"] = src
+        elif bf16 and not same_model(meta["args"]["model"], a.model):  # another teacher: KL is the gap, not ~0
+            say(f"LOSSLESS_GATE skipped: cache teacher {meta['args']['model']} is not the student {a.model}")
         else:  # lossless gate: with the quantizer bypassed the student must BE the teacher
             ctl.bypass = True
             g = evaluate(student, head, ev, a, "lossless")
@@ -777,7 +915,9 @@ def phase_train(a) -> None:
         j = s0 % sh
         x = shard[1]["x"][j : j + a.bs].long().to(a.device)
         idx, val = shard[1]["idx"][j : j + a.bs].to(a.device), shard[1]["val"][j : j + a.bs].to(a.device)
-        loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a)
+        roles = {k: shard[1][k][j : j + a.bs].to(a.device) if k in shard[1] else None
+                 for k in ("role", "aidx", "aval")}
+        loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles)
         rolled = guard.observe(step, loss)
         row = {"train/loss": loss, "train/lr": ctl.lr, **({"train/guard_rollback": 1} if rolled else {})}
         if step % a.log_every == 0 or step <= 3:
@@ -820,7 +960,17 @@ def phase_train(a) -> None:
 
 
 def phase_export(a) -> None:
-    """GGUF of the trained (or, without --load, the untrained = PTQ floor) student at the layout's plan."""
+    """GGUF of the trained (or, without --load, the untrained = PTQ floor) student at the layout's plan.
+
+    ``--mode bf16``: the source HF checkpoint with the trained tensors of ``--load`` written in (``--out-hf``).
+    """
+    if a.mode == "bf16":
+        from .recovery import export_bf16
+
+        if not (a.load and a.out_hf):
+            raise SystemExit("--mode bf16 export needs --load CKPT and --out-hf DIR")
+        export_bf16(Path(a.model), a.load, Path(a.out_hf), say)
+        return
     from .qad_export import export_gguf
 
     layout = torch.load(a.layout, weights_only=False)
@@ -855,6 +1005,16 @@ def main(argv=None) -> None:
     """CLI entry point."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--phase", choices=["cache", "train", "export"], required=True)
+    ap.add_argument("--mode", choices=["qad", "bf16"], default="qad",
+                    help="qad: fake-quantized latents per --layout; bf16: train the model's own bf16 weights in "
+                    "--train-scope, no quantizer (omk_qad.recovery)")
+    ap.add_argument("--train-scope", default="gemma4", help="bf16 mode: gemma4 | classes:<a,b,...>")
+    ap.add_argument("--train-router", action="store_true", help="bf16 mode, gemma4 scope: also train router.proj")
+    ap.add_argument("--out-hf", default="", help="bf16 export: output HF checkpoint dir (must be new/empty)")
+    ap.add_argument("--anchor", action="store_true", help="cache: add --model's top-K as the ANCHOR targets of the "
+                    "anchor-role positions of an existing role cache (bf16 recovery: the original student)")
+    ap.add_argument("--anchor-weight", type=float, default=1.0, help="train: weight of the anchor-role loss")
+    ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens")
     ap.add_argument("--model", required=True, help="HF model dir (weights) of the teacher / student base")
     ap.add_argument("--layout", default="", help="omk_qad.layout output (.pt)")
     ap.add_argument("--cache", default="")

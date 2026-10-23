@@ -179,11 +179,12 @@ def classify_model(model: nn.Module) -> Census:
             continue
         anc = ancestors(n)
         parent = n.rsplit(".", 1)[0] if "." in n else ""
+        grand = parent.rsplit(".", 1)[0] if "." in parent else ""
         if emb_out is not None and m is emb_out:
             cls = "lm_head"
         elif any(n.startswith(e + ".") for e in experts):
             cls = "routed_experts"
-        elif parent in moe_blocks and m.out_features == moe_blocks[parent]:
+        elif m.out_features in (moe_blocks.get(parent), moe_blocks.get(grand)):  # Gemma-4: <layer>.router.proj
             cls = "router"
         elif m.out_features < SMALL_OUT:
             cls = "small_proj"

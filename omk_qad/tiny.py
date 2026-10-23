@@ -9,6 +9,8 @@ of 256 (the GGML super-block).
   python -m omk_qad.tiny --kind moe   --out DIR   # Qwen3.6-27B-A3B-Coder shape (qwen3_5_moe_text)
   python -m omk_qad.tiny --kind dense --out DIR   # Qwen3.6-27B shape (qwen3_5_text)
   python -m omk_qad.tiny --kind dense_tied --out DIR   # Qwen3.5-4B shape (qwen3_5_text, tied embeddings)
+  python -m omk_qad.tiny --kind gemma4_moe --out DIR   # Gemma-4 26B-A4B shape (gemma4_text: sliding + full
+                                                       # attention, k=v on full layers, router.proj, softcap)
 """
 
 import argparse
@@ -23,6 +25,7 @@ REFERENCE = {
     "moe": "ManniX-ITA/Qwen3.6-27B-A3B-Coder",
     "dense": "Qwen/Qwen3.6-27B",
     "dense_tied": "Qwen/Qwen3.5-4B",  # the smoke target: one tensor is both the lookup table and the head
+    "gemma4_moe": "google/gemma-4-26B-A4B-it",  # bf16 recovery target (tied embeddings, final-logit softcap)
 }
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.jinja")
 
@@ -43,12 +46,31 @@ SHRINK_MOE = {
     "shared_expert_intermediate_size": 256,
 }
 SHRINK_DENSE = {"intermediate_size": 512}
+SHRINK_GEMMA4 = {  # 5 sliding + 1 full layer, as the 26B-A4B's period; head dims keep the 1:2 sliding/full ratio
+    "hidden_size": 256,
+    "num_hidden_layers": 6,
+    "layer_types": ["sliding_attention"] * 5 + ["full_attention"],
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "num_global_key_value_heads": 1,
+    "head_dim": 64,
+    "global_head_dim": 128,
+    "intermediate_size": 512,
+    "moe_intermediate_size": 256,
+    "num_experts": 8,
+    "top_k_experts": 2,
+    "sliding_window": 64,
+    "max_position_embeddings": 4096,
+}
 
 
 def tiny_text_config(kind: str, mtp: bool = False) -> dict:
     """The reference text config with sizes shrunk (no weights downloaded); ``mtp`` keeps one MTP layer."""
     cfg = json.loads(Path(hf_hub_download(REFERENCE[kind], "config.json")).read_text())
     text = dict(cfg.get("text_config", cfg))
+    if kind == "gemma4_moe":
+        text.update(SHRINK_GEMMA4)
+        return text
     text.update(SHRINK)
     text.update(SHRINK_MOE if kind == "moe" else SHRINK_DENSE)
     if mtp:
@@ -66,16 +88,21 @@ def make_tiny(kind: str, out: Path, seed: int = 0, std: float = 0.05, mtp: bool 
     ``mtp`` adds one random MTP (nextn) layer saved as ``model-mtp.safetensors`` (checkpoint names ``mtp.*``).
     """
     from transformers import (
+        Gemma4ForCausalLM,
+        Gemma4TextConfig,
         Qwen3_5ForCausalLM,
         Qwen3_5MoeForCausalLM,
         Qwen3_5MoeTextConfig,
         Qwen3_5TextConfig,
     )
 
+    if mtp and kind == "gemma4_moe":
+        raise ValueError("gemma4_moe has no MTP layer (its drafter is a separate assistant model)")
     text = tiny_text_config(kind, mtp)
-    config_cls, model_cls = (
-        (Qwen3_5MoeTextConfig, Qwen3_5MoeForCausalLM) if kind == "moe" else (Qwen3_5TextConfig, Qwen3_5ForCausalLM)
-    )
+    config_cls, model_cls = {
+        "moe": (Qwen3_5MoeTextConfig, Qwen3_5MoeForCausalLM),
+        "gemma4_moe": (Gemma4TextConfig, Gemma4ForCausalLM),
+    }.get(kind, (Qwen3_5TextConfig, Qwen3_5ForCausalLM))
     for key in ("model_type", "architectures", "transformers_version", "dtype", "torch_dtype"):
         text.pop(key, None)
     config = config_cls(**text)
@@ -94,6 +121,8 @@ def make_tiny(kind: str, out: Path, seed: int = 0, std: float = 0.05, mtp: bool 
 
         save_random_weights(model, out, std=std, seed=seed + 1)
     for fname in TOKENIZER_FILES:
+        if kind == "gemma4_moe" and fname in ("vocab.json", "merges.txt"):  # one tokenizer.json, no BPE files
+            continue
         shutil.copy(hf_hub_download(REFERENCE[kind], fname), out / fname)
     return out
 
