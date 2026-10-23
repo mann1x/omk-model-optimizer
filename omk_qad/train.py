@@ -219,18 +219,33 @@ def phase_cache(a) -> None:
     dtype = torch.float32 if a.device == "cpu" else torch.bfloat16
     if getattr(a, "anchor", False):
         return anchor_pass(a, dtype)
-    teacher, tok = load_text_causal_lm(a.model, a.device, dtype)
-    teacher.requires_grad_(False)
-    cap = softcap_of(teacher)  # Gemma-4: the teacher's distribution is the soft-capped one
-    from .mtp import attach, checkpoint_mtp_keys, load_weights, mtp_layers
-
-    if a.imatrix_seqs and mtp_layers(teacher.config) and checkpoint_mtp_keys(Path(a.model)):
-        attach(teacher)  # the MTP head's inputs go into the imatrix too (no MTP-head imatrix gap)
-        load_weights(teacher, Path(a.model))
     imat = {"collector": None, "seqs": 0}
+    if a.teacher_gguf:  # libllama teacher (omk_qad.gguf_teacher); --model gives the tokenizer only
+        from transformers import AutoTokenizer
+
+        from .gguf_teacher import GGUFTeacher
+
+        if a.imatrix_seqs:
+            say("--teacher-gguf: no imatrix (it needs the torch teacher's activations); --imatrix-seqs set to 0")
+            a.imatrix_seqs = 0
+        tok = AutoTokenizer.from_pretrained(a.model)
+        gguf = GGUFTeacher(a.teacher_gguf, a.seq, a.topk, len(tok), a.teacher_gguf_bin, a.teacher_ngl,
+                           a.teacher_ubatch, log=say)
+
+        def topk_of(x, want=None):
+            return gguf(x, want)
+    else:
+        teacher, tok = load_text_causal_lm(a.model, a.device, dtype)
+        teacher.requires_grad_(False)
+        cap = softcap_of(teacher)  # Gemma-4: the teacher's distribution is the soft-capped one
+        from .mtp import attach, checkpoint_mtp_keys, load_weights, mtp_layers
+
+        if a.imatrix_seqs and mtp_layers(teacher.config) and checkpoint_mtp_keys(Path(a.model)):
+            attach(teacher)  # the MTP head's inputs go into the imatrix too (no MTP-head imatrix gap)
+            load_weights(teacher, Path(a.model))
 
     @torch.no_grad()
-    def topk_of(x):
+    def topk_of_torch(x, want=None):
         x = x.to(a.device)
         h = teacher.get_decoder()(input_ids=x).last_hidden_state
         if imat["collector"] is not None and getattr(teacher, "mtp", None) is not None:
@@ -243,6 +258,9 @@ def phase_cache(a) -> None:
             if imat["seqs"] >= a.imatrix_seqs:
                 save_imatrix()
         return i.to(torch.int32).cpu(), v.to(torch.float16).cpu(), nll
+
+    if not a.teacher_gguf:
+        topk_of = topk_of_torch
 
     def save_imatrix():
         from .imatrix import save, save_folded
@@ -319,7 +337,9 @@ def phase_cache(a) -> None:
                     break
                 topk_of(x[i : i + a.cache_bs])
             continue
-        parts = [topk_of(x[i : i + a.cache_bs]) for i in range(0, len(x), a.cache_bs)]
+        want = None if role is None else role[:, 1:] > 0  # a GGUF teacher skips unscored positions
+        parts = [topk_of(x[i : i + a.cache_bs], None if want is None else want[i : i + a.cache_bs])
+                 for i in range(0, len(x), a.cache_bs)]
         torch.save({"x": x.to(torch.int32), "idx": torch.cat([q[0] for q in parts]),
                     "val": torch.cat([q[1] for q in parts]), **({"role": role} if role is not None else {})},
                    fn + ".tmp")
@@ -330,6 +350,11 @@ def phase_cache(a) -> None:
     meta = {"args": vars(a), "n_seq": a.n_seq, "shard": a.shard, "topk": a.topk, "seq": a.seq,
             "rows_per_source": dict(zip([p for p, _ in srcs], n_src)), "source_passes": passes}
     json.dump(meta, open(os.path.join(a.cache, "cache.json"), "w"), indent=1)
+    if a.teacher_gguf:
+        gguf.close()
+        side = Path(a.teacher_gguf + ".sha256")  # the download's verified digest (hashing 60 GB here is not)
+        meta["teacher"] = {"gguf": a.teacher_gguf, "sha256": side.read_text().split()[0] if side.exists() else None}
+        json.dump(meta, open(os.path.join(a.cache, "cache.json"), "w"), indent=1)
     say("CACHE_DONE")
 
 
@@ -1016,6 +1041,11 @@ def main(argv=None) -> None:
     ap.add_argument("--anchor-weight", type=float, default=1.0, help="train: weight of the anchor-role loss")
     ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens")
     ap.add_argument("--model", required=True, help="HF model dir (weights) of the teacher / student base")
+    ap.add_argument("--teacher-gguf", default="", help="cache: the teacher as a GGUF, run by libllama "
+                    "(omk_qad.gguf_teacher); --model then gives the tokenizer only. No imatrix")
+    ap.add_argument("--teacher-gguf-bin", default="", help="llama_topk binary (default omk_qad/llama_topk/llama_topk)")
+    ap.add_argument("--teacher-ngl", type=int, default=999, help="--teacher-gguf: layers on the GPU")
+    ap.add_argument("--teacher-ubatch", type=int, default=512, help="--teacher-gguf: tokens per decode")
     ap.add_argument("--layout", default="", help="omk_qad.layout output (.pt)")
     ap.add_argument("--cache", default="")
     ap.add_argument("--out", default="")
