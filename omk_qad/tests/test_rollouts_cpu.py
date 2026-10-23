@@ -4,6 +4,7 @@
 
 import json
 import os
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -85,6 +86,8 @@ def test_roles_of_a_gemma4_agentic_turn(tok):
     assert by[LOOP].strip().startswith("I should look") and "I should look." in by[TEACHER]  # first one is not loop
     assert "```" in by[TEACHER] and "```" not in by[ANCHOR]  # fences are prose, their inside is code
     assert sp[-1] == (IGNORE, "\n")  # the template newline after <turn|> is not generated
+    assert any(q0 == IGNORE and s0.endswith("<tool_response|><|channel>thought\n") and q1 == TEACHER
+               and s1.startswith("Done.") for (q0, s0), (q1, s1) in pairwise(sp))  # server's gen prompt: unscored
 
 
 def test_earlier_segment_turns_are_context_only(tok):
@@ -128,9 +131,9 @@ def test_build_statistics_and_refusal(tok):
 
 def test_stripped_history_one_example_per_turn(tok):
     """opencoti-provider rollouts: earlier reasoning is not re-sent, so each turn is its own example."""
-    from omk_qad.rollouts import _norm, render_turns_stripped
+    from omk_qad.rollouts import _norm, render_turns
 
-    items = render_turns_stripped(tok, _norm(CONV), TOOLS)
+    items = render_turns(tok, _norm(CONV), TOOLS, "strip")
     assert len(items) == 3  # one per assistant turn
     sp = [_spans(tok, t, r) for t, r in items]
     scored = ["".join(s for q, s in x if q != IGNORE) for x in sp]
@@ -138,6 +141,32 @@ def test_stripped_history_one_example_per_turn(tok):
     assert "I should look" in scored[0] and "I should look" not in items[1][0]  # no reasoning re-sent in turn 2
     assert CODE in items[1][0] and CODE not in scored[1]  # turn 1's tool call is context of turn 2
     assert "Done." in scored[1] and "Done." not in items[2][0] and "Adding tests." in scored[2]
-    assert all("<|channel>thought" not in c.split("<|turn>model")[-1] for c in ctx[1:])  # history thought-free
+    assert all("<channel|>" not in c.split("<|turn>model")[-1] for c in ctx[1:])  # no earlier thought re-sent
+    assert "<tool_response|><|channel>thought\n" in ctx[1]  # the server's generation prompt is context
     out, st = build(tok, [{"id": "a", "messages": CONV, "tools": TOOLS}], seq=256, stride=128, history="strip")
+    assert st["segments"] == 3 and st["refused_not_prefix"] == 0 and len(out) == 3
+
+
+def test_last_inline_history_matches_the_sdk(tok):
+    """Cerebriline SDK >= 4.100.260 (ai-sdk.ts): only the newest reasoning is re-sent, as <think>R</think> text."""
+    from omk_qad.rollouts import _context_last_inline, _norm, render_turns
+
+    items = render_turns(tok, _norm(CONV), TOOLS, "last-inline")
+    assert len(items) == 3
+    sp = [_spans(tok, t, r) for t, r in items]
+    scored = ["".join(s for q, s in x if q != IGNORE) for x in sp]
+    reasoning = "I should look. I should look. I should look."
+    assert f"<think>{reasoning}</think>" in items[1][0] and "<think>" not in scored[1]  # turn 1 inlined, context
+    assert f"<think>{reasoning}</think>\n" not in items[1][0]  # it had no text: the block alone
+    assert "I should look" not in items[2][0]  # older reasoning dropped once a newer one exists
+    assert "<think>Done.</think>\nHere:" in items[2][0] and "Adding tests." in scored[2]
+    assert "</think><turn|>\n<|channel>thought\n" in items[1][0]  # the server's prompt, closed turn and all
+    assert "I should look" in scored[0] and "Done." in scored[1]  # each turn's own reasoning is still trained
+    msgs = [{"role": "user", "content": "go"},
+            {"role": "assistant", "reasoning_content": "only thinking"},  # emptied by the drop: omitted
+            {"role": "assistant", "reasoning_content": " recap ", "content": "Plan.", "pinned_reasoning": True},
+            {"role": "assistant", "reasoning_content": " newest ", "content": "ok"}]
+    ctx = _context_last_inline(msgs)
+    assert [m.get("content") for m in ctx] == ["go", "recap\n\nPlan.", "<think>newest</think>\nok"]
+    out, st = build(tok, [{"id": "a", "messages": CONV, "tools": TOOLS}], seq=256, stride=128, history="last-inline")
     assert st["segments"] == 3 and st["refused_not_prefix"] == 0 and len(out) == 3

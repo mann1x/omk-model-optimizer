@@ -88,7 +88,7 @@ def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_AR
         m = msgs[i]
         if m["role"] != "assistant":
             continue
-        p = tok.apply_chat_template(msgs[:i], add_generation_prompt=msgs[i - 1]["role"] != "tool", **kw)
+        p = tok.apply_chat_template(msgs[:i], add_generation_prompt=True, **kw)  # what the server sent
         a = tok.apply_chat_template(msgs[: i + 1], **kw)
         if not (text.startswith(p) and text.startswith(a) and len(a) > len(p)):
             raise NotPrefixError(f"turn {i}: prompt/turn render is not a prefix of the segment render")
@@ -96,27 +96,82 @@ def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_AR
     return text, roles
 
 
-def render_turns_stripped(tok, messages: list[dict], tools, code_args=CODE_ARGS, stats=None):
-    """One (text, char roles) per assistant turn, for providers that do NOT re-send earlier reasoning.
+def _context_without_reasoning(messages: list[dict]) -> list[dict]:
+    """``strip``: every earlier assistant turn without its reasoning (what such a provider sends back)."""
+    return [{k: v for k, v in q.items() if k != "reasoning_content"} if q["role"] == "assistant" else q
+            for q in messages]
 
-    The context of turn i is every earlier message with the assistant ``reasoning_content`` removed (what such
-    a provider sends back), followed by turn i as generated, reasoning included; only turn i is scored.
+
+def _context_last_inline(messages: list[dict]) -> list[dict]:
+    r"""``last-inline``: Cerebriline SDK >= 4.100.260 when the template drops the reasoning field (ai-sdk.ts).
+
+    Only the newest message that carries reasoning keeps it, trimmed and folded into its text as
+    ``<think>R</think>\n`` + text (``<think>R</think>`` alone when it has no text); every other reasoning is
+    dropped, and an assistant turn emptied by that is omitted. A ``pinned_reasoning`` turn (the harness's
+    post-compaction retrospective) keeps its reasoning as text, ``R\n\n`` + text.
+    """
+    last = max((j for j, q in enumerate(messages) if q["role"] == "assistant" and q.get("reasoning_content")),
+               default=-1)
+    out = []
+    for j, q in enumerate(messages):
+        if q["role"] != "assistant":
+            out.append(q)
+            continue
+        r = (q.get("reasoning_content") or "").strip()
+        m = {k: v for k, v in q.items() if k != "reasoning_content"}
+        text = m.get("content") or ""
+        if r and q.get("pinned_reasoning"):
+            m["content"] = f"{r}\n\n{text}"
+        elif r and j == last:
+            m["content"] = f"<think>{r}</think>\n{text}" if text else f"<think>{r}</think>"
+        elif q.get("reasoning_content") and not text and not m.get("tool_calls"):
+            continue  # emptied only by its dropped reasoning: the SDK sends no such turn
+        out.append(m)
+    return out
+
+
+HISTORY_CONTEXT = {"strip": _context_without_reasoning, "last-inline": _context_last_inline}
+
+
+def render_turns(tok, messages: list[dict], tools, history: str, code_args=CODE_ARGS, stats=None):
+    """One (text, char roles) per assistant turn, for clients whose re-sent history changes every turn.
+
+    The context of turn i is every earlier message as the client re-sent it (``HISTORY_CONTEXT[history]``),
+    followed by turn i as generated, reasoning included; only turn i is scored.
     """
     kw = {"tools": tools, "tokenize": False, "enable_thinking": True}
     out = []
     for i, m in enumerate(messages):
         if m["role"] != "assistant":
             continue
-        ctx = [{k: v for k, v in q.items() if k != "reasoning_content"} if q["role"] == "assistant" else q
-               for q in messages[:i]]
-        p = tok.apply_chat_template(ctx, add_generation_prompt=messages[i - 1]["role"] != "tool", **kw)
-        a = tok.apply_chat_template([*ctx, m], **kw)
-        if not (a.startswith(p) and len(a) > len(p)):
-            raise NotPrefixError(f"turn {i}: the prompt render is not a prefix of prompt + turn")
-        roles = np.zeros(len(a), np.int8)
-        _label_turn(a, roles, len(p), len(a), m, code_args, stats)
-        out.append((a, roles))
+        ctx = HISTORY_CONTEXT[history](messages[:i])
+        p, gen = _prompt_and_generated(tok, ctx, m, kw, i)
+        text = p + gen
+        roles = np.zeros(len(text), np.int8)
+        _label_turn(text, roles, len(p), len(text), m, code_args, stats)
+        out.append((text, roles))
     return out
+
+
+def _prompt_and_generated(tok, ctx: list[dict], m: dict, kw: dict, i: int) -> tuple[str, str]:
+    """(the prompt the server rendered, the text the model generated after it) for turn ``m`` after ``ctx``.
+
+    The prompt is the template with its generation prompt, as llama-server sends it. The generated text is
+    taken from the render of ``ctx + [m]``: what follows the history there, minus the generation prompt. The
+    history render may close the model turn (``<turn|>``) where the continued turn does not (Gemma-4 after a
+    tool response whose message also carries text, e.g. last-inline reasoning); only such a closure may
+    differ, anything else is refused.
+    """
+    p = tok.apply_chat_template(ctx, add_generation_prompt=True, **kw)
+    q = tok.apply_chat_template(ctx, **kw)
+    a = tok.apply_chat_template([*ctx, m], **kw)
+    if not p.startswith(q):
+        raise NotPrefixError(f"turn {i}: the history render is not a prefix of the prompt")
+    g = p[len(q):]
+    for h in (q, q.removesuffix("<turn|>\n")):
+        if a.startswith(h + g) and len(a) > len(h + g):
+            return p, a[len(h + g):]
+    raise NotPrefixError(f"turn {i}: the turn render does not continue the prompt render")
 
 
 def _label_turn(text: str, roles: np.ndarray, g0: int, g1: int, m: dict, code_args, stats) -> None:
@@ -195,7 +250,8 @@ def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = 
     """Windows of every row plus build statistics.
 
     ``history``: ``keep`` = the serving client re-sent earlier reasoning (one render per segment); ``strip`` =
-    it did not (e.g. Cerebriline's opencoti provider): one example per assistant turn.
+    it re-sent none; ``last-inline`` = only the newest, folded into the text (Cerebriline SDK >= 4.100.260 on a
+    template that drops the field). ``strip`` and ``last-inline`` give one example per assistant turn.
     """
     stats = {"rows": 0, "segments": 0, "refused_not_prefix": 0, "windows": 0, "code_args_not_found": 0,
              "loop_spans_not_found": 0, "tokens_by_role": [0, 0, 0, 0]}
@@ -204,9 +260,9 @@ def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = 
     for row in rows:
         stats["rows"] += 1
         msgs = _norm(row["messages"])
-        if history == "strip":
+        if history in HISTORY_CONTEXT:
             try:
-                items = render_turns_stripped(tok, msgs, row.get("tools"), code_args, stats)
+                items = render_turns(tok, msgs, row.get("tools"), history, code_args, stats)
             except NotPrefixError:
                 stats["refused_not_prefix"] += 1
                 continue
@@ -237,9 +293,11 @@ def main() -> None:
     ap.add_argument("--seq", type=int, default=16384)
     ap.add_argument("--stride", type=int, default=0, help="window step (default seq // 2)")
     ap.add_argument("--code-args", default=",".join(CODE_ARGS))
-    ap.add_argument("--history-reasoning", choices=["keep", "strip"], required=True,
-                    help="did the serving client re-send earlier turns' reasoning? keep = yes (one render per "
-                    "segment); strip = no, e.g. Cerebriline's opencoti provider (one example per assistant turn)")
+    ap.add_argument("--history-reasoning", choices=["keep", *HISTORY_CONTEXT], required=True,
+                    help="how the serving client re-sent earlier turns' reasoning: keep = all of it (one render per "
+                    "segment); strip = none; last-inline = only the newest, as <think>..</think> in its text "
+                    "(Cerebriline SDK >= 4.100.260, automaticum's opencoti provider). strip / last-inline: one "
+                    "example per assistant turn")
     a = ap.parse_args()
     if not a.out.endswith(".roles.jsonl"):
         raise SystemExit("--out must end in .roles.jsonl (the trainer recognises role data by that suffix)")
