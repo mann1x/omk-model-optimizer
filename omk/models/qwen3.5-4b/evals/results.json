@@ -48,11 +48,17 @@
    "label": "Q4_K_S",
    "kind": "stock",
    "file": "compare/Qwen3.5-4B-Q4_K_S.gguf",
-   "bytes": null,
+   "bytes": 2631772256,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
-   "kld": null
+   "humaneval": 0.5975609756097561,
+   "humaneval_plus": 0.5365853658536586,
+   "kld": {
+    "kld_mean": 0.030699,
+    "same_top_p_pct": 91.682,
+    "ppl_q": 9.845549,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
   },
   {
    "label": "Q3_K_L",
@@ -60,9 +66,15 @@
    "file": "compare/Qwen3.5-4B-Q3_K_L.gguf",
    "bytes": 2482647136,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
-   "kld": null
+   "humaneval": 0.5426829268292683,
+   "humaneval_plus": 0.49390243902439024,
+   "kld": {
+    "kld_mean": 0.08737,
+    "same_top_p_pct": 86.247,
+    "ppl_q": 10.477223,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
   },
   {
    "label": "Q3_K_M",
@@ -70,8 +82,8 @@
    "file": "compare/Qwen3.5-4B-Q3_K_M.gguf",
    "bytes": 2318807136,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
+   "humaneval": 0.5182926829268293,
+   "humaneval_plus": 0.4878048780487805,
    "kld": {
     "kld_mean": 0.09281,
     "same_top_p_pct": 85.639,
@@ -86,8 +98,8 @@
    "file": "compare/Qwen3.5-4B-Q3_K_S.gguf",
    "bytes": 2121748576,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
+   "humaneval": 0.49390243902439024,
+   "humaneval_plus": 0.4329268292682927,
    "kld": {
     "kld_mean": 0.132395,
     "same_top_p_pct": 83.133,
@@ -102,8 +114,8 @@
    "file": "compare/Qwen3.5-4B-IQ3_M.gguf",
    "bytes": 2216796256,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
+   "humaneval": 0.5548780487804879,
+   "humaneval_plus": 0.4878048780487805,
    "kld": {
     "kld_mean": 0.090863,
     "same_top_p_pct": 86.204,
@@ -118,8 +130,8 @@
    "file": "compare/Qwen3.5-4B-IQ3_XS.gguf",
    "bytes": 2145464416,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
+   "humaneval": 0.49390243902439024,
+   "humaneval_plus": 0.43902439024390244,
    "kld": {
     "kld_mean": 0.112198,
     "same_top_p_pct": 84.51,
@@ -134,8 +146,8 @@
    "file": "compare/Qwen3.5-4B-IQ3_XXS.gguf",
    "bytes": 1972377696,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
+   "humaneval": 0.4817073170731707,
+   "humaneval_plus": 0.4268292682926829,
    "kld": {
     "kld_mean": 0.151085,
     "same_top_p_pct": 81.969,
@@ -150,9 +162,15 @@
    "file": "pack/iq3m_l/iq2-pack-iq3m_l.gguf",
    "bytes": 1983211232,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
-   "kld": null
+   "humaneval": 0.2926829268292683,
+   "humaneval_plus": 0.25,
+   "kld": {
+    "kld_mean": 0.375522,
+    "same_top_p_pct": 73.42,
+    "ppl_q": 12.487635,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
   },
   {
    "label": "student IQ2_XXS core, Q3_K_M packaging",
@@ -160,9 +178,15 @@
    "file": "pack/q3km/iq2-pack-q3km.gguf",
    "bytes": 1834495712,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
-   "kld": null
+   "humaneval": 0.3231707317073171,
+   "humaneval_plus": 0.2804878048780488,
+   "kld": {
+    "kld_mean": 0.366801,
+    "same_top_p_pct": 74.592,
+    "ppl_q": 12.727822,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
   },
   {
    "label": "student IQ2_XXS core, IQ3_M packaging",
@@ -170,9 +194,15 @@
    "file": "pack/iq3m/iq2-pack-iq3m.gguf",
    "bytes": 1829252832,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
-   "kld": null
+   "humaneval": 0.3048780487804878,
+   "humaneval_plus": 0.2621951219512195,
+   "kld": {
+    "kld_mean": 0.365364,
+    "same_top_p_pct": 74.443,
+    "ppl_q": 12.560023,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
   },
   {
    "label": "IQ2_M",
@@ -180,8 +210,8 @@
    "file": "compare/Qwen3.5-4B-IQ2_M.gguf",
    "bytes": 1809438816,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
+   "humaneval": 0.3231707317073171,
+   "humaneval_plus": 0.27439024390243905,
    "kld": {
     "kld_mean": 0.281815,
     "same_top_p_pct": 75.718,
@@ -244,9 +274,31 @@
    "file": "pack/iq3xxs/iq2-pack-iq3xxs.gguf",
    "bytes": 1689261792,
    "engine": "llama.cpp",
-   "humaneval": null,
-   "humaneval_plus": null,
-   "kld": null
+   "humaneval": 0.36585365853658536,
+   "humaneval_plus": 0.3170731707317073,
+   "kld": {
+    "kld_mean": 0.36324,
+    "same_top_p_pct": 74.725,
+    "ppl_q": 12.636074,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
+  },
+  {
+   "label": "**student IQ2_XXS stage 2 (mix_v2, lr 3e-6)**",
+   "kind": "student",
+   "file": "iq2/stage2/mix_v2_lr3e6/iq2_s2_mix_v2_lr3e6.gguf",
+   "bytes": 1657558752,
+   "engine": "llama.cpp",
+   "humaneval": 0.42073170731707316,
+   "humaneval_plus": 0.3902439024390244,
+   "kld": {
+    "kld_mean": 0.323503,
+    "same_top_p_pct": 76.882,
+    "ppl_q": 12.204641,
+    "ppl_base": 9.733265,
+    "tool": "llama.cpp 311d4211bf"
+   }
   },
   {
    "label": "**student IQ2_XXS (as trained, IQ2_M packaging)**",

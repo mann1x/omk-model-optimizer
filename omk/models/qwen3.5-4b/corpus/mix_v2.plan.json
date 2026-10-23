@@ -1,0 +1,80 @@
+{
+ "n_seq": 19200,
+ "shard": 1000,
+ "seed": 0,
+ "seq": 1024,
+ "rows": [
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/agentic.train.jsonl",
+   "windows": 3077,
+   "weight": 0.149893,
+   "demand": 2868,
+   "headroom": 209
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/cp_reasoning.train.jsonl",
+   "windows": 1539,
+   "weight": 0.074971,
+   "demand": 1430,
+   "headroom": 109
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/exercism_sql.train.jsonl",
+   "windows": 1027,
+   "weight": 0.050029,
+   "demand": 944,
+   "headroom": 83
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/opencode.train.jsonl",
+   "windows": 4618,
+   "weight": 0.224961,
+   "demand": 4267,
+   "headroom": 351
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/swe_agentless.train.jsonl",
+   "windows": 1541,
+   "weight": 0.075068,
+   "demand": 1487,
+   "headroom": 54
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/agent_train.fresh.jsonl",
+   "windows": 513,
+   "weight": 0.02499,
+   "demand": 493,
+   "headroom": 20
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/sample_10BT_000_00000.fresh.jsonl",
+   "windows": 4102,
+   "weight": 0.199825,
+   "demand": 3854,
+   "headroom": 248
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/train_code.fresh.jsonl",
+   "windows": 2051,
+   "weight": 0.099912,
+   "demand": 1936,
+   "headroom": 115
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/train_general.fresh.jsonl",
+   "windows": 1026,
+   "weight": 0.049981,
+   "demand": 959,
+   "headroom": 67
+  },
+  {
+   "file": "/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/train_tech.fresh.jsonl",
+   "windows": 1034,
+   "weight": 0.05037,
+   "demand": 962,
+   "headroom": 72
+  }
+ ],
+ "ok": true,
+ "data": "/mnt/sdc/omk-model-optimizer/data/mix_v2/agentic.train.jsonl=0.149893,/mnt/sdc/omk-model-optimizer/data/mix_v2/cp_reasoning.train.jsonl=0.074971,/mnt/sdc/omk-model-optimizer/data/mix_v2/exercism_sql.train.jsonl=0.050029,/mnt/sdc/omk-model-optimizer/data/mix_v2/opencode.train.jsonl=0.224961,/mnt/sdc/omk-model-optimizer/data/mix_v2/swe_agentless.train.jsonl=0.075068,/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/agent_train.fresh.jsonl=0.02499,/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/sample_10BT_000_00000.fresh.jsonl=0.199825,/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/train_code.fresh.jsonl=0.099912,/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/train_general.fresh.jsonl=0.049981,/mnt/sdc/omk-model-optimizer/data/mix_v2/fresh/train_tech.fresh.jsonl=0.05037"
+}
