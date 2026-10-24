@@ -76,6 +76,10 @@ def test_census_covers_every_parameter(tiny_models, kind):
 def test_ptq_export_verify_and_load(tiny_models, kind, policy, two_bit_type):
     tag = f"e2e_{kind}_{two_bit_type.lower()}"
     packed, gguf_path = WORK / tag, WORK / f"{tag}.gguf"
+    if packed.exists():
+        import shutil
+
+        shutil.rmtree(packed)  # test scratch of this test only (ptq never overwrites an export)
     args = ["omk_qad.ptq", "--model", str(tiny_models[kind]), "--out", str(packed), "--calib-seqs", "2", "--seq", "64"]
     _run(*args, *(["--policy", policy] if policy else []))
     _run("omk_qad.gguf_export", "--src", str(packed), "--out", str(gguf_path), "--llama-cpp", str(LLAMA_CPP))

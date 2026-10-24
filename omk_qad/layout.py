@@ -498,9 +498,19 @@ def main() -> None:
         layout = plan_layout(probe, a.rest, fixed, overrides, regex, a.mtp_type)
     finally:
         probe["sparse"].unlink(missing_ok=True)
-    torch.save(layout, a.out)
+    if a.out.exists():  # a layout may be in use by a run (its identity names this file): never replaced by another
+        old = torch.load(a.out, weights_only=False)
+        types = [{g: t["type"] for g, t in x["targets"].items()} for x in (old, layout)]
+        same = types[0] == types[1] and all(old.get(k) == layout.get(k) for k in ("params", "hadamard_block"))
+        if not same:
+            raise SystemExit(f"RUN_REFUSED layout: {a.out} exists with another plan; write the new one elsewhere")
+        print(f"{a.out}: the same plan already exists, kept as it is")
+    else:
+        from .runctl import atomic_json, atomic_torch_save
+
+        atomic_json(a.out.with_suffix(".json"), summary(layout))
+        atomic_torch_save(layout, a.out)  # last: the .pt is what runs load
     s = summary(layout)
-    a.out.with_suffix(".json").write_text(json.dumps(s, indent=1))
     keys = ("rest", "fixed", "type_counts", "per_class", "sizes_mib", "seconds")
     print(json.dumps({k: s[k] for k in keys}, indent=1))
     print(f"unsupported mappings: {len(s['unsupported'])} (quantized among them: {s['unsupported_quantized']})")

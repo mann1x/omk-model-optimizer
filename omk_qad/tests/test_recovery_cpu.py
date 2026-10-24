@@ -147,12 +147,16 @@ def test_bf16_export_replaces_only_trained_tensors(g4):
     if not (out / "stage1" / "final.pt").exists():
         pytest.skip("needs test_bf16_mode_trains_only_the_scope_and_descends")
     hf = WORK / "export_hf"
-    if hf.exists():
-        import shutil
+    import shutil
 
-        shutil.rmtree(hf)
-    _run("omk_qad.train", "--phase", "export", "--mode", "bf16", "--device", "cpu", "--model", str(g4["student"]),
-         "--load", str(out / "stage1" / "final.pt"), "--out-hf", str(hf))
+    for d in (hf, hf.with_name(hf.name + ".partial")):
+        if d.exists():
+            shutil.rmtree(d)  # test scratch of this test only
+    (hf.with_name(hf.name + ".partial")).mkdir()  # what a killed export leaves: removed, then rebuilt
+    (hf.with_name(hf.name + ".partial") / "model.safetensors").write_bytes(b"torn")
+    p = _run("omk_qad.train", "--phase", "export", "--mode", "bf16", "--device", "cpu", "--model",
+             str(g4["student"]), "--load", str(out / "stage1" / "final.pt"), "--out-hf", str(hf))
+    assert "never finished" in p.stdout and not hf.with_name(hf.name + ".partial").exists()
     rep = json.loads((hf / "omk_bf16_export.json").read_text())
     ck = _ckpt(out)
     assert rep["replaced"] == len(ck["latents"]) and rep["unchanged_verified"] > 0

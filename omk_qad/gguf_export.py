@@ -150,7 +150,14 @@ def export(src: Path, out: Path, llama_cpp: Path, embed_type: str = "q8_0", deco
 
     ``decoded_f32`` writes the reference instead: every tensor as the float32 decode, nothing packed. Its
     llama.cpp perplexity must match the packed GGUF's up to activation rounding (runtime equivalence check).
+    Built and verified under ``<stem>.partial.gguf``; ``out`` appears only when it verified.
     """
+    from .runctl import publish_verified
+
+    return publish_verified(Path(out), lambda part: _export(src, part, llama_cpp, embed_type, decoded_f32))
+
+
+def _export(src: Path, out: Path, llama_cpp: Path, embed_type: str = "q8_0", decoded_f32: bool = False) -> dict:
     # llama.cpp's gguf-py must be imported before ModelOpt: transformers (pulled in by ModelOpt) imports
     # whatever gguf is installed, and the converter and its gguf-py must come from the same tree.
     gguf, get_model_architecture, get_model_class, text_type = _import_llama_cpp(llama_cpp)

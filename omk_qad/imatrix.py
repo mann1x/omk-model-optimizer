@@ -18,6 +18,7 @@ weighted IQ encoders take sqrt(E[x^2]) floored at 1e-4 of its mean (ModelOpt's m
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -190,15 +191,20 @@ def per_gguf(imat: dict, layout: dict) -> dict[str, tuple[np.ndarray, np.ndarray
 
 def save(imat: dict, layout: dict | None, out_dir: Path, datasets: list[str], chunk_size: int, chunks: int,
          llama_cpp: Path) -> list[Path]:
-    """Write ``imatrix.pt`` and (with a layout) llama.cpp's ``imatrix.gguf`` into ``out_dir``."""
+    """Write ``imatrix.pt`` and (with a layout) llama.cpp's ``imatrix.gguf`` into ``out_dir``.
+
+    Both atomically, the GGUF first: ``imatrix.pt`` is the completion marker callers test for.
+    """
+    from .runctl import atomic_torch_save
+
     out_dir = Path(out_dir)
     paths = [out_dir / "imatrix.pt"]
-    torch.save({"entries": imat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks}, paths[0])
     if layout is not None:
         from .gguf_export import _import_llama_cpp
 
         gguf = _import_llama_cpp(Path(llama_cpp))[0]
-        w = gguf.GGUFWriter(str(out_dir / "imatrix.gguf"), arch="imatrix")
+        part = out_dir / f"imatrix.gguf.{os.getpid()}.part"
+        w = gguf.GGUFWriter(str(part), arch="imatrix")
         w.add_string("general.type", "imatrix")
         w.add_array("imatrix.datasets", datasets)
         w.add_uint32("imatrix.chunk_count", chunks)
@@ -210,7 +216,10 @@ def save(imat: dict, layout: dict | None, out_dir: Path, datasets: list[str], ch
         w.write_kv_data_to_file()
         w.write_tensors_to_file()
         w.close()
+        os.replace(part, out_dir / "imatrix.gguf")
         paths.append(out_dir / "imatrix.gguf")
+    atomic_torch_save({"entries": imat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks},
+                      paths[0])
     return paths
 
 
@@ -245,7 +254,9 @@ def folded_candidates(layout: dict) -> tuple[dict[str, torch.Tensor | None], int
 
 def save_folded(fimat: dict, out_dir: Path, datasets: list[str], chunk_size: int, chunks: int) -> Path:
     """``imatrix.folded.pt``: the ternary students' statistic, with the basis it was computed in."""
+    from .runctl import atomic_torch_save
+
     path = Path(out_dir) / "imatrix.folded.pt"
-    torch.save({"entries": fimat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks,
-                "basis": "seeded"}, path)
+    atomic_torch_save({"entries": fimat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks,
+                       "basis": "seeded"}, path)
     return path

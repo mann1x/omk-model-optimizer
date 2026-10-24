@@ -10,6 +10,8 @@ omk_qad.gguf_export turns into a GGUF. Text-only: multimodal checkpoints are loa
 
 import argparse
 import json
+import os
+import shutil
 import time
 from pathlib import Path
 
@@ -123,6 +125,8 @@ def main() -> None:
     from modelopt.torch.export import export_hf_checkpoint
 
     t0 = time.time()
+    if a.out.exists() and any(a.out.iterdir()):
+        raise SystemExit(f"RUN_REFUSED ptq: {a.out} is not empty (an export is never overwritten)")
     model, tok = load_text_causal_lm(a.model, a.device)
     policy = dict(kv.split("=", 1) for kv in a.policy.split(",") if kv)
     census = run_census(model, policy)
@@ -140,18 +144,24 @@ def main() -> None:
     if a.algorithm != "max":  # statistics need the per-expert eager loop (grouped_mm bypasses F.linear hooks)
         model.config._experts_implementation = "eager"
     mtq.quantize(model, cfg, forward_loop)
-    a.out.mkdir(parents=True, exist_ok=True)
-    export_hf_checkpoint(model, export_dir=a.out)
-    tok.save_pretrained(a.out)
+    part = a.out.with_name(a.out.name + ".partial")  # built aside, renamed when complete: a kill leaves no a.out
+    if part.exists():
+        shutil.rmtree(part)  # a killed ptq: incomplete by construction
+    part.mkdir(parents=True)
+    export_hf_checkpoint(model, export_dir=part)
+    tok.save_pretrained(part)
     for extra in ("chat_template.jinja",):
         src = Path(a.model) / extra
         if src.exists():
-            (a.out / extra).write_bytes(src.read_bytes())
-    (a.out / "omk_census.json").write_text(json.dumps(census.to_json(), indent=1))
-    (a.out / "omk_ptq.json").write_text(
+            (part / extra).write_bytes(src.read_bytes())
+    (part / "omk_census.json").write_text(json.dumps(census.to_json(), indent=1))
+    (part / "omk_ptq.json").write_text(
         json.dumps({"model": a.model, "policy": policy, "algorithm": a.algorithm, "calib_text": a.calib_text,
                     "calib_seqs": a.calib_seqs, "seq": a.seq, "seconds": round(time.time() - t0, 1)}, indent=1)
     )
+    if a.out.exists():
+        a.out.rmdir()  # empty (checked before quantizing)
+    os.replace(part, a.out)
     print(f"exported {a.out} in {time.time() - t0:.0f}s", flush=True)
 
 

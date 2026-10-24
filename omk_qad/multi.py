@@ -49,12 +49,15 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import torch
+
+from .runctl import RunLock, atomic_json
 
 OWNED = {"phase", "model", "layout", "cache", "out", "device", "llama_cpp", "gguf", "load"}  # set by this driver
 PHASES = ("plan", "cache", "preflight", "train", "export", "report")
@@ -134,8 +137,7 @@ def _state(spec: dict) -> dict:
 def _save_state(spec: dict, st: dict) -> None:
     p = _paths(spec)["state"]
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.with_suffix(".tmp").write_text(json.dumps(st, indent=1))
-    p.with_suffix(".tmp").replace(p)
+    atomic_json(p, st)
 
 
 def _same_plan(a: dict, b: dict) -> bool:
@@ -220,11 +222,20 @@ def phase_cache(spec: dict) -> None:
     cmd = [sys.executable, "-m", "omk_qad.train", "--phase", "cache", "--model", spec["model"], "--cache",
            str(p["cache"]), "--layout", str(cache_layout(spec)), "--device", dev, "--llama-cpp", spec["llama_cpp"],
            *_flags(c)]
-    with open(p["logs"] / "cache.out", "a") as log:
-        rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, check=False).returncode
-    if rc or not (p["cache"] / "cache.json").exists():
-        raise SystemExit(f"cache phase failed (rc {rc}): see {p['logs'] / 'cache.out'}")
+    res = _launch([("cache", cmd, env, p["logs"] / "cache.out")])["cache"]
+    status = _child_status(p["cache"] / "state.json")
+    if res["rc"] or status != "done":  # done is the cache's own state, not the existence of cache.json
+        raise SystemExit(f"cache phase {status or 'failed'} (rc {res['rc']}): see {p['logs'] / 'cache.out'}"
+                         + ("; relaunch to continue" if status == "drained" else ""))
     print(f"cache: {p['cache']}")
+
+
+def _child_status(state: Path) -> str | None:
+    """Status a child process recorded (running / paused / drained / done / failed), None without a state file."""
+    try:
+        return json.loads(state.read_text()).get("status")
+    except (OSError, ValueError):
+        return None
 
 
 # ------------------------------------------------------------------------------------------------ train processes
@@ -238,24 +249,46 @@ def _train_cmd(spec: dict, s: dict, out: Path, overrides: dict | None = None) ->
     return cmd, env
 
 
+FORWARD = (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1, signal.SIGUSR2)
+
+
 def _launch(jobs: list[tuple[str, list[str], dict, Path]]) -> dict:
-    """Start every job at once, wait for all; {name: {pid, rc, started, ended, log}}."""
+    """Start every job at once, wait for all; {name: {pid, rc, started, ended, log}}.
+
+    Signals to this driver (SIGTERM / SIGINT / SIGUSR1 drain, SIGUSR2 pause toggle) are forwarded to every running
+    child, which acts on them at its own step boundary (a 2nd SIGTERM stops each at once). The children run in their
+    own sessions: a driver killed hard leaves them training (their locks refuse a second copy), never half-killed.
+    """
     procs, out = {}, {}
-    for name, cmd, env, log in jobs:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(log, "a")
-        procs[name] = (subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env), fh)
-        out[name] = {"pid": procs[name][0].pid, "started": time.time(), "cmd": cmd, "log": str(log)}
-        print(f"started {name}: pid {out[name]['pid']} (log {log})")
-    running = dict(procs)
-    while running:  # poll, so each student's end time is its own
-        for name, (proc, fh) in list(running.items()):
-            if proc.poll() is not None:
-                out[name]["rc"], out[name]["ended"] = proc.returncode, time.time()
-                fh.close()
-                del running[name]
-        if running:
-            time.sleep(1.0)
+    running: dict = {}
+
+    def forward(signum, _frame):
+        for proc, _fh in running.values():
+            if proc.poll() is None:
+                proc.send_signal(signum)
+        os.write(2, f"multi: forwarded {signal.Signals(signum).name} to {len(running)} running jobs\n".encode())
+
+    prev = {sg: signal.signal(sg, forward) for sg in FORWARD}
+    try:
+        for name, cmd, env, log in jobs:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(log, "a")
+            procs[name] = (subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env,
+                                            start_new_session=True), fh)
+            out[name] = {"pid": procs[name][0].pid, "started": time.time(), "cmd": cmd, "log": str(log)}
+            running[name] = procs[name]
+            print(f"started {name}: pid {out[name]['pid']} (log {log})", flush=True)
+        while running:  # poll, so each student's end time is its own
+            for name, (proc, fh) in list(running.items()):
+                if proc.poll() is not None:
+                    out[name]["rc"], out[name]["ended"] = proc.returncode, time.time()
+                    fh.close()
+                    del running[name]
+            if running:
+                time.sleep(1.0)
+    finally:
+        for sg, h in prev.items():
+            signal.signal(sg, h)
     return out
 
 
@@ -337,14 +370,23 @@ def phase_train(spec: dict, students: list[dict]) -> int:
         cmd, env = _train_cmd(spec, s, p["dir"])
         jobs.append((s["name"], cmd, env, _paths(spec)["logs"] / f"{s['name']}.train.out"))
     res = _launch(jobs)
+    for s in todo:  # each student's own state (train --phase train's state.json), not just the exit code
+        if s["name"] in res:
+            res[s["name"]]["status"] = _child_status(_paths(spec, s)["final"].parent / "state.json")
+            if "RUN_REFUSED" in Path(res[s["name"]]["log"]).read_text()[-4000:]:
+                res[s["name"]]["status"] = "refused"
     st.setdefault("train", {}).update(res)
     _save_state(spec, st)
     bad = {n: r["rc"] for n, r in res.items() if r["rc"]}
     for n, r in res.items():
-        print(f"train {n}: rc {r['rc']} in {r['ended'] - r['started']:.0f}s")
+        print(f"train {n}: rc {r['rc']} status {r.get('status')} in {r['ended'] - r['started']:.0f}s")
     if bad:
-        print(f"FAILED students {bad}: see their logs; relaunching resumes each from its last.pt")
-    return 1 if bad else 0
+        print(f"FAILED students {bad}: see their logs; relaunching resumes each from its last.pt (a refused one is "
+              "held by another process or was relaunched with other settings: its log names which)")
+    stopped = [n for n, r in res.items() if not r["rc"] and r.get("status") in ("paused", "drained")]
+    if stopped:
+        print(f"PAUSED students {stopped}: relaunch to continue")
+    return 1 if bad or stopped else 0
 
 
 # --------------------------------------------------------------------------------------------------- export, report
@@ -432,6 +474,7 @@ def main(argv=None) -> None:
     spec = load_spec(a.spec)
     students = _students(spec, a.students)
     Path(spec["out"]).mkdir(parents=True, exist_ok=True)
+    lock = RunLock(Path(spec["out"]) / "multi.lock", f"multi {spec['out']}")  # noqa: F841  (held for the run)
     rc = 0
     for ph in (("plan", "cache", "train", "export", "report") if a.phase == "all" else (a.phase,)):
         if ph == "plan":

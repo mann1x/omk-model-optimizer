@@ -15,17 +15,23 @@ fenced code 2).
                shares ~80 %); a smaller share is shared boilerplate ("it is guaranteed that the sum of n over all
                test cases ...", digit grids) and is kept, counted as gate_partial_kept
   generate     POST each body to an OpenAI-compatible server -> ``<out>/<category>/<id>.json`` +
-               ``.response.json``; resumable (a complete response is never re-asked), ``--parallel`` requests
+               ``.response.json``; resumable (a complete response is never re-asked), ``--parallel`` requests,
+               ``--redo-capped`` re-asks rows capped below a raised ``--max-tokens``; atomic writes, one process
+               per capture dir (``<out>.lock``), progress in ``<out>.state.json``
+  control      pause | resume | drain | status of a running generate (also SIGUSR2 = pause/resume toggle,
+               SIGUSR1 / SIGTERM = drain: finish the in-flight request, then exit; a 2nd SIGTERM stops at once)
 
     python -m omk_qad.replay gate-ngrams --out gate13.json
     python -m omk_qad.replay prompts --src 'RL-*/rlvr*.jsonl' --gate gate13.json --per-category 75 --out p.jsonl
     python -m omk_qad.replay generate --prompts p.jsonl --url http://host:port --model NAME --out CAPDIR
+    python -m omk_qad.replay control --out CAPDIR drain    # then restart, e.g. with a higher --max-tokens --redo-capped
 """
 
 import argparse
 import glob
 import hashlib
 import json
+import os
 import random
 import re
 import threading
@@ -35,6 +41,8 @@ import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from .runctl import Control, RunLock, atomic_write, check_identity, file_id, parse_allow
 
 # Nemotron RL-blend verifier names -> replay category. Left out on purpose: genrm (judging other answers),
 # jailbreak / abstention / over-refusal (policy, not capability), lean, swe pivots (foreign agent histories),
@@ -210,27 +218,96 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _capped_tokens(rec: dict) -> int | None:
+    """completion_tokens of a complete response that stopped on the length cap, else None."""
+    try:
+        b = json.loads(rec["body"])
+        if b["choices"][0].get("finish_reason") == "length":
+            return int(b.get("usage", {}).get("completion_tokens") or 0)
+    except (ValueError, KeyError, IndexError, TypeError):
+        pass
+    return None
+
+
+def _side(out: Path, kind: str) -> Path:
+    """Sibling of the capture dir (never inside it: rollouts --capture scans it recursively)."""
+    return out.with_name(f"{out.name}.{kind}")
+
+
 def generate(a) -> None:
-    """Ask the server for every prompt not already answered; write request + response in capture layout."""
+    """Ask the server for every prompt not already answered; write request + response in capture layout.
+
+    Resumable: a complete response is never re-asked; a request without a response, or a response file that does
+    not parse (moved to ``<out>.bad/``), is asked again. ``--redo-capped``: a complete response that hit a LOWER
+    length cap than ``--max-tokens`` counts as not answered; its pair is moved (never overwritten) to
+    ``<out>.capped/<old cap>/`` and the prompt is re-asked. Control: ``replay control`` / signals (runctl.Control).
+    One process per capture dir (``<out>.lock``); progress in ``<out>.state.json``; ``<out>.identity.json`` refuses
+    a restart with another served model, sampler or prompts file unless ``--allow-change`` names it (the url is a
+    location, not identity: it is recorded in the state file) (``--max-tokens``
+    is not identity: a raised cap is what ``--redo-capped`` is for).
+    """
+    from concurrent.futures import FIRST_COMPLETED, wait
+
     rows = [json.loads(ln) for ln in Path(a.prompts).open() if ln.strip()]
     if a.limit:
         rows = rows[: a.limit]
     root = Path(a.out)
+    root.mkdir(parents=True, exist_ok=True)
+    run_lock = RunLock(_side(root, "lock"), "replay generate")
+    check_identity(_side(root, "identity.json"),
+                   {"model": a.model, "sampler": SAMPLER, "prompts": file_id(a.prompts), "limit": a.limit},
+                   parse_allow(a.allow_change), what="replay generate")
+    atomic_write(_side(root, "pid"), f"{os.getpid()}\n")
+    ctl = Control(_side(root, "control"), name="replay generate")
     url = a.url.rstrip("/") + "/v1/chat/completions"
     lock = threading.Lock()
-    done = Counter()
+    done, redo = Counter(), Counter()
+    inflight_ids: set[str] = set()
+    status = {"v": "running"}
+
+    def state() -> None:
+        with lock:
+            snap = {"pid": os.getpid(), "status": status["v"], "at": _now(), "url": url, "max_tokens": a.max_tokens,
+                    "redo_capped": a.redo_capped, "rows": len(rows), "counts": {**done, **redo},
+                    "inflight": sorted(inflight_ids)}
+        atomic_write(_side(root, "state.json"), json.dumps(snap, indent=1))
+
+    def move_aside(src: Path, dst_dir: Path, rid: str, suf: str) -> None:
+        tgt = dst_dir / f"{rid}{suf}"
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        if tgt.exists():
+            raise SystemExit(f"refusing to overwrite archived {tgt}")
+        os.replace(src, tgt)
 
     def one(r):
         req_f = root / f"{r['id']}.json"
         resp_f = req_f.with_name(req_f.name[: -len(".json")] + ".response.json")
-        if resp_f.exists() and json.loads(resp_f.read_text()).get("complete"):
-            with lock:
-                done["skipped"] += 1
-            return
+        if resp_f.exists():
+            try:
+                old = json.loads(resp_f.read_text())
+            except ValueError:
+                move_aside(resp_f, _side(root, "bad"), r["id"], ".response.json")
+                old = None
+                with lock:
+                    redo["unparsable_moved"] += 1
+            if old and old.get("complete"):
+                cap = _capped_tokens(old) if a.redo_capped else None
+                if cap is None or cap >= a.max_tokens:
+                    with lock:
+                        done["skipped"] += 1
+                    return
+                for src, suf in ((req_f, ".json"), (resp_f, ".response.json")):
+                    if src.exists():
+                        move_aside(src, _side(root, "capped") / str(cap), r["id"], suf)
+                with lock:
+                    redo[f"redo_capped_{cap}"] += 1
         body = {"model": a.model, "max_tokens": a.max_tokens, **SAMPLER, **r["body"], "stream": False}
         req_f.parent.mkdir(parents=True, exist_ok=True)
-        req_f.write_text(json.dumps({"at": _now(), "url": url, "method": "POST", "sessionId": r["id"],
-                                     "body": body}))
+        atomic_write(req_f, json.dumps({"at": _now(), "url": url, "method": "POST", "sessionId": r["id"],
+                                         "body": body}))
+        with lock:
+            inflight_ids.add(r["id"])
+        state()
         rec = {"at": None, "status": None, "body": "", "complete": False, "error": None}
         try:
             q = urllib.request.Request(url, json.dumps(body).encode(), {"Content-Type": "application/json"})
@@ -242,7 +319,7 @@ def generate(a) -> None:
         except Exception as e:  # timeout / connection: recorded, retried on the next run
             rec["error"] = f"{type(e).__name__}: {e}"
         rec["at"] = _now()
-        resp_f.write_text(json.dumps(rec))
+        atomic_write(resp_f, json.dumps(rec))
         finish = None
         if rec["complete"]:
             try:
@@ -250,14 +327,66 @@ def generate(a) -> None:
             except (ValueError, KeyError, IndexError):
                 finish = "unparsed"
         with lock:
+            inflight_ids.discard(r["id"])
             done[f"finish:{finish}" if rec["complete"] else "error"] += 1
             n = sum(done.values())
             if n % a.log_every == 0 or n == len(rows):
                 print(f"{_now()} {n}/{len(rows)} {dict(done)}", flush=True)
+        state()
 
-    with ThreadPoolExecutor(a.parallel) as ex:
-        list(ex.map(one, rows))
-    print(json.dumps(dict(done)))
+    pending, futs, exhausted, last_mode = iter(rows), set(), False, "run"
+    try:
+        with ThreadPoolExecutor(a.parallel) as ex:
+            while True:
+                mode = ctl.mode()
+                if mode != last_mode:
+                    print(f"{_now()} mode {last_mode} -> {mode} ({len(futs)} in flight finish first)", flush=True)
+                    last_mode = mode
+                while mode == "run" and not exhausted and len(futs) < a.parallel:
+                    r = next(pending, None)
+                    if r is None:
+                        exhausted = True
+                    else:
+                        futs.add(ex.submit(one, r))
+                if not futs:
+                    if exhausted:
+                        status["v"] = "done"
+                        break
+                    if mode == "drain":
+                        status["v"] = "drained"
+                        break
+                    if status["v"] != "paused":
+                        status["v"] = "paused"
+                        print(f"{_now()} PAUSED (replay control --out {root} resume, or SIGUSR2)", flush=True)
+                        state()
+                    time.sleep(2)
+                    continue
+                if status["v"] == "paused":
+                    status["v"] = "running"
+                fin, futs = wait(futs, timeout=2, return_when=FIRST_COMPLETED)
+                for f in fin:
+                    f.result()
+    except BaseException as e:
+        status["v"] = "failed"
+        state()
+        print(f"GENERATE_FAILED {_now()} {type(e).__name__}: {e}", flush=True)
+        raise
+    finally:
+        ctl.restore()
+        run_lock.release()
+    state()
+    print(json.dumps({**dict(done), **dict(redo)}))
+    print(f"GENERATE_{status['v'].upper()} {_now()}", flush=True)
+
+
+def control(a) -> None:
+    """Set the run mode of the generate process on ``--out`` (or just print its state)."""
+    root = Path(a.out)
+    if a.action != "status":
+        atomic_write(_side(root, "control"), {"resume": "run"}.get(a.action, a.action) + "\n")
+        print(f"{_side(root, 'control')} <- {a.action}")
+    sf = _side(root, "state.json")
+    print(sf.read_text() if sf.exists() else f"no {sf}")
 
 
 def main() -> None:
@@ -284,8 +413,15 @@ def main() -> None:
     q.add_argument("--timeout", type=float, default=3600)
     q.add_argument("--limit", type=int, default=0)
     q.add_argument("--log-every", type=int, default=10)
+    q.add_argument("--allow-change", nargs="*", default=[], metavar="KEY[=VALUE]",
+                   help="identity keys (model sampler prompts limit) allowed to differ from the capture")
+    q.add_argument("--redo-capped", action="store_true",
+                   help="re-ask complete responses capped below --max-tokens (the old pair is archived)")
+    c = sub.add_parser("control", help="pause / resume / drain a running generate, or print its state")
+    c.add_argument("--out", required=True, help="the capture dir of the running generate")
+    c.add_argument("action", choices=("pause", "resume", "drain", "status"))
     a = ap.parse_args()
-    {"gate-ngrams": gate_ngrams, "prompts": prompts, "generate": generate}[a.cmd](a)
+    {"gate-ngrams": gate_ngrams, "prompts": prompts, "generate": generate, "control": control}[a.cmd](a)
 
 
 if __name__ == "__main__":

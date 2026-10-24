@@ -44,6 +44,16 @@ from .fakequant import (
 from .losses import jaccard_topk_rest, kl_topk_rest
 from .ptq import load_text_causal_lm
 from .recovery import softcap, softcap_of
+from .runctl import Control as RunControl
+from .runctl import (
+    RunLock,
+    State,
+    atomic_json,
+    atomic_torch_save,
+    check_identity,
+    file_id,
+    parse_allow,
+)
 
 LOG = [None]
 
@@ -104,7 +114,13 @@ def _packed(path: str, tok, seq: int, eos: int, passes: list):
 
 
 def _role_rows(path: str, seq: int, passes: list):
-    """Endless stream of (ids, role) rows of a ``.roles.jsonl`` source (omk_qad.rollouts windows, ``seq`` long)."""
+    """Endless stream of (ids, role) rows of a ``.roles.jsonl`` source (omk_qad.rollouts windows, ``seq`` long).
+
+    The first pass is checked against the builder's ``.stats.json`` window count: a short (torn) file is refused.
+    """
+    side = Path(path).with_suffix(".stats.json")
+    want = json.loads(side.read_text()).get("windows") if side.exists() else None
+    first = True
     while True:
         n = 0
         with open(path) as f:
@@ -119,6 +135,9 @@ def _role_rows(path: str, seq: int, passes: list):
         passes.append(path)
         if n == 0:
             raise SystemExit(f"{path}: no rows")
+        if first and want is not None and n != want:
+            raise SystemExit(f"{path}: {n} rows, its {side.name} says {want} (a torn or replaced file)")
+        first = False
 
 
 def _stream(path: str, tok, seq: int, eos: int, passes: list):
@@ -154,9 +173,14 @@ def _wandb_key() -> tuple[str, str]:
 class Telemetry:
     """One W&B run per training run dir; its id comes from the dir, so a relaunch (resume) reattaches to it."""
 
-    def __init__(self, a, run: Path, config: dict):
-        """Start (or reattach to) the run, or stay off, per the rules above."""
-        self.wb = None
+    def __init__(self, a, run: Path, config: dict, resume_step: int | None = None):
+        """Start (or reattach to) the run, or stay off, per the rules above.
+
+        ``resume_step``: the checkpoint's step. The W&B run is REWOUND to it (``resume_from``), so the rows a killed
+        run logged after its last checkpoint are replaced by the resumed trajectory, not kept beside it; where rewind
+        is unavailable (offline, older server) it reattaches and skips the steps it already holds (said once).
+        """
+        self.wb, self.skip_to, self.said_skip = None, -1, False
         explicit = bool(a.wandb_project or a.wandb_name or a.wandb_entity)
         if a.no_wandb or os.environ.get("WANDB_MODE") == "disabled":
             say(f"WANDB off ({'--no-wandb' if a.no_wandb else 'WANDB_MODE=disabled'})")
@@ -178,9 +202,21 @@ class Telemetry:
         stage = "stage1" if a.stage == 1 else f"stage2-{a.branch}"
         name = a.wandb_name or f"{Path(a.out).parent.name}-{Path(a.out).name}-{stage}"
         rid = hashlib.sha1(str(run.resolve()).encode()).hexdigest()[:16]
+        entity = a.wandb_entity or os.environ.get("WANDB_ENTITY") or None
+        if resume_step is not None:
+            try:
+                self.wb = wandb.init(project=project, entity=entity, name=name, config=config, dir=str(run),
+                                     resume_from=f"{rid}?_step={resume_step}")
+                say(f"WANDB rewound {rid} to step {resume_step} (later rows of the killed run are archived by W&B)")
+            except Exception as e:
+                say(f"WANDB rewind unavailable ({type(e).__name__}: {e}); reattaching instead")
+                self.wb = None
         try:
-            self.wb = wandb.init(project=project, entity=a.wandb_entity or os.environ.get("WANDB_ENTITY") or None,
-                                 name=name, id=rid, resume="allow", config=config, dir=str(run))
+            if self.wb is None:
+                self.wb = wandb.init(project=project, entity=entity, name=name, id=rid, resume="allow", config=config,
+                                     dir=str(run))
+                if resume_step is not None:
+                    self.skip_to = int(getattr(self.wb, "step", 0) or 0) - 1  # rows W&B already holds
         except Exception as e:  # any W&B failure: refuse when asked for, else train without it
             if explicit:
                 raise SystemExit(f"wandb.init failed: {type(e).__name__}: {e}") from None
@@ -191,6 +227,12 @@ class Telemetry:
     def log(self, data: dict, step: int) -> None:
         """Log numeric values at a training step (a failed upload is reported, never fatal)."""
         if self.wb is None:
+            return
+        if step <= self.skip_to:  # logged before the kill; W&B would drop it anyway
+            if not self.said_skip:
+                say(f"WANDB holds steps up to {self.skip_to} from before the restart (no rewind): those rows are "
+                    f"the killed run's, the resumed run logs from step {self.skip_to + 1}")
+                self.said_skip = True
             return
         try:
             self.wb.log({k: v for k, v in data.items() if isinstance(v, int | float)}, step=step)
@@ -211,14 +253,71 @@ class Telemetry:
             self.wb = None
 
 
+# Cache settings that decide what the cached targets ARE (n_seq is not one: raising it extends the cache).
+CACHE_IDENTITY = ("topk", "seq", "shard", "seed", "n_eval", "mode")
+
+
+def cache_identity(a) -> dict:
+    """Identity of a teacher cache: the teacher (GGUF or HF weights), tokenizer, data and the target settings."""
+    ident = {k: getattr(a, k, None) for k in CACHE_IDENTITY}
+    ident["teacher"] = {"gguf": file_id(a.teacher_gguf)} if a.teacher_gguf else _model_id(a.model)
+    ident["tokenizer"] = _model_id(a.model) if a.teacher_gguf else "teacher"
+    ident["data"] = [[q.split("=")[0], q.split("=")[1] if "=" in q else "1", file_id(q.split("=")[0])]
+                     for q in a.data.split(",") if q]
+    ident["eval_data"] = [[q, file_id(q)] for q in a.eval_data.split(",") if q]
+    return ident
+
+
+def _ident_sha(ident: dict) -> str:
+    return hashlib.sha256(json.dumps(ident, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _x_sha(x: torch.Tensor) -> str:
+    return hashlib.sha256(x.to(torch.int32).contiguous().numpy().tobytes()).hexdigest()[:16]
+
+
 def phase_cache(a) -> None:
-    """Teacher top-K cache over the mixed training stream and the eval rows."""
+    """Teacher top-K cache over the mixed training stream and the eval rows.
+
+    One process per cache dir (``cache.lock``); ``identity.json`` (teacher, tokenizer, data, topk, seq, shard, seed)
+    refuses a restart with other settings unless ``--allow-change``; every shard has a ``train_NNNN.json`` sidecar
+    (identity hash, rows, sha of its token rows) checked before reuse; drain / pause between shards via
+    ``<cache>/control`` or signals; ``state.json``; ``cache.json`` (atomic) only when complete.
+    """
     os.makedirs(a.cache, exist_ok=True)
     LOG[0] = open(os.path.join(a.cache, "cache.log"), "a")
     say("args", json.dumps(vars(a)))
-    dtype = torch.float32 if a.device == "cpu" else torch.bfloat16
-    if getattr(a, "anchor", False):
-        return anchor_pass(a, dtype)
+    lock = RunLock(Path(a.cache) / "cache.lock", f"cache {a.cache}")
+    st = State(Path(a.cache) / "state.json", cache=a.cache, step="anchor" if getattr(a, "anchor", False) else "cache")
+    ctl_run = RunControl(Path(a.cache) / "control", name=f"cache {Path(a.cache).name}", log=say)
+    try:
+        dtype = torch.float32 if a.device == "cpu" else torch.bfloat16
+        if getattr(a, "anchor", False):
+            anchor_pass(a, dtype, st, ctl_run)
+        else:
+            _phase_cache(a, dtype, st, ctl_run)
+    except BaseException as e:
+        st.refused_or_failed(e)
+        raise
+    finally:
+        ctl_run.restore()
+        lock.release()
+
+
+def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
+    cache = Path(a.cache)
+    ident = cache_identity(a)
+    if (cache / "cache.json").exists() and not (cache / "identity.json").exists():  # a cache from before identity
+        old = json.loads((cache / "cache.json").read_text()).get("args", {})
+        bad = {k: (old.get(k), getattr(a, k, None)) for k in (*CACHE_IDENTITY, "model", "teacher_gguf", "data")
+               if k in old and old.get(k) != getattr(a, k, None)}
+        if bad:
+            raise SystemExit(f"RUN_REFUSED cache {cache}: cache.json was made with {bad}")
+        say("identity.json created for an existing cache (its args matched)")
+    check_identity(cache / "identity.json", ident, parse_allow(getattr(a, "allow_change", [])),
+                   what=f"cache {cache}", log=say)
+    isha = _ident_sha(ident)
+    st.update(status="running", identity=isha, n_seq=a.n_seq)
     imat = {"collector": None, "seqs": 0}
     if a.teacher_gguf:  # libllama teacher (omk_qad.gguf_teacher); --model gives the tokenizer only
         from transformers import AutoTokenizer
@@ -231,6 +330,9 @@ def phase_cache(a) -> None:
         tok = AutoTokenizer.from_pretrained(a.model)
         gguf = GGUFTeacher(a.teacher_gguf, a.seq, a.topk, len(tok), a.teacher_gguf_bin, a.teacher_ngl,
                            a.teacher_ubatch, log=say)
+        import atexit
+
+        atexit.register(gguf.close)  # the llama_topk child never outlives a failed or drained cache pass
 
         def topk_of(x, want=None):
             return gguf(x, want)
@@ -289,13 +391,25 @@ def phase_cache(a) -> None:
         ex += [next(stream) for _ in range(a.n_eval)]
         fam += [k] * a.n_eval
     ex = torch.stack(ex)
-    parts = [topk_of(ex[i : i + 4]) for i in range(0, len(ex), 4)]
-    ev = {"x": ex.to(torch.int32), "idx": torch.cat([q[0] for q in parts]), "val": torch.cat([q[1] for q in parts]),
-          "teacher_ppl": math.exp(sum(q[2] for q in parts) / (len(ex) * (a.seq - 1))),
-          "family": torch.tensor(fam, dtype=torch.int32), "families": names}
-    torch.save(ev, os.path.join(a.cache, "eval.pt"))
-    say(f"eval: {len(ex)} x {a.seq} tokens ({a.n_eval} per family {names}); teacher ppl {ev['teacher_ppl']:.3f}; "
-        f"top-{a.topk} mass {ev['val'].float().exp().sum(-1).mean().item():.4f}")
+    ev_p = cache / "eval.pt"
+    old_ev = torch.load(ev_p) if ev_p.exists() else None
+    same_rows = old_ev is not None and torch.equal(old_ev["x"], ex.to(torch.int32))
+    if same_rows and old_ev.get("identity") in (None, isha):
+        if old_ev.get("identity") is None:  # an eval.pt from before identity: same rows, so tag it
+            atomic_torch_save({**old_ev, "identity": isha}, ev_p)
+        say(f"eval.pt kept: same identity and the same {len(ex)} rows (finished runs keep their reference)")
+    else:
+        if old_ev is not None:  # never silently replace the reference of runs that already used it
+            raise SystemExit(f"RUN_REFUSED cache {cache}: eval.pt holds other rows or another identity; move it "
+                             "aside (or use a new cache dir) to rebuild it")
+        parts = [topk_of(ex[i : i + 4]) for i in range(0, len(ex), 4)]
+        ev = {"x": ex.to(torch.int32), "idx": torch.cat([q[0] for q in parts]),
+              "val": torch.cat([q[1] for q in parts]),
+              "teacher_ppl": math.exp(sum(q[2] for q in parts) / (len(ex) * (a.seq - 1))),
+              "family": torch.tensor(fam, dtype=torch.int32), "families": names, "identity": isha}
+        atomic_torch_save(ev, ev_p)
+        say(f"eval: {len(ex)} x {a.seq} tokens ({a.n_eval} per family {names}); teacher ppl "
+            f"{ev['teacher_ppl']:.3f}; top-{a.topk} mass {ev['val'].float().exp().sum(-1).mean().item():.4f}")
 
     srcs = [(q.split("=")[0], float(q.split("=")[1]) if "=" in q else 1.0) for q in a.data.split(",") if q]
     folded, block = (None, None)
@@ -330,35 +444,64 @@ def phase_cache(a) -> None:
             role = torch.stack([q[1] if q[1] is not None else torch.ones(a.seq, dtype=torch.int8) for q in rows])
         for k in picks:
             n_src[k] += 1
+        side = Path(fn).with_suffix(".json")
+        want_side = {"identity": isha, "rows": len(x), "x_sha": _x_sha(x), "s0": s0}
+        if os.path.exists(fn) and not side.exists():  # a shard from before sidecars: verify its rows once
+            old_x = torch.load(fn)["x"]
+            if old_x.shape[0] == len(x) and torch.equal(old_x, x.to(torch.int32)):
+                atomic_json(side, want_side)
+            else:
+                raise SystemExit(f"RUN_REFUSED cache {cache}: {fn} holds other rows than this stream draws")
         if os.path.exists(fn):
-            # a resumed cache still owes its imatrix: run the teacher on the cached rows for the imatrix only
-            for i in range(0, len(x), a.cache_bs):
-                if imat["collector"] is None:
-                    break
-                topk_of(x[i : i + a.cache_bs])
-            continue
+            have = json.loads(side.read_text())
+            if have.get("identity") != isha or have.get("x_sha") != want_side["x_sha"]:
+                raise SystemExit(f"RUN_REFUSED cache {cache}: {fn} was made with another identity or other rows "
+                                 f"({have} vs {want_side})")
+            if have.get("rows") == len(x):
+                # a resumed cache still owes its imatrix: run the teacher on the cached rows for the imatrix only
+                for i in range(0, len(x), a.cache_bs):
+                    if imat["collector"] is None:
+                        break
+                    topk_of(x[i : i + a.cache_bs])
+                continue
+        if os.path.exists(fn):  # a short last shard from a smaller --n-seq: recompute it, keep the old one
+            os.replace(fn, f"{fn}.rows{have.get('rows')}.old")
+            say(f"{fn}: had {have.get('rows')} rows, this run needs {len(x)}: recomputed (old kept as .old)")
         want = None if role is None else role[:, 1:] > 0  # a GGUF teacher skips unscored positions
         parts = [topk_of(x[i : i + a.cache_bs], None if want is None else want[i : i + a.cache_bs])
                  for i in range(0, len(x), a.cache_bs)]
-        torch.save({"x": x.to(torch.int32), "idx": torch.cat([q[0] for q in parts]),
-                    "val": torch.cat([q[1] for q in parts]), **({"role": role} if role is not None else {})},
-                   fn + ".tmp")
-        os.replace(fn + ".tmp", fn)
+        atomic_torch_save({"x": x.to(torch.int32), "idx": torch.cat([q[0] for q in parts]),
+                           "val": torch.cat([q[1] for q in parts]), **({"role": role} if role is not None else {})},
+                          fn)
+        atomic_json(side, want_side)  # written after the shard: a shard without its sidecar is re-verified
         say(f"cached {s0 + len(x)}/{a.n_seq} sequences [{time.time() - t0:.0f}s] rows per source {n_src}")
+        st.update(cached=s0 + len(x))
+        last = s0 + len(x) >= a.n_seq  # a drain on the last shard still finishes (imatrix + cache.json)
+        if not last and control.boundary(on_pause=lambda: st.update(status="paused")) == "drain":
+            st.update(status="drained")
+            say(f"CACHE_DRAINED after {s0 + len(x)}/{a.n_seq} sequences; relaunch the same command to continue")
+            if a.teacher_gguf:
+                gguf.close()
+            return
+        st.update(status="running")
     if imat["collector"] is not None:  # fewer sequences than --imatrix-seqs
         save_imatrix()
-    meta = {"args": vars(a), "n_seq": a.n_seq, "shard": a.shard, "topk": a.topk, "seq": a.seq,
+    meta = {"args": vars(a), "n_seq": a.n_seq, "shard": a.shard, "topk": a.topk, "seq": a.seq, "identity": isha,
             "rows_per_source": dict(zip([p for p, _ in srcs], n_src)), "source_passes": passes}
-    json.dump(meta, open(os.path.join(a.cache, "cache.json"), "w"), indent=1)
     if a.teacher_gguf:
         gguf.close()
         side = Path(a.teacher_gguf + ".sha256")  # the download's verified digest (hashing 60 GB here is not)
         meta["teacher"] = {"gguf": a.teacher_gguf, "sha256": side.read_text().split()[0] if side.exists() else None}
-        json.dump(meta, open(os.path.join(a.cache, "cache.json"), "w"), indent=1)
+    old = json.loads((cache / "cache.json").read_text()) if (cache / "cache.json").exists() else {}
+    for k in ("anchor_model",):  # an anchor pass of the same cache survives an extension of it
+        if k in old:
+            meta[k] = old[k]
+    atomic_json(cache / "cache.json", meta)
+    st.update(status="done", cached=a.n_seq)
     say("CACHE_DONE")
 
 
-def anchor_pass(a, dtype) -> None:
+def anchor_pass(a, dtype, st: State, control: RunControl) -> None:
     """Add the ANCHOR model's top-K (``aidx``/``aval``) to every cached shard holding anchor-role positions.
 
     Runs over the very rows the teacher pass cached (read back from the shards), so the two targets can never
@@ -372,6 +515,10 @@ def anchor_pass(a, dtype) -> None:
     meta = json.loads(meta_p.read_text())
     if meta.get("anchor_model") not in (None, a.model):
         raise SystemExit(f"{a.cache} already holds anchor targets of {meta['anchor_model']}")
+    # the anchor model is recorded BEFORE the first shard, so an interrupted pass cannot be finished by another
+    check_identity(Path(a.cache) / "anchor_identity.json", {"anchor_model": a.model, "id": _model_id(a.model)},
+                   parse_allow(getattr(a, "allow_change", [])), what=f"anchor {a.cache}", log=say)
+    st.update(status="running")
     model, _ = load_text_causal_lm(a.model, a.device, dtype)
     model.requires_grad_(False)
     cap = softcap_of(model)
@@ -381,6 +528,8 @@ def anchor_pass(a, dtype) -> None:
         sh = torch.load(fn)
         if "role" not in sh:
             raise SystemExit(f"{fn}: no role data (the anchor targets only positions of role {ANCHOR})")
+        if "aidx" in sh and sh.get("anchor_model", a.model) != a.model:
+            raise SystemExit(f"{fn}: holds anchor targets of {sh['anchor_model']}, not {a.model}")
         if "aidx" in sh or not (sh["role"] == ANCHOR).any():
             continue
         ai, av = [], []
@@ -392,13 +541,20 @@ def anchor_pass(a, dtype) -> None:
                 v, k = lp.topk(meta["topk"], -1)
                 ai.append(k.to(torch.int32).cpu())
                 av.append(v.to(torch.float16).cpu())
-        sh.update(aidx=torch.cat(ai), aval=torch.cat(av))
-        torch.save(sh, str(fn) + ".tmp")
-        os.replace(str(fn) + ".tmp", fn)
+        sh.update(aidx=torch.cat(ai), aval=torch.cat(av), anchor_model=a.model)
+        atomic_torch_save(sh, fn)
         done += 1
         say(f"anchor {fn.name}: {int((sh['role'] == ANCHOR).sum())} anchor positions")
+        st.update(anchor_shard=s + 1, of=n_sh)
+        if s + 1 < n_sh and control.boundary(on_pause=lambda: st.update(status="paused")) == "drain":
+            st.update(status="drained")
+            say(f"ANCHOR_DRAINED after shard {s + 1}/{n_sh}; relaunch the same command to continue")
+            return
+        st.update(status="running")
+    meta = json.loads(meta_p.read_text())  # re-read: never write back a stale copy of the master metadata
     meta["anchor_model"] = a.model
-    meta_p.write_text(json.dumps(meta, indent=1))
+    atomic_json(meta_p, meta)
+    st.update(status="done")
     say(f"ANCHOR_DONE {done} shards from {a.model}")
 
 
@@ -666,12 +822,11 @@ def save_state(path: Path, step: int, latents, student, opt, a, ctl=None, result
           if max(getattr(a, "refresh", 1), getattr(a, "ggml_refresh", 1)) > 1 else {},
           "saved_at": time.time(), **(extra or {})}
     path = Path(path)
-    torch.save(sd, str(path) + ".tmp")
-    os.replace(str(path) + ".tmp", path)
-    path.with_suffix(".json").write_text(json.dumps(
-        {"step": step, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": getattr(a, "stage", 1),
-         "branch": getattr(a, "branch", ""), **{k: v for k, v in (extra or {}).items() if isinstance(v, str | int)}},
-        indent=1))
+    atomic_torch_save(sd, path)  # per-process temp name: two writers can never rename each other's file
+    atomic_json(path.with_suffix(".json"),
+                {"step": step, "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "stage": getattr(a, "stage", 1),
+                 "branch": getattr(a, "branch", ""),
+                 **{k: v for k, v in (extra or {}).items() if isinstance(v, str | int)}})
     del sd
 
 
@@ -709,26 +864,47 @@ def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = 
     return ck
 
 
-class Pauser:
-    """SIGINT / SIGTERM or a PAUSE file in the run dir: finish the step, checkpoint, exit cleanly."""
+# Settings that do not change what a run computes: they may differ between the segments of one run.
+RUNTIME_ARGS = {"phase", "device", "stop_at", "log_every", "eval_every", "save_every", "save_minutes", "snapshot_every",
+                "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change", "llama_cpp",
+                "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf", "loss_chunk"}
 
-    def __init__(self, run_dir: Path):
-        """Install the signal handlers."""
-        import signal
 
-        self.file, self.why = run_dir / "PAUSE", ""
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, self._on_signal)
+def _model_id(model: str) -> dict:
+    """Identity of an HF model dir: config + weight index (or the single weight file)."""
+    d, out = Path(model), {}
+    for f in ("config.json", "model.safetensors.index.json", "model.safetensors"):
+        if (d / f).exists():
+            out[f] = file_id(d / f)
+    return out or {"path": model}
 
-    def _on_signal(self, signum, frame):
-        del frame
-        self.why = f"signal {signum}"
 
-    def requested(self) -> str:
-        """Reason to pause now, or ''."""
-        if not self.why and self.file.exists():
-            self.why = f"pause file {self.file}"
-        return self.why
+def train_identity(a) -> dict:
+    """What a training run's outputs depend on: every non-runtime arg plus the content of its inputs."""
+    ident = {k: v for k, v in sorted(vars(a).items()) if k not in RUNTIME_ARGS}
+    ident["id_model"] = _model_id(a.model)
+    cmeta = json.loads((Path(a.cache) / "cache.json").read_text())
+    ident["id_cache"] = ({k: cmeta.get(k) for k in ("identity", "n_seq", "anchor_model")} if "identity" in cmeta
+                         else file_id(Path(a.cache) / "cache.json"))  # what the targets ARE, not how it was launched
+    for k in ("layout", "imatrix", "init_from"):
+        v = getattr(a, k, "")
+        if v and v not in ("none", "auto") and Path(v).exists():
+            ident[f"id_{k}"] = file_id(v)
+    return ident
+
+
+def check_resume_args(saved: dict, a, allow: dict, src: str) -> None:
+    """Refuse to resume a checkpoint written with different run-critical args (legacy runs have no identity.json)."""
+    cur = vars(a)
+    diff = {k: (saved.get(k), cur.get(k)) for k in sorted(set(saved) | set(cur))
+            if k not in RUNTIME_ARGS and saved.get(k) != cur.get(k) and k in saved}
+    bad = {k: v for k, v in diff.items() if k not in allow or (allow[k] is not None and str(v[1]) != allow[k])}
+    if bad:
+        raise SystemExit(f"RUN_REFUSED resume from {src}: written with different settings ("
+                         + "; ".join(f"{k}: {x!r} -> {y!r}" for k, (x, y) in bad.items())
+                         + f"). Relaunch with the original values, or pass --allow-change {' '.join(bad)}.")
+    for k, (x, y) in diff.items():
+        say(f"ALLOWED CHANGE on resume {k}: {x!r} -> {y!r}")
 
 
 class Guard:
@@ -842,9 +1018,30 @@ def run_dir_of(a) -> Path:
 
 
 def phase_train(a) -> None:
-    """QAD training loop with rolling checkpoints, pause/resume and stage-1 / stage-2 runs."""
+    """QAD training loop with rolling checkpoints, pause/resume and stage-1 / stage-2 runs.
+
+    One process per run dir (``run.lock``); ``identity.json`` + the checkpoint's args refuse a resume with other
+    run-critical settings unless ``--allow-change`` names them; ``state.json`` running / paused / drained / done /
+    failed. Control: ``touch <run>/PAUSE`` or SIGTERM/SIGINT/SIGUSR1 = checkpoint at the step boundary and exit
+    (PAUSED; a 2nd SIGTERM exits at once, last.pt intact); ``echo pause > <run>/control`` (or SIGUSR2) = checkpoint
+    and wait in-process until ``run``.
+    """
     run = run_dir_of(a)
     run.mkdir(parents=True, exist_ok=True)
+    lock = RunLock(run / "run.lock", f"train {run}")
+    st = State(run / "state.json", run=str(run))
+    ctl_run = RunControl(run / "control", name=f"train {run.name}", log=say)
+    try:
+        _phase_train(a, run, st, ctl_run)
+    except BaseException as e:
+        st.refused_or_failed(e)
+        raise
+    finally:
+        ctl_run.restore()
+        lock.release()
+
+
+def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     LOG[0] = open(run / "log.txt", "a")
     say("args", json.dumps(vars(a)))
     torch.manual_seed(a.seed)
@@ -863,6 +1060,10 @@ def phase_train(a) -> None:
     if a.imatrix == "auto":  # bf16 mode encodes nothing: no imatrix
         a.imatrix = str(Path(a.cache) / "imatrix.pt") if (Path(a.cache) / "imatrix.pt").exists() and not bf16 \
             else "none"
+    if (run / "last.pt").exists() and not (run / "identity.json").exists():
+        say("identity.json created for an existing run: earlier segments are checked by their saved args only")
+    check_identity(run / "identity.json", train_identity(a), parse_allow(a.allow_change), what=f"train {run}",
+                   log=say)
     if bf16:
         from .recovery import build_student_bf16
 
@@ -871,6 +1072,7 @@ def phase_train(a) -> None:
         layout = torch.load(a.layout, weights_only=False)
         student, latents, fp_params, ctl, head_name = build_student(a, layout)
         head = latents[head_name]
+    allow = parse_allow(a.allow_change)
     opt = torch.optim.AdamW(fp_params, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0) if fp_params else None
     last_ck = run / "last.pt"
     origin = {"cache": a.cache, "layout": a.layout, "imatrix": a.imatrix}
@@ -880,9 +1082,13 @@ def phase_train(a) -> None:
     results: list = []
     start = 1
     guard = Guard(a, latents, student, opt)
+    if a.load and last_ck.exists() and Path(a.load).resolve() != last_ck.resolve() and "load" not in allow:
+        raise SystemExit(f"RUN_REFUSED --load {a.load}: {last_ck} exists and would be overwritten by a resume from "
+                         "another checkpoint (use a new --branch, or --allow-change load)")
     resume = a.load or (str(last_ck) if last_ck.exists() else "")
     if resume:  # full state: continue exactly where it stopped
         ck = load_state(resume, latents, student, opt, ctl)
+        check_resume_args(ck.get("args", {}), a, allow, resume)
         start, results = int(ck["step"]) + 1, ck.get("results", [])
         origin["init_from"] = ck.get("init_from", "")
         guard.load(ck.get("guard"))
@@ -905,10 +1111,12 @@ def phase_train(a) -> None:
                 raise SystemExit("unquantized student does not reproduce the teacher cache")
         results.append(evaluate(student, head, ev, a, "init", dict(ctl.stats)))
     tel = Telemetry(a, run, {**vars(a), "origin": origin, "cache_meta": {k: meta[k] for k in ("n_seq", "seq", "topk")
-                                                                         if k in meta}})
+                                                                         if k in meta}},
+                    resume_step=start - 1 if resume else None)
     if not resume:  # a resumed run's W&B run already holds its init eval
         tel.eval(results[-1], start - 1)
-    pauser = Pauser(run)
+    pause_file = run / "PAUSE"
+    st.update(status="running", step=start - 1, steps=a.steps, last=last)
     shard = (-1, None)
     t0, t_save = time.time(), time.time()
 
@@ -956,11 +1164,19 @@ def phase_train(a) -> None:
         if step % a.eval_every == 0 or step == last:
             results.append(evaluate(student, head, ev, a, f"step{step}", dict(ctl.stats)))
             tel.eval(results[-1], step)
-            (run / "summary.json").write_text(json.dumps({"args": vars(a), "origin": origin, "results": results},
-                                                          indent=1))
+            atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
         if a.snapshot_every and step % a.snapshot_every == 0:
             checkpoint(step, run / f"ckpt_step{step:07d}.pt")
-        why = pauser.requested()
+        st.update(step=step, loss=loss)
+        mode = control.mode()
+        why = f"pause file {pause_file}" if pause_file.exists() else ("drain" if mode == "drain" else "")
+        if mode == "pause" and not why and not guard.bad:  # in-process pause: checkpoint first, keep the model loaded
+            checkpoint(step)
+            t_save = time.time()
+            st.update(status="paused", step=step)
+            if control.boundary() == "drain":
+                why = "drain while paused"
+            st.update(status="running")
         if guard.bad and not why:  # never roll the saved state forward onto a step the guard suspects
             continue
         finishing = step == a.steps and not why  # final.pt is written right after the loop: no second copy
@@ -969,7 +1185,8 @@ def phase_train(a) -> None:
             checkpoint(step)
             t_save = time.time()
         if why:
-            pauser.file.unlink(missing_ok=True)
+            pause_file.unlink(missing_ok=True)
+            st.update(status="drained", step=step)
             say(f"PAUSED at step {step} ({why}); relaunch the same command to resume from {last_ck}")
             say(peak())
             tel.finish()
@@ -980,6 +1197,7 @@ def phase_train(a) -> None:
             f.unlink(missing_ok=True)
         say(f"STAGE_DONE stage {a.stage}{' branch ' + a.branch if a.branch else ''}: {final}")
     say(peak())
+    st.update(status="done", step=step)
     say(f"QAD_DONE at step {step} in {time.time() - t0:.0f}s")
     tel.finish()
 
@@ -1109,6 +1327,8 @@ def main(argv=None) -> None:
     ap.add_argument("--wandb-name", default="", help="W&B run name (default <run>-<student>-<stage>)")
     ap.add_argument("--wandb-entity", default="", help="W&B entity (default $WANDB_ENTITY)")
     ap.add_argument("--no-wandb", action="store_true", help="no W&B even when a key exists")
+    ap.add_argument("--allow-change", nargs="*", default=[], metavar="KEY[=VALUE]",
+                    help="train: run-critical settings allowed to differ from the run's identity.json / checkpoint")
     ap.add_argument("--load", default="", help="train: resume from this full checkpoint (default: <run>/last.pt "
                     "if present); export: checkpoint whose weights to export")
     a = ap.parse_args(argv)

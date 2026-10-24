@@ -104,3 +104,31 @@ def test_run_id_is_stable_per_run_dir_and_logs_flatten(tmp_path, fake_wandb, mon
     assert rows[0] == (3, {"train/loss": 0.5})
     assert rows[1] == (3, {"eval/klk": 0.4, "eval/eval_code/klk": 0.2})
     assert Path(fake_wandb.runs[0].kw["dir"]) == run
+
+
+def test_resume_rewinds_to_the_checkpoint_step(tmp_path, fake_wandb, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "k" * 40)
+    t = T.Telemetry(_args(), tmp_path, {}, resume_step=40)
+    rid = T.Telemetry(_args(), tmp_path, {}).wb.kw["id"]
+    assert t.wb.kw["resume_from"] == f"{rid}?_step=40" and "id" not in t.wb.kw
+    t.log({"train/loss": 1.0}, 41)
+    assert fake_wandb.runs[0].rows == [(41, {"train/loss": 1.0})]
+
+
+def test_resume_without_rewind_skips_the_rows_wandb_holds(tmp_path, fake_wandb, monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "k" * 40)
+    plain = fake_wandb.init
+
+    def init(**kw):
+        if "resume_from" in kw:
+            raise RuntimeError("rewind not enabled")
+        r = plain(**kw)
+        r.step = 46  # the killed run logged up to step 45, its checkpoint is step 40
+        return r
+
+    fake_wandb.init = init
+    t = T.Telemetry(_args(), tmp_path, {}, resume_step=40)
+    assert t.wb.kw["resume"] == "allow"
+    for step in (41, 45, 46):
+        t.log({"train/loss": float(step)}, step)
+    assert t.wb.rows == [(46, {"train/loss": 46.0})]

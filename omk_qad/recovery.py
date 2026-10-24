@@ -20,6 +20,7 @@ vision tower included, byte for byte), under the source's own key names and shar
 """
 
 import json
+import os
 import re
 import shutil
 import time
@@ -159,20 +160,37 @@ def key_for(name: str, keys: dict[str, str]) -> str:
 
 def export_bf16(src: Path, ckpt: str, out: Path, say) -> dict:
     """Source checkpoint with the trained tensors of ``ckpt`` written in; every other tensor byte-identical."""
-    from safetensors import safe_open
-    from safetensors.torch import save_file
-
     t0 = time.time()
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     trained = {**ck["latents"], **ck["fp"]}
     keys = checkpoint_keys(src)
     mapped = {key_for(n, keys): t for n, t in trained.items()}
-    if out.exists() and any(out.iterdir()):
-        raise SystemExit(f"export: {out} is not empty (an export is never overwritten)")
-    out.mkdir(parents=True, exist_ok=True)
+    from .runctl import RunLock
+
+    lock = RunLock(out.with_name(out.name + ".lock"), f"export {out}")
+    try:
+        if out.exists() and any(out.iterdir()):
+            raise SystemExit(f"export: {out} is not empty (an export is never overwritten)")
+        return _export_bf16(src, ck, ckpt, keys, mapped, trained, out, say, t0)
+    finally:
+        lock.release()
+
+
+def _export_bf16(src, ck, ckpt, keys, mapped, trained, out: Path, say, t0) -> dict:
+    """The bf16 export, built in ``<out>.partial/`` and renamed to ``out`` once verified (a kill leaves no out)."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from .runctl import atomic_json
+
+    part = out.with_name(out.name + ".partial")
+    if part.exists():  # a killed export: incomplete by construction (the report is written last, then renamed)
+        say(f"export: removing {part}, left by an export that never finished")
+        shutil.rmtree(part)
+    part.mkdir(parents=True)
     for f in src.iterdir():  # configs, tokenizer, chat template, processor files: copied as they are
         if f.is_file() and not f.name.endswith(".safetensors"):
-            shutil.copy2(f, out / f.name)
+            shutil.copy2(f, part / f.name)
     replaced, shards = [], sorted(set(keys.values()))
     for shard in shards:
         with safe_open(src / shard, "pt") as f:
@@ -188,15 +206,18 @@ def export_bf16(src: Path, ckpt: str, out: Path, say) -> dict:
                     replaced.append(k)
                 else:
                     tensors[k] = t
-        save_file(tensors, out / shard, metadata=meta)
+        save_file(tensors, part / shard, metadata=meta)
         del tensors
     if len(replaced) != len(mapped):
         raise SystemExit(f"export: wrote {len(replaced)} of {len(mapped)} trained tensors")
-    unchanged = verify_export(src, out, set(replaced))
+    unchanged = verify_export(src, part, set(replaced))
     rep = {"source": str(src), "checkpoint": ckpt, "step": ck["step"], "replaced": len(replaced),
            "unchanged_verified": unchanged, "shards": shards, "seconds": round(time.time() - t0, 1),
            "replaced_keys": sorted(replaced)}
-    (out / "omk_bf16_export.json").write_text(json.dumps(rep, indent=1))
+    atomic_json(part / "omk_bf16_export.json", rep)
+    if out.exists():
+        out.rmdir()  # empty (checked above)
+    os.replace(part, out)
     say(f"EXPORT_BF16 {out}: {len(replaced)} trained tensors written, {unchanged} others verified identical "
         f"({rep['seconds']}s)")
     return rep

@@ -34,7 +34,11 @@ are the context, and the response is the scored turn. No history mode is modelle
 was shown. A response cut short (``complete: false``, a guard's cancel, or a finish other than stop /
 tool_calls) is scored up to its last generated character only: the template's closure after it was never
 generated. ``--verify-server URL`` posts each body to llama-server's ``/apply-template`` and refuses any
-example whose prompt differs from the builder's render.
+example whose prompt differs from the builder's render; answers are cached per body in ``<out>.verify.jsonl``
+(keyed on the server's chat template), so a server error after retries stops the build and a rerun resumes it.
+A capture dir that a ``replay generate`` still holds (``<capture>.lock``) or did not finish (``<capture>.state.json``
+status != done) is refused unless ``--allow-live-capture``. The output is written to a temp file and renamed; its
+stats (``.stats.json``) carry the window count and sha256 the trainer checks.
 
     python -m omk_qad.rollouts --model DIR --in conv.jsonl --out X.roles.jsonl --seq 16384 [--stride 8192]
     python -m omk_qad.rollouts --model DIR --capture CAPDIR --template-kwargs '{"enable_thinking": true}' \
@@ -42,8 +46,12 @@ example whose prompt differs from the builder's render.
 """
 
 import argparse
+import fcntl
+import hashlib
 import json
+import os
 import re
+import time
 import urllib.request
 from pathlib import Path
 
@@ -404,6 +412,95 @@ def apply_template_on(url: str):
     return verify
 
 
+def _sha(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+class TemplateVerifier:
+    """``/apply-template`` checks with retries and a resumable per-body cache of the served prompt's sha256.
+
+    The cache's first line names the server's chat template (``/props``); a cache made against another template
+    is set aside (``.stale-<time>``), never reused. A request still failing after the retries stops the build
+    (SystemExit): every answer so far is cached, so the rerun asks only the rest.
+    """
+
+    def __init__(self, url: str, cache: Path | None, retries=(2, 8, 30), log=print):
+        """Open (or start) the cache for the server at ``url``."""
+        self.url, self.retries, self.log, self.ask = url, retries, log, apply_template_on(url)
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + "/props", timeout=60) as r:
+                props = json.loads(r.read())
+            head = {"server_template_sha256": _sha(props.get("chat_template") or "")}
+        except Exception as e:  # an old server without /props: the cache is keyed on the URL alone
+            head = {"server_template_sha256": None, "url": url, "props_error": f"{type(e).__name__}"}
+        self.seen: dict[str, str] = {}
+        self.cache, self.fh = cache, None
+        if cache is None:
+            return
+        if cache.exists():
+            lines = cache.read_text().splitlines()
+            old = json.loads(lines[0]) if lines else {}
+            if old.get("head") != head:
+                stale = cache.with_name(f"{cache.name}.stale-{time.strftime('%Y%m%dT%H%M%S')}")
+                os.replace(cache, stale)
+                self.log(f"verify cache made against {old.get('head')}, server is {head}: kept as {stale.name}")
+            else:
+                for ln in lines[1:]:
+                    try:
+                        r = json.loads(ln)
+                    except ValueError:  # a torn last line of a killed build
+                        continue
+                    self.seen[r["key"]] = r["served_sha256"]
+                self.log(f"verify cache: {len(self.seen)} answers reused")
+        new = not cache.exists()
+        self.fh = cache.open("a")
+        if new:
+            self.fh.write(json.dumps({"head": head}) + "\n")
+            self.fh.flush()
+
+    def __call__(self, body: dict) -> str:
+        """The served prompt (uncached; retried)."""
+        for i, wait_s in enumerate((*self.retries, None)):
+            try:
+                return self.ask(body)
+            except Exception as e:  # noqa: PERF203  (a retry loop)
+                if wait_s is None:
+                    raise SystemExit(f"verify server {self.url}: {type(e).__name__}: {e} after {i} retries; "
+                                     f"{len(self.seen)} answers are cached, rerun the same command to resume")
+                self.log(f"verify server: {type(e).__name__}: {e}; retry in {wait_s}s")
+                time.sleep(wait_s)
+        raise AssertionError("unreachable")
+
+    def matches(self, body: dict, prompt: str) -> bool:
+        """Does the server render ``body`` as ``prompt``? (cached by body)."""
+        key = _sha(json.dumps(body, sort_keys=True))
+        if key not in self.seen:
+            self.seen[key] = _sha(self(body))
+            if self.fh is not None:
+                self.fh.write(json.dumps({"key": key, "served_sha256": self.seen[key]}) + "\n")
+                self.fh.flush()
+        return self.seen[key] == _sha(prompt)
+
+
+def refuse_live_capture(root: Path) -> None:
+    """SystemExit unless ``root`` is a finished capture: no ``replay generate`` holds it, and its state says done."""
+    lock = root.with_name(root.name + ".lock")
+    if lock.exists():
+        with lock.open("a+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fh.seek(0)
+                raise SystemExit(f"RUN_REFUSED rollouts: {root} is still being written ({fh.read().strip()}); "
+                                 "wait for GENERATE_DONE or pass --allow-live-capture") from None
+    st = root.with_name(root.name + ".state.json")
+    if st.exists():
+        status = json.loads(st.read_text()).get("status")
+        if status != "done":
+            raise SystemExit(f"RUN_REFUSED rollouts: {root} capture status is {status!r}, not done; finish it "
+                             "(replay generate) or pass --allow-live-capture")
+
+
 def render_captured(tok, body: dict, resp: dict, spans: list, server_kwargs: dict, code_args=CODE_ARGS,
                     stats=None, verify=None):
     """(text, char roles) of one captured request + response, or a refusal reason (str)."""
@@ -429,8 +526,9 @@ def render_captured(tok, body: dict, resp: dict, spans: list, server_kwargs: dic
     except NotPrefixError:
         return "not_prefix"
     if verify is not None:
-        served = verify({k: v for k, v in body.items() if k != "stream"})
-        if served != p.removeprefix(tok.bos_token or ""):
+        vbody, want = {k: v for k, v in body.items() if k != "stream"}, p.removeprefix(tok.bos_token or "")
+        ok = verify.matches(vbody, want) if isinstance(verify, TemplateVerifier) else verify(vbody) == want
+        if not ok:
             return "server_mismatch"
     text = p + gen
     roles = np.zeros(len(text), np.int8)
@@ -501,7 +599,9 @@ def main() -> None:
     ap.add_argument("--pack", action="store_true", help="--capture: examples shorter than --seq share windows "
                     "back to back (chat replay), instead of one padded window each")
     ap.add_argument("--verify-server", help="--capture: llama-server URL; refuse examples whose /apply-template "
-                    "prompt differs from the builder's render")
+                    "prompt differs from the builder's render (answers cached in <out>.verify.jsonl)")
+    ap.add_argument("--allow-live-capture", action="store_true", help="--capture: build from a capture dir that "
+                    "a replay generate still holds or did not finish (a partial dataset)")
     a = ap.parse_args()
     if a.inp and not a.history_reasoning:
         raise SystemExit("--in needs --history-reasoning (keep | strip | last-inline)")
@@ -514,15 +614,20 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(a.model)
     code_args, stride = tuple(a.code_args.split(",")), a.stride or a.seq // 2
     if a.capture:
+        if not a.allow_live_capture:
+            refuse_live_capture(Path(a.capture))
         items = read_capture(Path(a.capture), Path(a.loop_spans) if a.loop_spans else None)
-        out, stats = build_capture(tok, items, a.seq, stride, json.loads(a.template_kwargs), code_args,
-                                   apply_template_on(a.verify_server) if a.verify_server else None, a.pack)
+        verify = (TemplateVerifier(a.verify_server, Path(a.out + ".verify.jsonl")) if a.verify_server else None)
+        out, stats = build_capture(tok, items, a.seq, stride, json.loads(a.template_kwargs), code_args, verify, a.pack)
     else:
         rows = [json.loads(ln) for ln in Path(a.inp).open() if ln.strip()]
         out, stats = build(tok, rows, a.seq, stride, code_args, a.history_reasoning)
-    with open(a.out, "w") as f:
-        f.writelines(json.dumps(w) + "\n" for w in out)
-    Path(a.out).with_suffix(".stats.json").write_text(json.dumps({**stats, "args": vars(a)}, indent=1))
+    from .runctl import atomic_json, atomic_write
+
+    data = "".join(json.dumps(w) + "\n" for w in out)
+    stats = {**stats, "sha256": _sha(data), "complete": True}
+    atomic_write(a.out, data)  # the data first: stats with complete=true never describe a file that is not there
+    atomic_json(Path(a.out).with_suffix(".stats.json"), {**stats, "args": vars(a)})
     print(json.dumps(stats))
 
 

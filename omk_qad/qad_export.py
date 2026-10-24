@@ -110,8 +110,19 @@ def export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path
     """Write ``model``'s current weights as a GGUF at ``layout``'s plan; returns the export report.
 
     ``imatrix`` (omk_qad.imatrix.load record: entries by HF name + metadata) weights the encoders exactly as in
-    training, and is saved next to the GGUF in llama.cpp's format (``<stem>.imatrix.gguf``).
+    training, and is saved next to the GGUF in llama.cpp's format (``<stem>.imatrix.gguf``). Built and verified
+    under ``<stem>.partial.gguf``; ``out`` appears only when every tensor verified (``runctl.publish_verified``).
     """
+    from .runctl import publish_verified
+
+    return publish_verified(Path(out), lambda part: _export_gguf(model, layout, part, llama_cpp, device, imatrix,
+                                                                 latents, imatrix_folded),
+                            sidecars=(".imatrix.gguf", ".imatrix.pt"))
+
+
+def _export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path | None = None,
+                 device: str | torch.device = "cpu", imatrix: dict | None = None, latents: dict | None = None,
+                 imatrix_folded: dict | None = None) -> dict:
     t0 = time.time()
     llama_cpp = Path(llama_cpp or layout["llama_cpp"])
     gguf, get_model_architecture, get_model_class, text_type = _import_llama_cpp(llama_cpp)
