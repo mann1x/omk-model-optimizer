@@ -65,7 +65,29 @@ def load_text_causal_lm(model_dir: str, device: str, dtype: torch.dtype = torch.
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     config = AutoConfig.from_pretrained(model_dir).get_text_config()
-    model = AutoModelForCausalLM.from_pretrained(model_dir, config=config, dtype=dtype, device_map={"": device})
+    # A multimodal checkpoint (e.g. Gemma4ForConditionalGeneration) nests the text model under
+    # model.language_model.*; the text-only class wants model.*. transformers remaps this for some families
+    # (Qwen3.5) but not all (Gemma-4, 5.5.0): there every weight came up MISSING and silently random.
+    index, single = Path(model_dir) / "model.safetensors.index.json", Path(model_dir) / "model.safetensors"
+    if index.exists():
+        keys = list(json.loads(index.read_text())["weight_map"])
+    elif single.exists():  # one-file checkpoint (e.g. Gemma-4 E2B): the keys are in its header
+        from safetensors import safe_open
+
+        with safe_open(str(single), "pt") as f:
+            keys = list(f.keys())
+    else:
+        keys = []
+    nested = any(k.startswith("model.language_model.") for k in keys)
+    remap = {r"^model\.language_model\.": "model."} if nested else None
+    model, info = AutoModelForCausalLM.from_pretrained(model_dir, config=config, dtype=dtype, device_map={"": device},
+                                                       key_mapping=remap, output_loading_info=True)
+    out_emb = model.get_output_embeddings()
+    tied = out_emb is not None and out_emb.weight is model.get_input_embeddings().weight
+    missing = [k for k in info["missing_keys"] if not (tied and k == "lm_head.weight")]
+    if missing:
+        raise SystemExit(f"{model_dir}: {len(missing)} weights not in the checkpoint (would be random), e.g. "
+                         f"{sorted(missing)[:3]}")
     if torch.device(device).type == "cpu":
         use_torch_kernels(model)
     model.eval()
