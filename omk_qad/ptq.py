@@ -62,6 +62,20 @@ def use_torch_kernels(model: nn.Module) -> int:
     return n
 
 
+def sdpa_without_gqa() -> None:
+    """Make transformers expand K/V to the query heads before SDPA instead of passing ``enable_gqa``.
+
+    With no attention mask (causal layers) transformers hands SDPA the unexpanded KV heads (``enable_gqa``). On torch
+    2.10 only the MATH kernel takes that: mem-efficient wants equal head counts and flash stops at head_dim 256, so
+    Gemma-4's head_dim-512 global layers (16 q / 2 kv heads) built the full score matrix -- 43 GiB extra at 1 x 16384,
+    forward only, and the anchor pass OOMed asking for 64 GiB (bm-889, 2026-10-25). Expanded K/V (~256 MB per such
+    layer at 16k) run the mem-efficient kernel. Process-wide and idempotent.
+    """
+    import transformers.integrations.sdpa_attention as sdpa
+
+    sdpa.use_gqa_in_sdpa = lambda attention_mask, key: False
+
+
 def load_text_causal_lm(model_dir: str, device: str, dtype: torch.dtype = torch.bfloat16):
     """The text causal LM of ``model_dir`` (vision tower / MTP head not loaded) and its tokenizer."""
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -92,6 +106,8 @@ def load_text_causal_lm(model_dir: str, device: str, dtype: torch.dtype = torch.
                          f"{sorted(missing)[:3]}")
     if torch.device(device).type == "cpu":
         use_torch_kernels(model)
+    else:
+        sdpa_without_gqa()
     model.eval()
     return model, AutoTokenizer.from_pretrained(model_dir)
 

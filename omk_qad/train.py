@@ -276,6 +276,24 @@ def _x_sha(x: torch.Tensor) -> str:
     return hashlib.sha256(x.to(torch.int32).contiguous().numpy().tobytes()).hexdigest()[:16]
 
 
+@torch.no_grad()
+def head_topk(model, h, x, cap, k: int, chunk: int):
+    """Top-``k`` soft-capped log-probs of next tokens over ``h`` [B, T, D], ``chunk`` positions at a time.
+
+    The whole head at once is B x T x vocab in fp32 (4 x 16384 x 262144 = 68 GB for Gemma-4 at --seq 16384,
+    bm-889); per chunk it is chunk x vocab. Returns int32 / fp16 [B, T-1, k] on the CPU and the summed NLL of ``x``.
+    """
+    head, ii, vv, nll = model.get_output_embeddings(), [], [], 0.0
+    for c0 in range(0, h.shape[1] - 1, chunk):
+        c1 = min(c0 + chunk, h.shape[1] - 1)
+        lp = F.log_softmax(softcap(head(h[:, c0:c1]).float(), cap), -1)
+        v, i = lp.topk(k, -1)
+        nll -= lp.gather(-1, x[:, c0 + 1 : c1 + 1, None]).sum().item()
+        ii.append(i.to(torch.int32).cpu())
+        vv.append(v.to(torch.float16).cpu())
+    return torch.cat(ii, 1), torch.cat(vv, 1), nll
+
+
 def phase_cache(a) -> None:
     """Teacher top-K cache over the mixed training stream and the eval rows.
 
@@ -352,14 +370,12 @@ def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
         h = teacher.get_decoder()(input_ids=x).last_hidden_state
         if imat["collector"] is not None and getattr(teacher, "mtp", None) is not None:
             teacher.mtp(teacher.get_input_embeddings()(x[:, 1:]), h[:, :-1], teacher.get_decoder().rotary_emb)
-        lp = F.log_softmax(softcap(teacher.get_output_embeddings()(h[:, :-1]).float(), cap), -1)
-        v, i = lp.topk(a.topk, -1)
-        nll = -lp.gather(-1, x[:, 1:, None]).sum().item()
+        i, v, nll = head_topk(teacher, h, x, cap, a.topk, a.loss_chunk)
         if imat["collector"] is not None:
             imat["seqs"] += x.shape[0]
             if imat["seqs"] >= a.imatrix_seqs:
                 save_imatrix()
-        return i.to(torch.int32).cpu(), v.to(torch.float16).cpu(), nll
+        return i, v, nll
 
     if not a.teacher_gguf:
         topk_of = topk_of_torch
@@ -537,10 +553,9 @@ def anchor_pass(a, dtype, st: State, control: RunControl) -> None:
             for i in range(0, len(sh["x"]), a.cache_bs):
                 x = sh["x"][i : i + a.cache_bs].long().to(a.device)
                 h = model.get_decoder()(input_ids=x).last_hidden_state
-                lp = F.log_softmax(softcap(model.get_output_embeddings()(h[:, :-1]).float(), cap), -1)
-                v, k = lp.topk(meta["topk"], -1)
-                ai.append(k.to(torch.int32).cpu())
-                av.append(v.to(torch.float16).cpu())
+                k, v, _ = head_topk(model, h, x, cap, meta["topk"], a.loss_chunk)
+                ai.append(k)
+                av.append(v)
         sh.update(aidx=torch.cat(ai), aval=torch.cat(av), anchor_model=a.model)
         atomic_torch_save(sh, fn)
         done += 1

@@ -232,3 +232,22 @@ def test_restart_with_another_model_is_refused(tmp_path):
         generate(_args(tmp_path, prompts, url=url, model="other", allow_change=["model"]))
     finally:
         srv.shutdown()
+
+
+def test_prompts_skip_an_empty_user_turn(tmp_path):
+    """A masked RL-Ultra row (empty question until fill_placeholders.py) is counted, never sampled (bug-843)."""
+    from omk_qad.replay import prompts
+
+    def row(text):
+        return {"agent_ref": {"name": "math_with_judge_simple_agent"},
+                "responses_create_params": {"input": [{"role": "user", "content": text}]}}
+
+    src = tmp_path / "rlvr.jsonl"
+    src.write_text("".join(json.dumps(row(t)) + "\n" for t in ("", "  ", "What is 2 + 2?")))
+    out = tmp_path / "p.jsonl"
+    prompts(SimpleNamespace(gate="", no_gate=True, src=str(src), seed=1, per_category=5, gate_frac=0.1,
+                            out=str(out)))
+    rows = [json.loads(ln) for ln in out.read_text().splitlines()]
+    assert [r["body"]["messages"][-1]["content"] for r in rows] == ["What is 2 + 2?"]
+    census = json.loads(out.with_suffix(".manifest.json").read_text())["census"]
+    assert census["math:empty_user_turn"] == 2

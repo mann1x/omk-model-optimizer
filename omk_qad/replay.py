@@ -180,6 +180,11 @@ def prompts(a) -> None:
                 if body is None:
                     census[f"{cat}:not_a_user_turn"] += 1
                     continue
+                # a masked row (RL-Ultra DAPO/Skywork: _hf_question_placeholder, question "") has an empty user
+                # turn until fill_placeholders.py restores it; the model would answer "" (bug-843)
+                if not (body["messages"][-1].get("content") or "").strip():
+                    census[f"{cat}:empty_user_turn"] += 1
+                    continue
                 pool.setdefault(cat, []).append((f"{Path(f).parent.name}/{Path(f).stem}/{i}", body))
     rng = random.Random(a.seed)
     out = []
