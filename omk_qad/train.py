@@ -911,6 +911,8 @@ def _model_id(model: str) -> dict:
 def train_identity(a) -> dict:
     """What a training run's outputs depend on: every non-runtime arg plus the content of its inputs."""
     ident = {k: v for k, v in sorted(vars(a).items()) if k not in RUNTIME_ARGS}
+    if ident.get("data_order") == "cache":  # the only order before --data-order: older identities stay valid
+        del ident["data_order"]
     ident["id_model"] = _model_id(a.model)
     cmeta = json.loads((Path(a.cache) / "cache.json").read_text())
     ident["id_cache"] = ({k: cmeta.get(k) for k in ("identity", "n_seq", "anchor_model")} if "identity" in cmeta
@@ -1070,9 +1072,68 @@ def phase_train(a) -> None:
         lock.release()
 
 
+class CacheRows:
+    """The cached training rows in the order a run consumes them, one batch at a time.
+
+    ``shuffle`` (default): one permutation of every cached row, seeded by ``--seed`` alone, so a resume continues it
+    and a batch mixes sources and documents. Cache rows follow their source files' order, and a rollout source is
+    sorted by run: in that order bm-889 trained one rollout at a time (steps 201-300 were a single run). Shards are
+    memory-mapped, so a batch reads only its rows. ``cache``: the cache's own order, one shard in memory at a time
+    (the order of runs made before --data-order).
+    """
+
+    KEYS = ("x", "idx", "val", "role", "aidx", "aval")
+
+    def __init__(self, cache: str, n_seq: int, shard: int, order: str, seed: int):
+        """Fix the order of all ``n_seq`` cached rows (``shard`` rows per file)."""
+        self.cache, self.shard, self.order = cache, shard, order
+        self.rows = list(range(n_seq))
+        if order == "shuffle":
+            random.Random(seed).shuffle(self.rows)
+        self.open: dict[int, dict] = {}
+
+    def _shard(self, k: int) -> dict:
+        if k not in self.open:
+            if self.order == "cache":  # sequential: the previous shard is done
+                self.open.clear()
+            fn = os.path.join(self.cache, f"train_{k:04d}.pt")
+            self.open[k] = torch.load(fn, mmap=self.order == "shuffle")
+        return self.open[k]
+
+    def batch(self, s0: int, bs: int) -> dict:
+        """Rows ``s0 .. s0+bs`` of the order as batch tensors (``role``/``aidx``/``aval`` None when no row has them)."""
+        got = [(self._shard(r // self.shard), r % self.shard) for r in self.rows[s0 : s0 + bs]]
+        out = {}
+        for key in self.KEYS:
+            if not any(key in sh for sh, _ in got):
+                out[key] = None
+                continue
+            vals = []
+            for sh, j in got:
+                if key in sh:
+                    vals.append(sh[key][j])
+                elif key == "role":  # a shard of text rows only: text rows are teacher-trained everywhere
+                    vals.append(torch.ones(sh["x"].shape[1], dtype=torch.int8))
+                else:  # a shard without anchor positions: its own teacher targets stand in, masked by role != 2
+                    vals.append(sh["idx" if key == "aidx" else "val"][j])
+            out[key] = torch.stack(vals)
+        return out
+
+
+def legacy_data_order(run: Path, order: str, log=print) -> str:
+    """A run started before --data-order (its identity has no data_order) continues in the cache order."""
+    idp = run / "identity.json"
+    ident = json.loads(idp.read_text()).get("identity", {}) if idp.exists() else {}
+    if order != "cache" and ((run / "last.pt").exists() or idp.exists()) and "data_order" not in ident:
+        log("DATA order cache: this run started before --data-order, it resumes in the order it was trained in")
+        return "cache"
+    return order
+
+
 def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     LOG[0] = open(run / "log.txt", "a")
     say("args", json.dumps(vars(a)))
+    a.data_order = legacy_data_order(run, a.data_order, say)
     torch.manual_seed(a.seed)
     meta = json.load(open(os.path.join(a.cache, "cache.json")))
     sh = meta["shard"]
@@ -1149,7 +1210,9 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         tel.eval(results[-1], start - 1)
     pause_file = run / "PAUSE"
     st.update(status="running", step=start - 1, steps=a.steps, last=last)
-    shard = (-1, None)
+    rows = CacheRows(a.cache, meta["n_seq"], sh, a.data_order, a.seed)
+    say(f"DATA order {a.data_order}" + (f" (seed {a.seed}): first rows {rows.rows[:8]}" if a.data_order == "shuffle"
+                                        else ": cache rows in sequence"))
     t0, t_save = time.time(), time.time()
 
     def checkpoint(step, path=last_ck):
@@ -1174,14 +1237,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         if opt is not None:
             for gq in opt.param_groups:
                 gq["lr"] = a.fp_lr * ctl.lr / a.lr
-        s0 = (step - 1) * a.bs
-        if s0 // sh != shard[0]:
-            shard = (s0 // sh, torch.load(os.path.join(a.cache, f"train_{s0 // sh:04d}.pt")))
-        j = s0 % sh
-        x = shard[1]["x"][j : j + a.bs].long().to(a.device)
-        idx, val = shard[1]["idx"][j : j + a.bs].to(a.device), shard[1]["val"][j : j + a.bs].to(a.device)
-        roles = {k: shard[1][k][j : j + a.bs].to(a.device) if k in shard[1] else None
-                 for k in ("role", "aidx", "aval")}
+        b = rows.batch((step - 1) * a.bs, a.bs)
+        x = b["x"].long().to(a.device)
+        idx, val = b["idx"].to(a.device), b["val"].to(a.device)
+        roles = {k: None if b[k] is None else b[k].to(a.device) for k in ("role", "aidx", "aval")}
         loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles)
         rolled = guard.observe(step, loss)
         row = {"train/loss": loss, "train/lr": ctl.lr, **({"train/guard_rollback": 1} if rolled else {})}
@@ -1302,6 +1361,9 @@ def main(argv=None) -> None:
     ap.add_argument("--gguf", default="")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data-order", choices=("shuffle", "cache"), default="shuffle",
+                    help="order of the cached training rows: one seeded permutation (default), or the cache's own "
+                    "order (the order of runs made before this flag; such runs resume in it)")
     # cache
     ap.add_argument("--data", default="", help="comma list of path[=weight] (.txt | .jsonl text/messages | .parquet)")
     ap.add_argument("--eval-data", default="", help="comma list of eval files, one family each (name = file stem)")

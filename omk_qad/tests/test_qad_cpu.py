@@ -451,6 +451,7 @@ def test_pause_resume_is_bitwise_and_stage2_branches(setup):
     assert not (b / "stage1" / "PAUSE").exists()  # consumed: the relaunch is not paused again
     p = _train(model, lay, setup["cache"], b)
     assert "RESUME from step 1" in p.stdout + p.stderr
+    assert "DATA order shuffle (seed 0)" in p.stdout + p.stderr  # the default order, continued by the resume
     assert (b / "stage1" / "last.pt").exists() is False  # finished: final.pt only, no second full copy
     fa = torch.load(a / "stage1" / "final.pt", weights_only=False)
     fb = torch.load(b / "stage1" / "final.pt", weights_only=False)
@@ -1089,3 +1090,71 @@ def test_guard_fails_loud_past_its_rollback_budget(setup, monkeypatch):
     with pytest.raises(SystemExit, match="GUARD_FAIL step 2"):
         _train_spiked(monkeypatch, model, lay, setup["cache"], run, 2, "--guard-ratio", "2", "--guard-patience", "1",
                       "--guard-every", "1", "--guard-max", "0")
+
+
+def _rows_cache(tmp_path: Path) -> Path:
+    """3 shards x 4 rows, x = row number: shard 0 role + anchor, shard 1 role only, shard 2 text (no role)."""
+    seq, k = 6, 3
+    for s in range(3):
+        rows = torch.arange(s * 4, s * 4 + 4, dtype=torch.int32)
+        sh = {"x": rows[:, None].repeat(1, seq), "idx": torch.zeros(4, seq - 1, k, dtype=torch.int32),
+              "val": torch.full((4, seq - 1, k), -1.0)}
+        if s < 2:
+            sh["role"] = torch.full((4, seq), 1, dtype=torch.int8)
+        if s == 0:
+            sh["role"][:, 2] = 2
+            sh["aidx"], sh["aval"] = torch.ones(4, seq - 1, k, dtype=torch.int32), torch.full((4, seq - 1, k), -2.0)
+        torch.save(sh, tmp_path / f"train_{s:04d}.pt")
+    return tmp_path
+
+
+def test_training_rows_are_shuffled_by_default(tmp_path):
+    """bm-889: the default training order is one seeded permutation of every cached row.
+
+    Cache rows follow the source files (a rollout source is sorted by run). The permutation is deterministic per seed
+    (a resume continues it), visits each row once and mixes shards.
+    """
+    from omk_qad import train as T
+
+    cache = str(_rows_cache(tmp_path))
+    def order(kind, seed=0):
+        r = T.CacheRows(cache, 12, 4, kind, seed)
+        return [int(r.batch(s0, 2)["x"][i, 0]) for s0 in range(0, 12, 2) for i in range(2)]
+
+    sh = order("shuffle")
+    assert sorted(sh) == list(range(12)) and sh != list(range(12))
+    assert sh == order("shuffle") and sh != order("shuffle", seed=1)
+    assert len({r // 4 for r in sh[:4]}) > 1  # the first two batches already span shards
+    assert order("cache") == list(range(12))  # the order of runs made before --data-order
+
+
+def test_a_shuffled_batch_across_shards_fills_role_and_anchor(tmp_path):
+    """A batch mixing shards fills role and anchor targets for the rows whose shard has none.
+
+    Text-shard rows get role 1 (teacher-trained everywhere); rows from a shard without anchor positions get their own
+    finite teacher targets as anchor stand-ins, which role != 2 masks out.
+    """
+    from omk_qad import train as T
+
+    r = T.CacheRows(str(_rows_cache(tmp_path)), 12, 4, "cache", 0)
+    r.rows = [0, 9]  # shard 0 (role + anchor) with shard 2 (text)
+    b = r.batch(0, 2)
+    assert b["role"].tolist()[1] == [1] * 6 and b["role"][0, 2] == 2
+    assert torch.equal(b["aidx"][1], b["idx"][1]) and torch.equal(b["aval"][1], b["val"][1])
+    assert torch.isfinite(b["aval"]).all()
+    r.rows = [8, 9]  # text rows only: no role data at all, as before
+    assert r.batch(0, 2)["role"] is None and r.batch(0, 2)["aidx"] is None
+
+
+def test_a_run_from_before_data_order_resumes_in_cache_order(tmp_path):
+    """run1 of bm-889 (identity without data_order) must not change order on a resume; new runs shuffle."""
+    from omk_qad import train as T
+
+    run = tmp_path / "stage1"
+    run.mkdir()
+    assert T.legacy_data_order(run, "shuffle", log=lambda *_: None) == "shuffle"  # fresh run
+    (run / "identity.json").write_text(json.dumps({"identity": {"seed": 0}}))
+    (run / "last.pt").write_bytes(b"")
+    assert T.legacy_data_order(run, "shuffle", log=lambda *_: None) == "cache"
+    (run / "identity.json").write_text(json.dumps({"identity": {"seed": 0, "data_order": "shuffle"}}))
+    assert T.legacy_data_order(run, "shuffle", log=lambda *_: None) == "shuffle"
