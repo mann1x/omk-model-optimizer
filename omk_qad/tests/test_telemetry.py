@@ -118,16 +118,23 @@ def test_resume_rewinds_to_the_checkpoint_step(tmp_path, fake_wandb, monkeypatch
 def test_resume_without_rewind_skips_the_rows_wandb_holds(tmp_path, fake_wandb, monkeypatch):
     monkeypatch.setenv("WANDB_API_KEY", "k" * 40)
     plain = fake_wandb.init
+    fake_wandb.leftover = False  # real wandb: a failed rewind keeps its stream until teardown()
+
+    def teardown():
+        fake_wandb.leftover = False
 
     def init(**kw):
         if "resume_from" in kw:
+            fake_wandb.leftover = True
             raise RuntimeError("rewind not enabled")
+        if fake_wandb.leftover:
+            raise RuntimeError(f"run ID {kw['id']} is in use")
         r = plain(**kw)
         r.step = 46  # the killed run logged up to step 45, its checkpoint is step 40
         return r
 
-    fake_wandb.init = init
-    t = T.Telemetry(_args(), tmp_path, {}, resume_step=40)
+    fake_wandb.init, fake_wandb.teardown = init, teardown
+    t = T.Telemetry(_args(wandb_project="omk-qad"), tmp_path, {}, resume_step=40)  # explicit: a failure refuses
     assert t.wb.kw["resume"] == "allow"
     for step in (41, 45, 46):
         t.log({"train/loss": float(step)}, step)

@@ -211,6 +211,9 @@ class Telemetry:
             except Exception as e:
                 say(f"WANDB rewind unavailable ({type(e).__name__}: {e}); reattaching instead")
                 self.wb = None
+                # the failed init leaves its stream registered under the run id: without a teardown the reattach
+                # below is refused with "run ID ... is in use" (wandb 0.26.1, rewind in private preview; bm-889)
+                wandb.teardown()
         try:
             if self.wb is None:
                 self.wb = wandb.init(project=project, entity=entity, name=name, id=rid, resume="allow", config=config,
