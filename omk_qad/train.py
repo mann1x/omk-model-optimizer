@@ -41,7 +41,7 @@ from .fakequant import (
     install,
     load_adafactor_state,
 )
-from .losses import jaccard_topk_rest, kl_topk_rest
+from .losses import jaccard_topk_rest, kl_topk_rest, rkl_topk_rest
 from .ptq import load_text_causal_lm
 from .recovery import softcap, softcap_of
 from .runctl import Control as RunControl
@@ -674,6 +674,14 @@ def token_terms(logits, idx, val, x_next):
             F.cross_entropy(logits, x_next, reduction="none"), (logits.argmax(-1) == idx[:, 0].long()).float())
 
 
+DISTILL = {"jaccard": jaccard_topk_rest, "kl": kl_topk_rest, "rkl": rkl_topk_rest}  # --loss: per-token top-K + rest
+
+
+def distill_loss(logits, idx, val, a) -> torch.Tensor:
+    """The per-token distillation loss ``--loss`` names (jaccard | kl = KL(t||s) | rkl = KL(s||t))."""
+    return DISTILL[a.loss](logits.float(), idx.long(), val.float())
+
+
 @torch.no_grad()
 def evaluate(student, head, ev, a, tag, extra=None) -> dict:
     """Jaccard / KL(top-K) / top-1 / ppl of the student against the cached teacher on the eval rows.
@@ -685,11 +693,11 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
     student.eval()
     wh = head.served()
     mtp = has_mtp(student)
-    tot = dict.fromkeys(("jac", "klk", "nll", "top1", "jac_m", "klk_m", "top1_m"), 0.0)
+    tot = dict.fromkeys(("jac", "klk", "rkl", "nll", "top1", "jac_m", "klk_m", "top1_m"), 0.0)
     n = n_m = 0
     names = ev.get("families") or []
     fam = ev["family"].tolist() if "family" in ev else [0] * len(ev["x"])
-    per = [dict.fromkeys(("jac", "klk", "nll", "top1", "n"), 0.0) for _ in names]
+    per = [dict.fromkeys(("jac", "klk", "rkl", "nll", "top1", "n"), 0.0) for _ in names]
     for i0 in range(0, len(ev["x"]), 4):
         x = ev["x"][i0 : i0 + 4].long().to(a.device)
         h = hidden_of(student, x, cuda)
@@ -699,9 +707,11 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                     lg = softcap(F.linear(h[i, c0:c1], wh), getattr(a, "softcap", None))
-                j, k, ce, t1 = token_terms(lg, ev["idx"][i0 + i, c0:c1].to(a.device),
-                                           ev["val"][i0 + i, c0:c1].to(a.device), x[i, c0 + 1 : c1 + 1])
-                terms = {"jac": j.sum().item(), "klk": k.sum().item(), "nll": ce.sum().item(), "top1": t1.sum().item()}
+                ei, ev_ = ev["idx"][i0 + i, c0:c1].to(a.device), ev["val"][i0 + i, c0:c1].to(a.device)
+                j, k, ce, t1 = token_terms(lg, ei, ev_, x[i, c0 + 1 : c1 + 1])
+                rk = rkl_topk_rest(lg.float(), ei.long(), ev_.float())
+                terms = {"jac": j.sum().item(), "klk": k.sum().item(), "rkl": rk.sum().item(), "nll": ce.sum().item(),
+                         "top1": t1.sum().item()}
                 for key, v in terms.items():
                     tot[key] += v
                     if per:
@@ -721,13 +731,14 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
                     tot["top1_m"] += t1.sum().item()
                     n_m += c1 - c0
     student.train()
-    res = {"tag": tag, "jaccard": tot["jac"] / n, "klk": tot["klk"] / n, "top1": tot["top1"] / n,
-           "ppl": math.exp(tot["nll"] / n), "teacher_ppl": ev.get("teacher_ppl")}
+    res = {"tag": tag, "jaccard": tot["jac"] / n, "klk": tot["klk"] / n, "rkl": tot["rkl"] / n,
+           "top1": tot["top1"] / n, "ppl": math.exp(tot["nll"] / n), "teacher_ppl": ev.get("teacher_ppl")}
     if mtp:
         res.update(jaccard_mtp=tot["jac_m"] / n_m, klk_mtp=tot["klk_m"] / n_m, top1_mtp=tot["top1_m"] / n_m)
     if len(per) > 1:  # the same metrics per eval family (rows of each family are disjoint)
-        res["families"] = {nm: {"jaccard": f["jac"] / f["n"], "klk": f["klk"] / f["n"], "top1": f["top1"] / f["n"],
-                                "ppl": math.exp(f["nll"] / f["n"])} for nm, f in zip(names, per, strict=True)}
+        res["families"] = {nm: {"jaccard": f["jac"] / f["n"], "klk": f["klk"] / f["n"], "rkl": f["rkl"] / f["n"],
+                                "top1": f["top1"] / f["n"], "ppl": math.exp(f["nll"] / f["n"])}
+                           for nm, f in zip(names, per, strict=True)}
     res.update(extra or {})
     say("EVAL", json.dumps(res))
     return res
@@ -735,13 +746,11 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
 
 def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
     """Per-token loss of one chunk under roles (omk_qad.rollouts): 1 teacher, 2 anchor, 3 teacher + unlikelihood."""
-    j, k, _, _ = token_terms(lg, idx, val, x_next)
-    per = (j if a.loss == "jaccard" else k) * ((r == 1) | (r == 3))
+    per = distill_loss(lg, idx, val, a) * ((r == 1) | (r == 3))
     if (r == 2).any():
         if aidx is None:
             raise SystemExit("anchor-role positions without anchor targets (run --phase cache --anchor)")
-        ja, ka, _, _ = token_terms(lg, aidx, aval, x_next)
-        per = per + a.anchor_weight * (ja if a.loss == "jaccard" else ka) * (r == 2)
+        per = per + a.anchor_weight * distill_loss(lg, aidx, aval, a) * (r == 2)
     if (r == 3).any():  # push down the repeated token the student produced: -log(1 - p_s(x_next))
         p = F.log_softmax(lg.float(), -1).gather(-1, x_next[:, None]).squeeze(-1).exp()
         per = per + a.ul_weight * -torch.log((1 - p).clamp_min(1e-6)) * (r == 3)
@@ -778,8 +787,9 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                 loss.backward()
                 tot += loss.item()
                 continue
-            j, k, ce, _ = token_terms(lg, idx[i, c0:c1], val[i, c0:c1], x[i, c0 + 1 : c1 + 1])
-            loss = ((j if a.loss == "jaccard" else k).sum() + a.ce_weight * ce.sum()) / n_tok
+            d = distill_loss(lg, idx[i, c0:c1], val[i, c0:c1], a)
+            ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none")
+            loss = (d.sum() + a.ce_weight * ce.sum()) / n_tok
             loss.backward()
             tot += loss.item()
     if a.mtp == "train" and has_mtp(student):  # MTP distillation: only mtp.* learns (trunk/embed/head detached)
@@ -792,8 +802,9 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 2)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                     lg = softcap(F.linear(zd[i, c0:c1], whd), getattr(a, "softcap", None))
-                j, k, ce, _ = token_terms(lg, idx[i, c0 + 1 : c1 + 1], val[i, c0 + 1 : c1 + 1], x[i, c0 + 2 : c1 + 2])
-                loss = a.mtp_weight * ((j if a.loss == "jaccard" else k).sum() + a.ce_weight * ce.sum()) / n_m
+                d = distill_loss(lg, idx[i, c0 + 1 : c1 + 1], val[i, c0 + 1 : c1 + 1], a)
+                ce = F.cross_entropy(lg.float(), x[i, c0 + 2 : c1 + 2], reduction="none")
+                loss = a.mtp_weight * (d.sum() + a.ce_weight * ce.sum()) / n_m
                 loss.backward()
                 tot += loss.item()
         z.backward(zd.grad)
@@ -1312,7 +1323,8 @@ def main(argv=None) -> None:
     ap.add_argument("--fp-lr", type=float, default=1e-5)
     ap.add_argument("--beta2", type=float, default=0.999)
     ap.add_argument("--clip", type=float, default=1.0, help="max RMS of one tensor's (expert's) normalized update")
-    ap.add_argument("--loss", choices=["jaccard", "kl"], default="jaccard")
+    ap.add_argument("--loss", choices=sorted(DISTILL), default="jaccard",
+                    help="distillation loss over the teacher top-K + rest: jaccard | kl = KL(t||s) | rkl = KL(s||t)")
     ap.add_argument("--ce-weight", type=float, default=0.0, help="Bolt: no CE term")
     ap.add_argument("--loss-chunk", type=int, default=1024, help="tokens per head/loss chunk (bounds logits memory)")
     ap.add_argument("--mtp", choices=["train", "freeze"], default="train",

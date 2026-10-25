@@ -140,6 +140,17 @@ def test_bf16_lossless_gate_when_the_teacher_is_the_student(g4):
     assert "LOSSLESS_GATE klk=" in log or "RESUME" in log, log[-3000:]
 
 
+def test_bf16_reverse_kl_trains_and_is_evaluated(g4, tmp_path):
+    out = tmp_path / "run_rkl"
+    tr = [*TRAIN[: TRAIN.index("--loss")], "--loss", "rkl", *TRAIN[TRAIN.index("--loss") + 2 :]]
+    _run("omk_qad.train", *tr, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+         "--out", str(out), "--steps", "8", "--eval-every", "8", "--save-every", "4")
+    res = _ckpt(out)["results"]
+    assert all("rkl" in r for r in res)
+    assert res[0]["tag"] == "init" and res[-1]["rkl"] < res[0]["rkl"], [r["rkl"] for r in res]
+    assert json.loads((out / "stage1" / "summary.json").read_text())["args"]["loss"] == "rkl"
+
+
 def test_bf16_gguf_teacher_cache_skips_the_lossless_gate(g4, tmp_path):
     """A --teacher-gguf cache names the student's dir as --model (tokenizer only): the gate must not run on it."""
     import shutil

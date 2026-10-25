@@ -16,7 +16,8 @@ Two forms:
     them). The tail outside the K ids collapses into one "rest" bin on both sides. Collapsing bins can only
     raise sum min (min(a+b, c+d) >= min(a, c) + min(b, d)), so this is a LOWER bound on the full loss.
 
-The KL forms of both are kept as the control arm.
+The KL forms of both are kept as the control arm; the top-K + rest form also has the reverse KL
+(student || teacher), the on-policy distillation objective of the bf16 recovery (bm-889).
 """
 
 import torch
@@ -30,6 +31,7 @@ __all__ = [
     "jaccard_topk_rest",
     "kl_topk_rest",
     "masked_mean",
+    "rkl_topk_rest",
 ]
 
 
@@ -110,6 +112,36 @@ def kl_topk_rest(
     lp_s_rest = torch.logsumexp(z.scatter(-1, ids, float("-inf")), dim=-1) - lse
     p_t_rest = (1.0 - p_t_k.sum(-1)).clamp_min(0.0)
     return kl_k + torch.xlogy(p_t_rest, p_t_rest) - p_t_rest * lp_s_rest
+
+
+def rkl_topk_rest(
+    logits_s: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_logprobs_t: torch.Tensor,
+    temperature: float = 1.0,
+    rest_floor: float = 1e-6,
+) -> torch.Tensor:
+    """Per-token reverse KL(student || teacher) over K ids plus one rest bin (mode-seeking, GKD-style).
+
+    Log space as :func:`kl_topk_rest`, so the gradient never saturates. The teacher's bins are its K cached
+    log-probs plus a rest bin of ``max(1 - sum p_t, rest_floor)``, renormalised: fp16-cached log-probs can put
+    the K mass at or over 1, and a zero rest bin would make any student mass outside the K infinitely costly
+    (log 0). Renormalising keeps both sides proper distributions, so the loss is >= 0.
+    """
+    z = logits_s.float() / temperature
+    lse = torch.logsumexp(z, dim=-1)
+    ids = topk_ids.long()
+    lp_s_k = z.gather(-1, ids) - lse[..., None]
+    lp_t_k = topk_logprobs_t.float().detach()
+    if ids.shape[-1] >= z.shape[-1]:  # the K ids are the whole vocabulary: no rest bin on either side
+        lp_t_k = lp_t_k - torch.logsumexp(lp_t_k, dim=-1, keepdim=True)
+        return (lp_s_k.exp() * (lp_s_k - lp_t_k)).sum(-1)
+    lp_s_rest = torch.logsumexp(z.scatter(-1, ids, float("-inf")), dim=-1) - lse
+    lp_t_rest = (1.0 - lp_t_k.exp().sum(-1)).clamp_min(rest_floor).log()
+    lp_t = torch.cat([lp_t_k, lp_t_rest[..., None]], -1)
+    lp_t = lp_t - torch.logsumexp(lp_t, dim=-1, keepdim=True)
+    lp_s = torch.cat([lp_s_k, lp_s_rest[..., None]], -1)
+    return (lp_s.exp() * (lp_s - lp_t)).sum(-1)
 
 
 class JaccardDistillationLoss(_Loss):

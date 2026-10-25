@@ -14,6 +14,7 @@ from omk_qad.losses import (
     jaccard_topk_rest,
     kl_topk_rest,
     masked_mean,
+    rkl_topk_rest,
 )
 
 
@@ -155,3 +156,59 @@ def test_kl_topk_rest_full_k_backward_is_finite():
     vals, ids = F.log_softmax(torch.randn(4, 20), -1).topk(20, dim=-1)
     kl_topk_rest(s, ids, vals).sum().backward()
     assert torch.isfinite(s.grad).all()
+
+
+def test_rkl_topk_rest_matches_full_reverse_kl_at_full_k():
+    torch.manual_seed(8)
+    s, t = torch.randn(16, 40), torch.randn(16, 40)
+    lp_s, lp_t = F.log_softmax(s, -1), F.log_softmax(t, -1)
+    vals, ids = lp_t.topk(40, dim=-1)
+    full = (lp_s.exp() * (lp_s - lp_t)).sum(-1)  # KL(s || t)
+    torch.testing.assert_close(rkl_topk_rest(s, ids, vals), full, atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("k", [1, 8, 39])
+def test_rkl_topk_rest_is_the_reverse_kl_of_the_collapsed_bins(k):
+    torch.manual_seed(9)
+    s, t = torch.randn(16, 40) * 2, torch.randn(16, 40) * 2
+    lp_s, lp_t = F.log_softmax(s, -1), F.log_softmax(t, -1)
+    vals, ids = lp_t.topk(k, dim=-1)
+    q_k, p_k = lp_s.gather(-1, ids).exp(), vals.exp()
+    q = torch.cat([q_k, 1 - q_k.sum(-1, keepdim=True)], -1)
+    p = torch.cat([p_k, 1 - p_k.sum(-1, keepdim=True)], -1)
+    want = (q * (q.log() - p.log())).sum(-1)
+    got = rkl_topk_rest(s, ids, vals)
+    torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-4)
+    assert torch.all(got >= -1e-6)
+    # a different direction from the forward KL on the same bins
+    assert not torch.allclose(got, kl_topk_rest(s, ids, vals), atol=1e-3)
+
+
+def test_rkl_topk_rest_is_zero_on_the_teacher_itself():
+    torch.manual_seed(10)
+    t = torch.randn(8, 50) * 3
+    vals, ids = F.log_softmax(t, -1).topk(16, dim=-1)
+    assert rkl_topk_rest(t, ids, vals).abs().max().item() < 1e-5
+
+
+def test_rkl_topk_rest_stays_finite_when_the_cached_k_mass_reaches_one():
+    """fp16-cached teacher log-probs can sum to >= 1 over the K: the floored, renormalised rest bin keeps it finite."""
+    torch.manual_seed(11)
+    t = torch.full((4, 30), -30.0)
+    t[:, :4] = torch.randn(4, 4)
+    vals, ids = F.log_softmax(t, -1).topk(4, dim=-1)
+    vals = (vals + 1e-3).half()  # K mass now slightly over 1: rest = 1 - sum < 0 before the floor
+    s = torch.randn(4, 30, requires_grad=True)  # a student with real mass outside the K
+    loss = rkl_topk_rest(s, ids, vals)
+    loss.sum().backward()
+    assert torch.isfinite(loss).all() and (loss >= -1e-5).all() and torch.isfinite(s.grad).all()
+
+
+def test_rkl_topk_rest_keeps_its_gradient_when_the_student_misses_every_topk_id():
+    s = torch.zeros(2, 64)
+    s[:, 32:] = 30.0  # all student mass outside the teacher's K
+    s.requires_grad_()
+    vals, ids = F.log_softmax(torch.randn(2, 64), -1)[:, :32].topk(8, dim=-1)
+    rkl_topk_rest(s, ids, vals).sum().backward()
+    g = s.grad[:, :32].gather(-1, ids)
+    assert torch.isfinite(s.grad).all() and (g < 0).all()  # descent raises the student on the teacher's ids
