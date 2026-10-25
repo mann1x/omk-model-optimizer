@@ -59,8 +59,10 @@ import numpy as np
 
 IGNORE, TEACHER, ANCHOR, LOOP = 0, 1, 2, 3
 PRIORITY = np.array([0, 2, 1, 3])  # a token spanning several roles takes the highest: loop > teacher > anchor
-CODE_ARGS = ("content", "new_string", "old_string", "new_str", "old_str", "code", "patch", "diff", "file_text",
-             "replace", "search", "text")
+# "new_text"/"old_text": the Cerebriline SDK's editor (the automaticum pool, bm-889) -- 690k of the pool's code
+# chars; without them the pool had 496 anchor tokens. The rest are other harnesses' editors (not verified on data).
+CODE_ARGS = ("content", "new_text", "old_text", "new_string", "old_string", "new_str", "old_str", "code", "patch",
+             "diff", "file_text", "replace", "search", "text")
 THOUGHT_OPEN, THOUGHT_CLOSE = "<|channel>thought\n", "<channel|>"  # Gemma-4 thinking channel
 FENCE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 
@@ -70,10 +72,17 @@ class NotPrefixError(ValueError):
 
 
 def _norm(messages: list[dict]) -> list[dict]:
-    """Tool-call arguments as dicts (the template renders dicts; OpenAI wire form carries JSON strings)."""
+    """Tool-call arguments as dicts (the template renders dicts; OpenAI wire form carries JSON strings).
+
+    Content given as text parts becomes one string joined by newlines, as llama-server joins them before its template;
+    the HF template concatenates parts with nothing between (54 server_mismatch refusals in the bm-889 pool).
+    """
     out = []
     for m in messages:
         m = dict(m)
+        c = m.get("content")
+        if isinstance(c, list) and c and all(isinstance(p, dict) and p.get("type") == "text" for p in c):
+            m["content"] = "\n".join(p.get("text") or "" for p in c)
         if m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:

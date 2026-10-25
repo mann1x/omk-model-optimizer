@@ -74,6 +74,28 @@ def test_segments_split_at_later_user_messages():
     assert segment_ends(_norm(CONV[:5])) == [5]
 
 
+def test_text_parts_join_with_a_newline_like_the_server():
+    from omk_qad.rollouts import _norm
+
+    m = {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+    assert _norm([m])[0]["content"] == "a\nb"
+    img = {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "image_url", "image_url": {}}]}
+    assert _norm([img])[0]["content"] == img["content"]  # not text-only: left to the template
+
+
+def test_sdk_editor_new_text_is_anchored(tok):
+    from omk_qad.rollouts import _norm
+
+    tools = [{"type": "function", "function": {"name": "editor", "description": "Edit a file", "parameters": {
+        "type": "object", "properties": {"file_path": {"type": "string"}, "new_text": {"type": "string"}},
+        "required": ["file_path", "new_text"]}}}]
+    conv = [CONV[0], CONV[1], {"role": "assistant", "reasoning_content": "Edit it.", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {
+            "name": "editor", "arguments": json.dumps({"file_path": "game.js", "new_text": CODE})}}]}]
+    text, roles = render_segment(tok, _norm(conv), tools, 3)
+    assert CODE in "".join(s for r, s in _spans(tok, text, roles) if r == ANCHOR)
+
+
 def test_roles_of_a_gemma4_agentic_turn(tok):
     from omk_qad.rollouts import _norm
 
