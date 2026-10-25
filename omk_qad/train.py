@@ -1115,8 +1115,11 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 raise SystemExit(f"stage 2 needs a finished stage 1: {src} not found")
             load_state(src, latents, student, None, weights_only=True)
             origin["init_from"] = src
-        elif bf16 and not same_model(meta["args"]["model"], a.model):  # another teacher: KL is the gap, not ~0
-            say(f"LOSSLESS_GATE skipped: cache teacher {meta['args']['model']} is not the student {a.model}")
+        elif bf16 and (meta["args"].get("teacher_gguf") or not same_model(meta["args"]["model"], a.model)):
+            # another teacher: KL is the gap, not ~0. With --teacher-gguf the cache's --model only gave the tokenizer
+            # (bm-889: the 31B GGUF cache carries the 26B student's dir there and would have failed the gate)
+            teacher = meta["args"].get("teacher_gguf") or meta["args"]["model"]
+            say(f"LOSSLESS_GATE skipped: cache teacher {teacher} is not the student {a.model}")
         else:  # lossless gate: with the quantizer bypassed the student must BE the teacher
             ctl.bypass = True
             g = evaluate(student, head, ev, a, "lossless")

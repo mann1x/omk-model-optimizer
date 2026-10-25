@@ -140,6 +140,21 @@ def test_bf16_lossless_gate_when_the_teacher_is_the_student(g4):
     assert "LOSSLESS_GATE klk=" in log or "RESUME" in log, log[-3000:]
 
 
+def test_bf16_gguf_teacher_cache_skips_the_lossless_gate(g4, tmp_path):
+    """A --teacher-gguf cache names the student's dir as --model (tokenizer only): the gate must not run on it."""
+    import shutil
+
+    c = tmp_path / "cache_gguf"
+    shutil.copytree(g4["cache_self"], c)
+    meta = json.loads((c / "cache.json").read_text())
+    meta["args"]["teacher_gguf"] = "/models/another-teacher.gguf"
+    (c / "cache.json").write_text(json.dumps(meta))
+    proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(c),
+                "--out", str(tmp_path / "run"), "--steps", "1", "--eval-every", "1")
+    log = proc.stdout + proc.stderr
+    assert "LOSSLESS_GATE skipped: cache teacher /models/another-teacher.gguf" in log, log[-3000:]
+
+
 def test_bf16_export_replaces_only_trained_tensors(g4):
     from safetensors import safe_open
 
