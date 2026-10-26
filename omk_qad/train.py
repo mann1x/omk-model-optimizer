@@ -355,7 +355,7 @@ def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
             a.imatrix_seqs = 0
         tok = AutoTokenizer.from_pretrained(a.model)
         gguf = GGUFTeacher(a.teacher_gguf, a.seq, a.topk, len(tok), a.teacher_gguf_bin, a.teacher_ngl,
-                           a.teacher_ubatch, log=say)
+                           a.teacher_ubatch, log=say, device=a.device)
         import atexit
 
         atexit.register(gguf.close)  # the llama_topk child never outlives a failed or drained cache pass
@@ -615,7 +615,7 @@ def _eval_teacher(a):
 
         tok = AutoTokenizer.from_pretrained(a.model)
         g = GGUFTeacher(a.teacher_gguf, a.seq, a.topk, len(tok), a.teacher_gguf_bin, a.teacher_ngl, a.teacher_ubatch,
-                        log=say)
+                        log=say, device=a.device)
         return g, g.close, True
     teacher, _ = load_text_causal_lm(a.model, a.device, torch.float32 if a.device == "cpu" else torch.bfloat16)
     teacher.requires_grad_(False)

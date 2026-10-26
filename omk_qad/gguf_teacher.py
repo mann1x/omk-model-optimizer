@@ -13,6 +13,7 @@ Build against a CUDA build of llama.cpp (``LLAMA`` = its source tree, built in `
 """
 
 import ctypes
+import os
 import signal
 import subprocess
 import threading
@@ -36,12 +37,31 @@ def _die_with_parent() -> None:
         _PRCTL(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
 
 
+def _pinned_env(device: str) -> dict:
+    """The child's environment with CUDA_VISIBLE_DEVICES narrowed to ``device`` (``cuda:N``).
+
+    N counts within the parent's own CUDA_VISIBLE_DEVICES, as torch counts it; any other device leaves it as it is.
+    """
+    env = dict(os.environ)
+    if not device.startswith("cuda"):
+        return env
+    n = int(device.partition(":")[2] or 0)
+    seen = [d for d in env.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip()]
+    if seen and n >= len(seen):
+        raise SystemExit(f"--device {device}: only {len(seen)} visible GPU(s) (CUDA_VISIBLE_DEVICES={seen})")
+    env["CUDA_VISIBLE_DEVICES"] = seen[n].strip() if seen else str(n)
+    return env
+
+
 class GGUFTeacher:
     """``teacher(x, want) -> (idx int32 [B, S-1, K], val fp16 [B, S-1, K], nll of the wanted positions)``."""
 
     def __init__(self, gguf: str, n_ctx: int, topk: int, n_vocab: int, binary: str = "", ngl: int = 999,
-                 ubatch: int = 512, threads: int = 16, log=print, seq_timeout: float = 1800.0):
+                 ubatch: int = 512, threads: int = 16, log=print, seq_timeout: float = 1800.0, device: str = ""):
         """Start ``llama_topk`` on ``gguf`` and wait for its ready line (vocabulary checked).
+
+        ``device`` (``cuda:N``) pins the child to that one GPU: llama.cpp with ``--ngl`` otherwise splits the model
+        over every visible GPU, onto cards other jobs hold.
 
         The child runs in its own session (a terminal Ctrl-C / group SIGTERM reaches only the parent, which drains at
         a shard boundary) and dies with the parent; one sequence taking over ``seq_timeout`` s kills it (a hang is a
@@ -54,7 +74,7 @@ class GGUFTeacher:
         self.p = subprocess.Popen([str(exe), "--model", gguf, "--ctx", str(n_ctx), "--topk", str(topk),
                                    "--ngl", str(ngl), "--ubatch", str(ubatch), "--threads", str(threads)],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  start_new_session=True, preexec_fn=_die_with_parent)
+                                  start_new_session=True, preexec_fn=_die_with_parent, env=_pinned_env(device))
         for ln in self.p.stderr:  # the load log, up to the ready line
             s = ln.decode(errors="replace").rstrip()
             if s.startswith("LLAMA_TOPK_READY"):

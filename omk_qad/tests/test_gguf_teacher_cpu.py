@@ -23,6 +23,8 @@ FAKE = textwrap.dedent("""\
     mode, k = os.environ["FAKE_MODE"], int(sys.argv[sys.argv.index("--topk") + 1])
     if mode == "deaf":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if os.environ.get("FAKE_ENV_OUT"):
+        open(os.environ["FAKE_ENV_OUT"], "w").write(os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"))
     sys.stderr.write("loading\\nLLAMA_TOPK_READY n_vocab=10\\n"); sys.stderr.flush()
     inp, out = sys.stdin.buffer, sys.stdout.buffer
     while True:
@@ -111,3 +113,25 @@ def test_child_dies_with_a_hard_killed_parent(tmp_path):
             break
         time.sleep(0.1)
     assert not _alive(child), f"llama_topk {child} outlived its parent"
+
+
+@pytest.mark.parametrize(("parent", "device", "child"), [
+    (None, "cuda:0", "0"), (None, "cuda:1", "1"), ("2,3", "cuda:1", "3"), ("0", "cuda", "0"), (None, "cpu", "<unset>"),
+    ("1", "", "1")])
+def test_the_child_sees_only_the_device_it_was_given(tmp_path, monkeypatch, parent, device, child):
+    """llama.cpp splits --ngl over every visible GPU (bm-889: a 31B teacher spilled onto a GPU another job held)."""
+    monkeypatch.setenv("FAKE_MODE", "ok")
+    monkeypatch.setenv("FAKE_ENV_OUT", str(tmp_path / "env"))
+    if parent is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", parent)
+    t = GGUFTeacher("m.gguf", 16, 4, 10, binary=str(_fake(tmp_path)), log=lambda *_: None, device=device)
+    t.close()
+    assert (tmp_path / "env").read_text() == child
+
+
+def test_a_device_past_the_visible_gpus_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    with pytest.raises(SystemExit, match="only 1 visible"):
+        GGUFTeacher("m.gguf", 16, 4, 10, binary=str(_fake(tmp_path)), log=lambda *_: None, device="cuda:1")
