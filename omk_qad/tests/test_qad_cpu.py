@@ -533,6 +533,63 @@ def test_numbered_snapshots_keep_the_newest_by_default(setup, monkeypatch):
     assert snap["step"] == 3
 
 
+def test_accum_of_two_half_batches_is_the_whole_batch_update(setup):
+    """bm-889: --accum 2 at --bs 1 sums the two micro-batch gradients into the one update of --bs 2.
+
+    fp32 latents: no stochastic rounding, so the two runs differ only by the summation order of the gradients
+    (~1e-6 against updates of ~1e-2). One step only: on this fake-quantized student a 1e-6 difference can move a
+    weight across an IQ2 grid boundary, and the next step's gradients then diverge for reasons unrelated to --accum.
+    """
+    import shutil
+
+    model, lay = setup["moe"]
+    outs = {}
+    for name, extra in (("whole", ("--bs", "2")), ("halves", ("--bs", "1", "--accum", "2"))):
+        out = WORK / f"run_accum_{name}"
+        if out.exists():
+            shutil.rmtree(out)  # test scratch of this test only
+        p = _train(model, lay, setup["cache"], out, "--steps", "1", "--eval-every", "1", "--latent-dtype", "fp32",
+                   *extra)
+        outs[name] = torch.load(out / "stage1" / "final.pt", weights_only=False)
+    assert "OPTIM accum 2 x bs 1 = 2 rows/update" in p.stdout + p.stderr
+    w, h = outs["whole"], outs["halves"]
+    assert w["step"] == h["step"] == 1
+    for n in w["latents"]:
+        assert torch.allclose(w["latents"][n], h["latents"][n], rtol=0, atol=2e-5), n
+    moved = [n for n in w["latents"] if w["adafactor"][n][2].sum() > 0]
+    assert moved and all(torch.equal(w["adafactor"][n][2], h["adafactor"][n][2]) for n in w["latents"])  # updates
+
+
+def test_momentum_with_accum_is_checkpointed_and_resumes_bitwise(setup):
+    """bm-889: --beta1 keeps a momentum per latent; it is saved, it changes the run, and a resume continues it."""
+    import shutil
+
+    model, lay = setup["moe"]
+    mom = ("--bs", "1", "--accum", "2", "--beta1", "0.9")
+    runs = {}
+    for name in ("straight", "paused", "nomom"):
+        d = WORK / f"run_mom_{name}"
+        if d.exists():
+            shutil.rmtree(d)  # test scratch of this test only
+        runs[name] = d
+    _train(model, lay, setup["cache"], runs["straight"], *mom)
+    (runs["paused"] / "stage1").mkdir(parents=True)
+    (runs["paused"] / "stage1" / "PAUSE").touch()
+    p = _train(model, lay, setup["cache"], runs["paused"], *mom)
+    assert "PAUSED at step 1" in p.stdout + p.stderr
+    p = _train(model, lay, setup["cache"], runs["paused"], *mom)
+    assert "RESUME from step 1" in p.stdout + p.stderr
+    _train(model, lay, setup["cache"], runs["nomom"], "--bs", "1", "--accum", "2")
+    fa, fb, fn = (torch.load(runs[k] / "stage1" / "final.pt", weights_only=False) for k in ("straight", "paused",
+                                                                                            "nomom"))
+    assert all(len(st) == 4 for st in fa["adafactor"].values())  # (r, c, t, momentum)
+    assert all(len(st) == 3 for st in fn["adafactor"].values())  # momentum-free: the old state, nothing more
+    for n in fa["latents"]:
+        assert torch.equal(fa["latents"][n], fb["latents"][n]), n
+        assert torch.equal(fa["adafactor"][n][3], fb["adafactor"][n][3]), n
+    assert any(not torch.equal(fa["latents"][n], fn["latents"][n]) for n in fa["latents"])
+
+
 def test_prune_snapshots_orders_by_step_and_zero_keeps_all(tmp_path):
     from omk_qad import train as T
 

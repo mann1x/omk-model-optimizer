@@ -903,8 +903,11 @@ def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
     return per
 
 
-def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None, aidx=None, aval=None) -> float:
-    """One update: body forward, head + loss per chunk, head gradient, body backward (latents update inside).
+def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None, aidx=None, aval=None,
+               apply: bool = True) -> float:
+    """One micro-batch (an update when ``apply``): body forward, head + loss per chunk, head gradient, backward.
+
+    The latents update inside backward (accumulating instead while ``apply`` is False).
 
     With ``role`` (role data, omk_qad.rollouts) only scored positions count: teacher / anchor / loop losses per
     the target token's role, normalised by the number of scored positions.
@@ -964,7 +967,11 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     h.backward(hd.grad)
     for lat in latents.values():
         lat.flush()
-    if fp_params and opt is not None:  # opt None: gradients are left in .grad (gradient checks)
+    if fp_params and opt is not None and apply:  # opt None: gradients are left in .grad (gradient checks)
+        if getattr(a, "accum", 1) > 1:  # .grad summed over the micro-batches: their mean, as the latents get
+            for p in fp_params:
+                if p.grad is not None:
+                    p.grad.div_(a.accum)
         torch.nn.utils.clip_grad_norm_(fp_params, 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
@@ -1050,6 +1057,9 @@ def prune_snapshots(run: Path, keep: int) -> list[Path]:
     return old
 
 
+STATE_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
+
+
 # Settings that do not change what a run computes: they may differ between the segments of one run.
 RUNTIME_ARGS = {"phase", "device", "stop_at", "log_every", "eval_every", "save_every", "save_minutes", "snapshot_every",
                 "snapshot_keep", "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change",
@@ -1087,6 +1097,9 @@ def train_identity(a) -> dict:
         del ident["data_order"]
     if not ident.get("sft_data"):  # likewise every run before --sft-data
         ident.pop("sft_data", None)
+    if ident.get("accum") == 1 and not ident.get("beta1"):  # likewise every run before --accum/--beta1
+        for k in ("accum", "beta1", "state_dtype"):
+            ident.pop(k, None)
     ident["id_model"] = _model_id(a.model)
     cmeta = json.loads((Path(a.cache) / "cache.json").read_text())
     ident["id_cache"] = ({k: cmeta.get(k) for k in ("identity", "n_seq", "anchor_model")} if "identity" in cmeta
@@ -1352,10 +1365,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     sft = sft_files(a)
     if sft:
         rows = SftRows(sft, meta["seq"], a.data_order, a.seed)
-        if len(rows) < last * a.bs:
-            raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs}")
-    elif meta["n_seq"] < last * a.bs:
-        raise SystemExit(f"cache holds {meta['n_seq']} sequences, the run needs {last * a.bs}")
+        if len(rows) < last * a.bs * a.accum:
+            raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs * a.accum}")
+    elif meta["n_seq"] < last * a.bs * a.accum:
+        raise SystemExit(f"cache holds {meta['n_seq']} sequences, the run needs {last * a.bs * a.accum}")
     if not sft and sh % a.bs:
         raise SystemExit("--bs must divide the cache shard size")
     final = run / "final.pt"
@@ -1386,6 +1399,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         layout = torch.load(a.layout, weights_only=False)
         student, latents, fp_params, ctl, head_name = build_student(a, layout)
         head = latents[head_name]
+    ctl.accum, ctl.beta1, ctl.state_dtype = a.accum, a.beta1, STATE_DTYPES[a.state_dtype]
+    if a.accum > 1 or a.beta1:
+        say(f"OPTIM accum {a.accum} x bs {a.bs} = {a.accum * a.bs} rows/update, beta1 {a.beta1}, "
+            f"state {a.state_dtype}")
     allow = parse_allow(a.allow_change)
     opt = torch.optim.AdamW(fp_params, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0) if fp_params else None
     last_ck = run / "last.pt"
@@ -1463,11 +1480,15 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         if opt is not None:
             for gq in opt.param_groups:
                 gq["lr"] = a.fp_lr * ctl.lr / a.lr
-        b = rows.batch((step - 1) * a.bs, a.bs)
-        x = b["x"].long().to(a.device)
-        idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
-        roles = {k: None if b[k] is None else b[k].to(a.device) for k in ("role", "aidx", "aval")}
-        loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles)
+        loss = 0.0
+        for k in range(a.accum):  # one update = accum micro-batches of bs rows; latents apply on the last
+            ctl.apply = k == a.accum - 1
+            b = rows.batch(((step - 1) * a.accum + k) * a.bs, a.bs)
+            x = b["x"].long().to(a.device)
+            idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
+            roles = {r: None if b[r] is None else b[r].to(a.device) for r in ("role", "aidx", "aval")}
+            loss += train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles,
+                               apply=ctl.apply) / a.accum
         rolled = guard.observe(step, loss)
         row = {"train/loss": loss, "train/lr": ctl.lr, **({"train/guard_rollback": 1} if rolled else {})}
         if step % a.log_every == 0 or step <= 3:
@@ -1617,6 +1638,11 @@ def main(argv=None) -> None:
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--fp-lr", type=float, default=1e-5)
     ap.add_argument("--beta2", type=float, default=0.999)
+    ap.add_argument("--beta1", type=float, default=0.0,
+                    help="momentum of the normalised Adafactor update (0 = momentum-free, as before; e.g. 0.9)")
+    ap.add_argument("--accum", type=int, default=1, help="micro-batches of --bs rows per update (gradient sum)")
+    ap.add_argument("--state-dtype", default="fp32", choices=sorted(STATE_DTYPES),
+                    help="storage of the --accum gradient sum and the --beta1 momentum")
     ap.add_argument("--clip", type=float, default=1.0, help="max RMS of one tensor's (expert's) normalized update")
     ap.add_argument("--loss", choices=sorted([*DISTILL, "ce"]), default="jaccard",
                     help="distillation loss over the teacher top-K + rest: jaccard | kl = KL(t||s) | rkl = KL(s||t); "

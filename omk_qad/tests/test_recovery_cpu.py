@@ -132,6 +132,38 @@ def test_bf16_mode_trains_only_the_scope_and_descends(g4):
     assert len(moved) == len(ck["latents"])
 
 
+@pytest.mark.parametrize(("name", "extra"), [
+    ("moe_scope", ("--train-scope", "classes:attention,dense_mlp,router,routed_experts", "--steps", "8",
+                   "--eval-every", "8")),
+    ("accum_momentum", ("--accum", "2", "--beta1", "0.9", "--steps", "4", "--eval-every", "4")),
+])
+def test_bf16_trial_configs_train_and_descend(g4, name, extra):
+    """bm-889 trials: the MoE scope (router + routed experts too) and --accum/--beta1 train every latent and descend."""
+    import shutil
+
+    from omk_qad.ptq import load_text_causal_lm
+    from omk_qad.recovery import scope_params
+
+    out = WORK / f"run_trial_{name}"
+    if out.exists():
+        shutil.rmtree(out)  # test scratch of this test only
+    proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+                "--out", str(out), "--save-every", "100", *extra)
+    ck = _ckpt(out)
+    m, _ = load_text_causal_lm(str(g4["student"]), "cpu", torch.float32)
+    scope = extra[1] if extra[0] == "--train-scope" else "gemma4"
+    assert set(ck["latents"]) == set(scope_params(m, scope))
+    if name == "moe_scope":
+        assert any(".router." in n for n in ck["latents"]) and any(".experts." in n for n in ck["latents"])
+    else:
+        assert "OPTIM accum 2 x bs 2 = 4 rows/update, beta1 0.9" in proc.stdout + proc.stderr
+        assert all(len(st) == 4 for st in ck["adafactor"].values())
+    base = dict(m.named_parameters())
+    assert all(not torch.equal(t, base[n].bfloat16()) for n, t in ck["latents"].items())
+    res = ck["results"]
+    assert res[-1]["klk"] < res[0]["klk"], [r["klk"] for r in res]
+
+
 def test_bf16_lossless_gate_when_the_teacher_is_the_student(g4):
     out = WORK / "run_self"
     proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_self"]),

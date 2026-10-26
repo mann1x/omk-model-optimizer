@@ -183,6 +183,10 @@ class Control:
     ggml_refresh: int = 1  # re-encode libggml segments every N steps (1 = every change)
     refresh: int = 1  # re-encode ModelOpt segments (IQ1/IQ2/Q8_0) every N steps (1 = every change)
     hadamard_block: int | None = None  # the model's one Hadamard block (layout["hadamard_block"]) for ternary latents
+    accum: int = 1  # micro-batches per update: their gradients sum in Latent.gacc, one update on the last
+    apply: bool = True  # this micro-batch ends an update (False: gradients only accumulate)
+    beta1: float = 0.0  # Adafactor momentum on the normalised, clipped update (0 = momentum-free)
+    state_dtype: torch.dtype = torch.float32  # storage of the accumulation buffer and the momentum
     dummy: torch.Tensor = field(default_factory=lambda: torch.zeros((), requires_grad=True))
     stats: dict = field(default_factory=lambda: {"encodes": 0, "updates": 0, "undelivered": 0})
 
@@ -213,6 +217,8 @@ class Latent:
         self.uses = 0
         self.version = 0  # bumped by every write; param._version cannot be used: updates go through .data
         self.gbuf: torch.Tensor | None = None
+        self.gacc: torch.Tensor | None = None  # gradient sum over the micro-batches of one update (accum > 1)
+        self.m: torch.Tensor | None = None  # momentum of the update (beta1 > 0), created at the first update
         self._cache: dict[int, tuple] = {}  # chunk id -> (latent version, step encoded, payload)
         self.msq: torch.Tensor | None = None  # imatrix E[x^2] per expert [E, C] (set_imatrix)
         self._imp: dict = {}
@@ -398,17 +404,51 @@ class Latent:
         self.uses -= 1
         if self.uses <= 0:
             self.uses = 0
-            self.update(self.gbuf)
+            self._deliver(self.gbuf)
             self.gbuf = None
 
     def flush(self) -> None:
-        """End of step: apply a partially delivered gradient (a use whose output never reached the loss)."""
+        """End of micro-batch: deliver what is pending, and apply an accumulated update on its last micro-batch.
+
+        A partially delivered gradient is a use whose output never reached the loss.
+        """
         if self.uses:
             self.ctl.stats["undelivered"] += self.uses
             self.uses = 0
         if self.gbuf is not None:
-            self.update(self.gbuf)
+            self._deliver(self.gbuf)
             self.gbuf = None
+        if self.ctl.apply and self.gacc is not None:
+            g = self.gacc.float().div_(self.ctl.accum)
+            self.gacc = None
+            self.update(g)
+
+    def _deliver(self, g: torch.Tensor) -> None:
+        """A finished gradient of this micro-batch: update at once (accum 1), else add it to the sum."""
+        if self.ctl.accum <= 1:
+            self.update(g)
+        elif self.gacc is None:
+            self.gacc = g.to(self.ctl.state_dtype)
+        else:
+            self.gacc.add_(g)
+
+    def _momentum(self, u: torch.Tensor, rows: tuple, active: torch.Tensor | None = None) -> torch.Tensor:
+        """``u`` through the momentum EMA (beta1 > 0) at ``rows`` of the [B, R/B, C] view.
+
+        Inactive experts keep their momentum and do not move.
+        """
+        ctl = self.ctl
+        if not ctl.beta1:
+            return u
+        if self.m is None:
+            self.m = torch.zeros(self.shape, dtype=ctl.state_dtype, device=self.param.device)
+        b = self.r.shape[0]
+        m = self.m.view(b, self.rows // b, self.cols)[rows]
+        mu = ctl.beta1 * m.float() + (1 - ctl.beta1) * u
+        if active is not None:
+            mu = torch.where(active[:, None, None], mu, m.float())
+        m.copy_(sr_cast(mu, m.dtype))
+        return mu
 
     @torch.no_grad()
     def update(self, grad: torch.Tensor) -> None:
@@ -442,6 +482,7 @@ class Latent:
             u = g / v.sqrt().clamp(min=1e-15)
             rms = u.square().mean((1, 2)).sqrt()
             u /= (rms / ctl.clip).clamp(min=1.0)[:, None, None]
+            u = self._momentum(u, (sl,), active)
             new = lat3[sl].float() - ctl.lr * u * a[:, None, None]
             lat3[sl] = sr_cast(new, self.param.dtype)
         self.version += 1
@@ -480,7 +521,8 @@ class Latent:
             sq += u_of(r0, r1).square().sum()
         scale = ((sq / g.numel()).sqrt() / ctl.clip).clamp(min=1.0)
         for r0, r1 in spans:
-            lat[r0:r1] = sr_cast(lat[r0:r1].float() - ctl.lr * u_of(r0, r1) / scale, self.param.dtype)
+            u = self._momentum((u_of(r0, r1) / scale)[None], (slice(e, e + 1), slice(r0, r1)))[0]
+            lat[r0:r1] = sr_cast(lat[r0:r1].float() - ctl.lr * u, self.param.dtype)
 
 
 class _Served(torch.autograd.Function):
@@ -566,16 +608,19 @@ def install(model: nn.Module, latents: dict[str, Latent], skip: set[str] = froze
 
 def adafactor_state(latents: dict[str, Latent]) -> dict:
     """Optimizer state of every latent (CPU), for checkpoints."""
-    return {n: (lat.r.cpu(), lat.c.cpu(), lat.t.cpu()) for n, lat in latents.items()}
+    return {n: (lat.r.cpu(), lat.c.cpu(), lat.t.cpu()) + (() if lat.m is None else (lat.m.cpu(),))
+            for n, lat in latents.items()}
 
 
 def load_adafactor_state(latents: dict[str, Latent], state: dict) -> None:
     """Inverse of :func:`adafactor_state`."""
-    for n, (r, c, t) in state.items():
+    for n, (r, c, t, *m) in state.items():
         lat = latents[n]
         lat.r.copy_(r)
         lat.c.copy_(c)
         lat.t.copy_(t)
+        if m:
+            lat.m = m[0].to(lat.param.device)
 
 
 def cosine_lr(step: int, total: int, lr: float, min_lr: float, warmup: int) -> float:
