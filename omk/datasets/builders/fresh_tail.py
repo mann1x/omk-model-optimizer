@@ -37,15 +37,58 @@ def rows(path: Path):
         raise SystemExit(f"{path}: only .jsonl / .parquet have a remainder (a .txt is one document)")
 
 
+def rowmap(fresh: Path, parquet: Path, out: Path) -> None:
+    """Map every row of a fresh tail written from a parquet source back to that file (repo, sha, row index, id).
+
+    ``main`` writes the documents right after the ``docs_skipped`` it passed, in file order, so fresh row i is
+    parquet row ``docs_skipped + i``; each is checked by its text (FineWeb repeats some texts verbatim, so a text
+    match alone is ambiguous). The parquet's SOURCE.json (stage_assets) gives the upstream repo and revision.
+    """
+    import pyarrow.parquet as pq
+
+    src = json.loads((parquet.parent / "SOURCE.json").read_text())
+    path = next(f for f in src["files"] if f.replace("/", "_") == parquet.name)
+    man = json.loads((fresh.parent / "manifest.json").read_text())["sources"]
+    rec = next(v for k, v in man.items() if v["file"] == fresh.name and k.endswith(parquet.name))
+    with fresh.open() as f:
+        texts = [json.loads(x)["text"] for x in f if x.strip()]
+    pf = pq.ParquetFile(parquet)
+    cols = [c for c in ("text", "id") if c in pf.schema_arrow.names]
+    first, rows, r = rec["docs_skipped"], [], 0
+    for b in pf.iter_batches(batch_size=4096, columns=cols):
+        for row in b.to_pylist():
+            i = r - first
+            if 0 <= i < len(texts):
+                if row["text"] != texts[i]:
+                    raise SystemExit(f"{fresh}: row {i} is not parquet row {r} (docs_skipped {first})")
+                rows.append({"row": r, "upstream_id": row.get("id")})
+            r += 1
+        if r >= first + len(texts):
+            break
+    if len(rows) != len(texts):
+        raise SystemExit(f"{fresh}: {len(texts)} rows, {parquet} holds only {len(rows)} after row {first}")
+    url = f"https://huggingface.co/datasets/{src['repo']}/resolve/{src['sha']}/{path}"
+    out.write_text("".join(json.dumps({"id": f"{fresh.name}/{i}", "repo": src["repo"], "rev": src["sha"], "path": path,
+                                       **q, "url": url}) + "\n" for i, q in enumerate(rows)))
+    print(f"ROWMAP_DONE {out}: {len(rows)} rows, sha256 {hashlib.sha256(out.read_bytes()).hexdigest()}", flush=True)
+
+
 def main():
-    """Write each requested source's unread remainder and its manifest."""
+    """Write each requested source's unread remainder and its manifest (or, with --rowmap, map one back)."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cache", type=Path, required=True, help="the earlier omk_qad cache dir (its cache.json)")
-    ap.add_argument("--tokenizer", required=True)
-    ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--take", required=True, help="comma list of source-suffix=tokens")
+    ap.add_argument("--rowmap", nargs=3, metavar=("FRESH", "PARQUET", "OUT"),
+                    help="map the rows of FRESH (a tail of PARQUET) to their parquet rows and write OUT; nothing else")
+    ap.add_argument("--cache", type=Path, help="the earlier omk_qad cache dir (its cache.json)")
+    ap.add_argument("--tokenizer")
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--take", help="comma list of source-suffix=tokens")
     ap.add_argument("--margin", type=float, default=1.05, help="write budget * margin tokens (packer never restarts)")
     a = ap.parse_args()
+    if a.rowmap:
+        rowmap(*(Path(x) for x in a.rowmap))
+        return
+    if not (a.cache and a.tokenizer and a.out and a.take):
+        ap.error("--cache, --tokenizer, --out and --take are required (unless --rowmap)")
     from transformers import AutoTokenizer
 
     from omk_qad.train import _texts

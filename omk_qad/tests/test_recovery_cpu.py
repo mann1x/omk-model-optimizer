@@ -365,3 +365,30 @@ def test_an_eval_set_scores_only_the_teacher_scored_positions(g4, roles_cache, h
         assert {k: off[k] for k in ("klk", "rkl", "jaccard", "top1")} == {k: held[k] for k in ("klk", "rkl",
                                                                                                 "jaccard", "top1")}
         assert on["klk"] != held["klk"]
+
+
+def test_sft_trains_on_role_windows_with_no_teacher_targets(g4, roles_cache):
+    """--loss ce: rows come from --sft-data (role windows), CE on their scored positions; the cache only evaluates."""
+    rfile = WORK / "conv.roles.jsonl"
+    n = json.loads(rfile.with_suffix(".stats.json").read_text())["windows"]
+    steps = max(1, n // 2)
+    out = WORK / "run_sft"
+    sft = ("--loss", "ce", "--sft-data", str(rfile), "--mtp", "freeze")
+    proc = _run("omk_qad.train", *TRAIN, *sft, "--model", str(g4["student"]), "--cache", str(roles_cache),
+                "--out", str(out), "--steps", str(steps), "--eval-every", str(steps), check=False)
+    log = proc.stdout + proc.stderr
+    assert proc.returncode == 0 or "is finished and immutable" in log, log[-3000:]
+    text = (out / "stage1" / "log.txt").read_text()
+    assert f"DATA sft {n} rows, order shuffle" in text
+    ck = _ckpt(out)
+    assert ck["step"] == steps and all(torch.isfinite(t.float()).all() for t in ck["latents"].values())
+    losses = [float(ln.split("loss=")[1].split()[0]) for ln in text.splitlines() if ln.startswith("step ")]
+    assert losses and all(0 < q < 50 for q in losses), losses
+    base = ("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(roles_cache), "--steps", "1")
+    for extra, why in ((("--sft-data", str(rfile)), "--loss ce trains on --sft-data"),  # kl + sft data
+                       (("--loss", "ce", "--mtp", "freeze"), "--loss ce trains on --sft-data"),
+                       ((*sft, "--ce-weight", "1"), "count it twice"),
+                       (("--loss", "ce", "--sft-data", str(rfile)), "--mtp freeze"),
+                       ((*sft, "--steps", str(n)), f"--sft-data holds {n} rows")):
+        bad = _run(*base, *extra, "--out", str(WORK / "run_sft_refused"), check=False)
+        assert bad.returncode != 0 and why in bad.stdout + bad.stderr, (extra, (bad.stdout + bad.stderr)[-800:])

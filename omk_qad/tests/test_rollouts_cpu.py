@@ -285,3 +285,73 @@ def test_pack_shares_windows_and_keeps_roles():
     (name, ids, r), = p.flush()
     assert name == "c" and ids[:4] == [8, 9, 10, 11] and len(ids) == 10 and r[4:].tolist() == [0] * 6
     assert p.flush() == []
+
+
+def test_conversations_pack_like_captures(tok):
+    """--in --pack: short segments share a window with every role kept; the unpacked build scores the same tokens."""
+    rows = [{"id": i, "messages": CONV, "tools": TOOLS} for i in "ab"]
+    one, st1 = build(tok, rows, seq=4096, stride=2048)
+    packed, st2 = build(tok, rows, seq=4096, stride=2048, pack=True)
+    assert len(one) == st1["segments"] and len(packed) == 1 and st2["segments"] == st1["segments"]
+    assert st2["tokens_by_role"][1:] == st1["tokens_by_role"][1:]
+    assert packed[0]["id"] == "+".join(w["id"].removesuffix("/w0") for w in one)
+    scored = [t for w in one for t, r in zip(w["ids"], w["role"]) if r]
+    assert [t for t, r in zip(packed[0]["ids"], packed[0]["role"]) if r] == scored
+
+
+def test_max_tokens_cuts_each_segment_and_drops_the_unscored(tok):
+    """--max-tokens: a segment keeps its first N tokens and their roles; one with nothing scored left is dropped."""
+    rows = [{"id": "a", "messages": CONV, "tools": TOOLS}]
+    whole, _ = build(tok, rows, seq=4096, stride=2048)
+    lens = [sum(1 for t in w["ids"] if t != (tok.pad_token_id or 0)) for w in whole]
+    cap = min(lens) - 5
+    cut, st = build(tok, rows, seq=4096, stride=2048, max_tokens=cap)
+    assert st["truncated"] == len(whole) and len(cut) == len(whole) - st["truncated_empty"]
+    for w0 in cut:
+        w = next(x for x in whole if x["id"] == w0["id"])
+        assert w0["ids"][:cap] == w["ids"][:cap] and w0["role"][:cap] == w["role"][:cap]
+        assert all(r == 0 for r in w0["role"][cap:])
+    tiny, st2 = build(tok, rows, seq=4096, stride=2048, max_tokens=3)  # nothing generated fits in 3 tokens
+    assert tiny == [] and st2["truncated_empty"] == st2["truncated"] == st2["segments"]
+
+
+def test_a_tool_call_preamble_moves_into_the_reasoning(tok):
+    """OpenAI-form preamble beside a tool call: refused as given on Gemma-4, rendered thought -> call when moved."""
+    from omk_qad.rollouts import preamble_to_reasoning
+
+    conv = json.loads(json.dumps(CONV))
+    i = next(j for j, m in enumerate(conv) if m["role"] == "assistant" and m.get("tool_calls"))
+    conv[i]["content"] = "I'll look at the file first."
+    rows = [{"id": "p", "messages": conv, "tools": TOOLS}]
+    _, st = build(tok, rows, seq=4096, stride=2048)
+    assert st["refused_not_prefix"] > 0
+    out, st2 = build(tok, rows, seq=4096, stride=2048, tool_preamble="reasoning")
+    assert st2["refused_not_prefix"] == 0 and out
+    moved = preamble_to_reasoning(conv)[i]
+    assert moved["content"] == "" and moved["reasoning_content"].endswith("I'll look at the file first.")
+    text = tok.decode([t for w in out for t in w["ids"]])
+    assert text.index("I'll look at the file first.") < text.index("<|tool_call>", text.index("I'll look"))
+
+
+def test_turns_without_reasoning_after_a_tool_response_are_scored(tok):
+    """Gemma-4 opens the thought after a tool response; a turn with no reasoning closed it at once (not refused)."""
+    conv = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in json.loads(json.dumps(CONV))]
+    assert sum(m["role"] == "tool" for m in conv) and not any(m.get("reasoning_content") for m in conv)
+    out, st = build(tok, [{"id": "n", "messages": conv, "tools": TOOLS}], seq=4096, stride=2048)
+    assert st["refused_not_prefix"] == 0 and st.get("thought_closed", 0) > 0
+    scored = tok.decode([t for w in out for t, r in zip(w["ids"], w["role"]) if r])
+    for m in conv:
+        for c in m.get("tool_calls") or []:
+            assert (c.get("function") or c)["name"] in scored  # every call after a tool response is trained
+
+
+def test_plain_text_rows_score_every_token_after_bos(tok):
+    """A {"text"} row (FineWeb SFT): <bos> + tokens, no template, all but <bos> scored; packs with conversations."""
+    text = "The white-tailed spider is a dark, elongated spider."
+    out, st = build(tok, [{"id": "t", "text": text}, {"id": "a", "messages": CONV, "tools": TOOLS}], seq=4096,
+                    stride=2048, pack=True)
+    assert st["text_rows"] == 1 and len(out) == 1
+    ids, role = out[0]["ids"], out[0]["role"]
+    want = [tok.bos_token_id, *tok(text, add_special_tokens=False).input_ids]
+    assert ids[: len(want)] == want and role[0] == 0 and all(r == 1 for r in role[1 : len(want)])
+    assert "<|turn>" not in tok.decode(ids[: len(want)])

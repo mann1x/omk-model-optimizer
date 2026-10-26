@@ -149,6 +149,170 @@ def render(row, tok, cap: int, drop_system: bool = False):
     return text, len(ids)
 
 
+# ===================================================================================== upstream rows (--fetch-rows)
+# The raw Nemotron files were deleted after the mixes were built (207 GB). A mix manifest still names every row it
+# used as (file index, byte offset) plus the upstream repo sha, so each row can be fetched again by HTTP range at that
+# revision, and proved to be the same row: rendered as build_mix renders it, it must give the mix's own text.
+WINDOWS = ".windows.jsonl"
+
+
+def upstream(f: str) -> tuple[str, str, bool]:
+    """(Nemotron set, file path inside its repo, windowed) of a file name under data/nemotron."""
+    s, _, path = f.partition("/")
+    return s, path.removesuffix(WINDOWS), path.endswith(WINDOWS)
+
+
+def http_range(u: str, start: int, end: int, tries: int = 12) -> bytes:
+    """Bytes [start, end] of ``u`` (inclusive), retried; HTTP 429 waits out HF's rate limit (Retry-After)."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    for t in range(tries):
+        try:
+            req = urllib.request.Request(u, headers={"Range": f"bytes={start}-{end}"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                b = r.read()
+            if r.status != 206 and start > 0:
+                raise OSError(f"range not honoured (HTTP {r.status})")
+            return b
+        except OSError as e:  # noqa: PERF203 (a transient network error is retried)
+            if t == tries - 1:
+                raise
+            wait = 2 + 4 * t
+            if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                wait = max(int(e.headers.get("Retry-After") or 0), 60 * (t + 1))
+            time.sleep(wait)
+    raise AssertionError
+
+
+def line_at(get, off: int, size: int, chunk: int = 1 << 20) -> bytes:
+    """The whole line starting at ``off`` (without its newline); ``get(start, end)`` reads bytes."""
+    buf = b""
+    while True:
+        end = min(size, off + len(buf) + chunk) - 1
+        buf += get(off + len(buf), end)
+        j = buf.find(b"\n")
+        if j >= 0:
+            return buf[:j]
+        if end + 1 >= size:
+            return buf
+        chunk *= 2
+
+
+def window_map(get, size: int, nwin: int, wbytes: int, chunk: int = 1 << 20) -> list[tuple[int, int, int]]:
+    """(local start, upstream start, kept bytes) of each window of omk/datasets/builders/stage_assets.window().
+
+    A window is ``wbytes`` at ``(size - wbytes) * k // (nwin - 1)`` with its partial first and last lines dropped;
+    the .windows.jsonl file is the windows back to back, so a local offset maps into exactly one of them.
+    """
+    out, local = [], 0
+    for k in range(nwin):
+        start = 0 if nwin == 1 else (size - wbytes) * k // (nwin - 1)
+        end = min(size, start + wbytes) - 1
+        first = start
+        if start > 0:  # the partial first line ends at the first newline at or after start
+            first = start + len(line_at(get, start, size, chunk)) + 1
+        last = end + 1
+        if end + 1 < size:  # the partial last line starts after the last newline at or before end
+            c, tail = chunk, b""
+            while b"\n" not in tail:
+                c = min(c * 2, end + 1 - first)
+                tail = get(end + 1 - c, end)
+            last = end + 1 - c + tail.rindex(b"\n") + 1
+        out.append((local, first, last - first))
+        local += last - first
+    return out
+
+
+def to_upstream(wmap: list[tuple[int, int, int]], off: int) -> int:
+    """Upstream byte offset of local offset ``off`` in a .windows.jsonl file."""
+    for local, first, kept in wmap:
+        if local <= off < local + kept:
+            return first + off - local
+    raise ValueError(f"offset {off} is outside every window")
+
+
+def conversation(row: dict, drop_system: bool) -> dict:
+    """The row as omk_qad.rollouts ``--in`` reads it: the messages build_mix rendered, reasoning in its own field."""
+    msgs = norm_messages(row["messages"])
+    if drop_system:
+        msgs = [m for m in msgs if m["role"] != "system"]
+    for m in msgs:
+        c = m.get("content")
+        if m["role"] == "assistant" and isinstance(c, str) and "</think>" in c and not m.get("reasoning_content"):
+            r, _, rest = c.partition("</think>")
+            m["reasoning_content"] = r.split("<think>", 1)[-1].strip()
+            m["content"] = rest.lstrip("\n")
+    return {"messages": msgs, "tools": None if drop_system else tool_defs(row)}
+
+
+def fetch_rows(a, tok) -> None:
+    """Fetch, verify and map every train/eval row of mix ``a.name``; write the row map and conversations."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from stage_assets import HF, WINDOWED, api, url
+
+    mix = a.root / "data" / a.name
+    man = json.loads((mix / "manifest.json").read_text())
+    if Path(man["tokenizer"]).resolve() != Path(a.tokenizer).resolve():
+        raise SystemExit(f"{a.name} was rendered with {man['tokenizer']}, not --tokenizer {a.tokenizer}")
+    sizes, wmaps = {}, {}
+
+    def size_of(s, rev, path):
+        if (s, rev) not in sizes:
+            d = api("datasets", f"nvidia/Nemotron-{s}", rev)
+            sizes[(s, rev)] = {x["rfilename"]: x.get("size") for x in d["siblings"]}
+        return sizes[(s, rev)][path]
+
+    (mix / "rows").mkdir(exist_ok=True)
+    rowmap = []
+    for name, src in man["sources"].items():
+        if a.only != MIX_V1 and name not in a.only.split(","):
+            continue
+        for split in ("eval", "train"):
+            jobs = []
+            for i, (fi, off) in enumerate(src[split]["rows"]):
+                s, path, windowed = upstream(src["files"][fi])
+                rev = src["upstream_sha"][s]
+                u = url("datasets", f"nvidia/Nemotron-{s}", path, rev)
+                size = size_of(s, rev, path)
+                if windowed:
+                    if u not in wmaps:
+                        wmaps[u] = window_map(lambda x, y, u=u: http_range(u, x, y), size, *WINDOWED[s])
+                    off = to_upstream(wmaps[u], off)
+                jobs.append((i, s, rev, path, u, off, size))
+            raw = mix / "rows" / f"{name}.{split}.raw.jsonl"
+            old = raw.read_bytes().split(b"\n")[:-1] if raw.exists() else []
+            if len(old) == len(jobs):  # fetched by an earlier run: proved again below, not fetched again
+                lines = old
+            else:
+                with ThreadPoolExecutor(4) as ex:  # HF rate-limits range reads (429 at 16 in flight)
+                    lines = list(ex.map(lambda j: line_at(lambda x, y, u=j[4]: http_range(u, x, y), j[5], j[6]),
+                                        jobs))
+            texts = [json.loads(ln)["text"] for ln in (mix / f"{name}.{split}.jsonl").open() if ln.strip()]
+            if len(texts) != len(lines):
+                raise SystemExit(f"{name}.{split}: {len(texts)} documents, the manifest names {len(lines)} rows")
+            conv = mix / f"{name}.{split}.conv.jsonl"
+            with raw.open("wb") as fr, conv.open("w") as fc:
+                for (i, s, rev, path, _, off, _), ln, text in zip(jobs, lines, texts, strict=True):
+                    row = json.loads(ln)
+                    got, _ = render(row, tok, man["cap"], src["drop_system"])
+                    if got != text:
+                        raise SystemExit(f"{name}.{split} row {i} ({s}/{path}@{off}): the fetched row does not "
+                                         "render to the mix's document")
+                    fr.write(ln + b"\n")
+                    rid = f"{a.name}/{name}/{split}/{i}"
+                    fc.write(json.dumps({"id": rid, **conversation(row, src["drop_system"])}) + "\n")
+                    rowmap.append({"id": rid, "repo": f"nvidia/Nemotron-{s}", "rev": rev, "path": path,
+                                   "offset": off, "length": len(ln), "sha256": hashlib.sha256(ln).hexdigest(),
+                                   "url": f"{HF}/datasets/nvidia/Nemotron-{s}/resolve/{rev}/{path}"})
+            print(f"{name}.{split}: {len(lines)} rows fetched and verified", flush=True)
+    out = mix / "rowmap.jsonl"
+    out.write_text("".join(json.dumps(r) + "\n" for r in rowmap))
+    print(f"ROWMAP_DONE {out}: {len(rowmap)} rows, sha256 {hashlib.sha256(out.read_bytes()).hexdigest()}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=Path("/mnt/sdc/omk-model-optimizer"))
@@ -162,10 +326,16 @@ def main():
     ap.add_argument("--exclude", default="", help="comma list of earlier mix manifests whose rows must not be reused")
     ap.add_argument("--budget", default="", help="train token budget overrides: name=tokens,...")
     ap.add_argument("--preview", type=int, default=0, help="print N rendered docs per source and stop")
+    ap.add_argument("--fetch-rows", action="store_true", help="re-fetch the rows mix --name used from HF by byte "
+                    "range (raw files deleted), prove each against the mix's text, write rows/, rowmap.jsonl and "
+                    "<source>.<split>.conv.jsonl (omk_qad.rollouts --in); --only limits the sources")
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.tokenizer)
+    if a.fetch_rows:
+        fetch_rows(a, tok)
+        return
     skip, seen_text = excluded([p for p in a.exclude.split(",") if p])
     budgets = {k: int(float(v)) for k, v in (kv.split("=") for kv in a.budget.split(",") if kv)}
     out_dir = a.root / "data" / a.name

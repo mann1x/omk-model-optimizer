@@ -926,9 +926,14 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                 lg = softcap(F.linear(hd[i, c0:c1], wh), getattr(a, "softcap", None))
             if role is not None:
                 r = role[i, c0 + 1 : c1 + 1].long()
+                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * (r > 0)
+                if a.loss == "ce":  # SFT: every scored position is plain next-token CE (no teacher targets)
+                    loss = ce.sum() / n_tok
+                    loss.backward()
+                    tot += loss.item()
+                    continue
                 per = role_loss(lg, x[i, c0 + 1 : c1 + 1], r, idx[i, c0:c1], val[i, c0:c1],
                                 None if aidx is None else aidx[i, c0:c1], None if aval is None else aval[i, c0:c1], a)
-                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * (r > 0)
                 loss = (per.sum() + a.ce_weight * ce.sum()) / n_tok
                 loss.backward()
                 tot += loss.item()
@@ -1052,11 +1057,27 @@ def _model_id(model: str) -> dict:
     return out or {"path": model}
 
 
+def sft_files(a) -> list[str]:
+    """``--sft-data`` files of a ``--loss ce`` run (refused with any other loss, or a ``ce`` run without them)."""
+    files = [f for f in getattr(a, "sft_data", "").split(",") if f]
+    if (a.loss == "ce") != bool(files):
+        raise SystemExit("--loss ce trains on --sft-data (and --sft-data needs --loss ce)")
+    if files and not all(f.endswith(".roles.jsonl") for f in files):
+        raise SystemExit("--sft-data takes .roles.jsonl files (omk_qad.rollouts)")
+    if files and a.ce_weight:
+        raise SystemExit("--loss ce is the CE: --ce-weight would count it twice")
+    if files and a.mtp == "train":
+        raise SystemExit("--loss ce has no teacher targets for an MTP head: pass --mtp freeze")
+    return files
+
+
 def train_identity(a) -> dict:
     """What a training run's outputs depend on: every non-runtime arg plus the content of its inputs."""
     ident = {k: v for k, v in sorted(vars(a).items()) if k not in RUNTIME_ARGS}
     if ident.get("data_order") == "cache":  # the only order before --data-order: older identities stay valid
         del ident["data_order"]
+    if not ident.get("sft_data"):  # likewise every run before --sft-data
+        ident.pop("sft_data", None)
     ident["id_model"] = _model_id(a.model)
     cmeta = json.loads((Path(a.cache) / "cache.json").read_text())
     ident["id_cache"] = ({k: cmeta.get(k) for k in ("identity", "n_seq", "anchor_model")} if "identity" in cmeta
@@ -1065,6 +1086,8 @@ def train_identity(a) -> dict:
         v = getattr(a, k, "")
         if v and v not in ("none", "auto") and Path(v).exists():
             ident[f"id_{k}"] = file_id(v)
+    if sft_files(a):
+        ident["id_sft_data"] = {f: file_id(f) for f in sft_files(a)}
     return ident
 
 
@@ -1264,6 +1287,41 @@ class CacheRows:
         return out
 
 
+class SftRows:
+    """``--loss ce`` training rows: the windows of ``--sft-data`` (.roles.jsonl), in memory, in the run's order.
+
+    The same contract as ``CacheRows`` (``shuffle``: one permutation seeded by ``--seed``; ``cache``: file order),
+    with no teacher targets: ``idx`` / ``val`` / ``aidx`` / ``aval`` are None. Each file is read once and checked
+    against its ``.stats.json`` window count (``_role_rows``).
+    """
+
+    def __init__(self, files: list[str], seq: int, order: str, seed: int):
+        """Read every row of ``files`` (``seq`` tokens each) and fix their order."""
+        xs, rs = [], []
+        for f in files:
+            done: list = []
+            for x, r in _role_rows(f, seq, done):
+                if done:
+                    break
+                xs.append(x.to(torch.int32))
+                rs.append(r)
+        if not xs:
+            raise SystemExit("--sft-data: no rows")
+        self.x, self.role = torch.stack(xs), torch.stack(rs)
+        self.rows = list(range(len(xs)))
+        if order == "shuffle":
+            random.Random(seed).shuffle(self.rows)
+
+    def __len__(self) -> int:
+        """Number of rows."""
+        return len(self.rows)
+
+    def batch(self, s0: int, bs: int) -> dict:
+        """Rows ``s0 .. s0+bs`` of the order (as ``CacheRows.batch``, teacher keys None)."""
+        sel = torch.tensor(self.rows[s0 : s0 + bs])
+        return {"x": self.x[sel], "role": self.role[sel], "idx": None, "val": None, "aidx": None, "aval": None}
+
+
 def legacy_data_order(run: Path, order: str, log=print) -> str:
     """A run started before --data-order (its identity has no data_order) continues in the cache order."""
     idp = run / "identity.json"
@@ -1282,9 +1340,14 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     meta = json.load(open(os.path.join(a.cache, "cache.json")))
     sh = meta["shard"]
     last = a.stop_at or a.steps
-    if meta["n_seq"] < last * a.bs:
+    sft = sft_files(a)
+    if sft:
+        rows = SftRows(sft, meta["seq"], a.data_order, a.seed)
+        if len(rows) < last * a.bs:
+            raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs}")
+    elif meta["n_seq"] < last * a.bs:
         raise SystemExit(f"cache holds {meta['n_seq']} sequences, the run needs {last * a.bs}")
-    if sh % a.bs:
+    if not sft and sh % a.bs:
         raise SystemExit("--bs must divide the cache shard size")
     final = run / "final.pt"
     if final.exists():
@@ -1362,9 +1425,11 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         tel.eval(results[-1], start - 1)
     pause_file = run / "PAUSE"
     st.update(status="running", step=start - 1, steps=a.steps, last=last)
-    rows = CacheRows(a.cache, meta["n_seq"], sh, a.data_order, a.seed)
-    say(f"DATA order {a.data_order}" + (f" (seed {a.seed}): first rows {rows.rows[:8]}" if a.data_order == "shuffle"
-                                        else ": cache rows in sequence"))
+    if not sft:
+        rows = CacheRows(a.cache, meta["n_seq"], sh, a.data_order, a.seed)
+    src = f"sft {len(rows)} rows, " if sft else ""
+    how = f" (seed {a.seed}): first rows {rows.rows[:8]}" if a.data_order == "shuffle" else ": cache rows in sequence"
+    say(f"DATA {src}order {a.data_order}{how}")
     t0, t_save = time.time(), time.time()
 
     def checkpoint(step, path=last_ck):
@@ -1391,7 +1456,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 gq["lr"] = a.fp_lr * ctl.lr / a.lr
         b = rows.batch((step - 1) * a.bs, a.bs)
         x = b["x"].long().to(a.device)
-        idx, val = b["idx"].to(a.device), b["val"].to(a.device)
+        idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
         roles = {k: None if b[k] is None else b[k].to(a.device) for k in ("role", "aidx", "aval")}
         loss = train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles)
         rolled = guard.observe(step, loss)
@@ -1542,8 +1607,11 @@ def main(argv=None) -> None:
     ap.add_argument("--fp-lr", type=float, default=1e-5)
     ap.add_argument("--beta2", type=float, default=0.999)
     ap.add_argument("--clip", type=float, default=1.0, help="max RMS of one tensor's (expert's) normalized update")
-    ap.add_argument("--loss", choices=sorted(DISTILL), default="jaccard",
-                    help="distillation loss over the teacher top-K + rest: jaccard | kl = KL(t||s) | rkl = KL(s||t)")
+    ap.add_argument("--loss", choices=sorted([*DISTILL, "ce"]), default="jaccard",
+                    help="distillation loss over the teacher top-K + rest: jaccard | kl = KL(t||s) | rkl = KL(s||t); "
+                    "ce = SFT: cross-entropy on the scored positions of --sft-data, no teacher targets")
+    ap.add_argument("--sft-data", default="", help="--loss ce: comma list of .roles.jsonl (omk_qad.rollouts) whose "
+                    "rows are the training data; --cache then only gives the eval rows and eval sets")
     ap.add_argument("--ce-weight", type=float, default=0.0, help="Bolt: no CE term")
     ap.add_argument("--loss-chunk", type=int, default=1024, help="tokens per head/loss chunk (bounds logits memory)")
     ap.add_argument("--mtp", choices=["train", "freeze"], default="train",

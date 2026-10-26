@@ -71,6 +71,25 @@ class NotPrefixError(ValueError):
     """A scored turn's prompt is not a prefix of its segment's render (template not prefix-stable here)."""
 
 
+def preamble_to_reasoning(messages: list[dict]) -> list[dict]:
+    """``--tool-preamble reasoning``: text an assistant wrote BEFORE its tool call becomes (the end of) its reasoning.
+
+    OpenAI-form SFT sets (Nemotron OpenCode) put a preamble ("I'll check the file first") in ``content`` beside
+    ``tool_calls``. Gemma-4's template renders a message's content AFTER its tool responses, i.e. as the answer to
+    them, so the render is not a prefix of the conversation and the turn is refused (26/32 OpenCode rows). Gemma's
+    own tool turns are thought -> call: the preamble goes into the thought, in the order it was written.
+    """
+    out = []
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls") and (m.get("content") or "").strip():
+            m = dict(m)
+            r = (m.get("reasoning_content") or "").strip()
+            m["reasoning_content"] = f"{r}\n\n{m['content'].strip()}" if r else m["content"].strip()
+            m["content"] = ""
+        out.append(m)
+    return out
+
+
 def _norm(messages: list[dict]) -> list[dict]:
     """Tool-call arguments as dicts (the template renders dicts; OpenAI wire form carries JSON strings).
 
@@ -121,6 +140,13 @@ def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_AR
             continue
         p = tok.apply_chat_template(msgs[:i], add_generation_prompt=True, **kw)  # what the server sent
         a = tok.apply_chat_template(msgs[: i + 1], **kw)
+        if (p.endswith(THOUGHT_OPEN) and not m.get("reasoning_content") and not text.startswith(p)
+                and text.startswith(p[: -len(THOUGHT_OPEN)])):
+            # Gemma-4 after a tool response opens the thought channel; a turn without reasoning closed it at once,
+            # and the segment render has no empty thought there (as in _prompt_and_generated): score what follows
+            p = p[: -len(THOUGHT_OPEN)]
+            if stats is not None:
+                stats["thought_closed"] = stats.get("thought_closed", 0) + 1
         if not (text.startswith(p) and text.startswith(a) and len(a) > len(p)):
             raise NotPrefixError(f"turn {i}: prompt/turn render is not a prefix of the segment render")
         _label_turn(text, roles, len(p), len(a), m, code_args, stats)
@@ -310,20 +336,59 @@ class Packer:
         return out
 
 
-def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = "keep") -> tuple[list[dict], dict]:
+def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = "keep",
+          pack: bool = False, max_tokens: int = 0, tool_preamble: str = "keep") -> tuple[list[dict], dict]:
     """Windows of every row plus build statistics.
 
     ``history``: ``keep`` = the serving client re-sent earlier reasoning (one render per segment); ``strip`` =
     it re-sent none; ``last-inline`` = only the newest, folded into the text (Cerebriline SDK >= 4.100.260 on a
     template that drops the field). ``strip`` and ``last-inline`` give one example per assistant turn.
+    ``pack``: segments that fit one window share it (``Packer``), e.g. SFT conversations far shorter than ``seq``.
+    ``max_tokens``: each segment is cut to its first ``max_tokens`` tokens (an SFT corpus's per-document cap, e.g.
+    omk/datasets build_mix's 4096); a segment left with nothing scored is dropped (``truncated_empty``).
+    ``tool_preamble``: ``reasoning`` = ``preamble_to_reasoning`` before rendering (``keep``: as given).
+    A row with ``text`` and no ``messages`` is plain text (e.g. FineWeb for SFT): ``<bos>`` + its tokens, every token
+    after ``<bos>`` scored (role 1), no template and no end token.
     """
     stats = {"rows": 0, "segments": 0, "refused_not_prefix": 0, "windows": 0, "code_args_not_found": 0,
-             "loop_spans_not_found": 0, "tokens_by_role": [0, 0, 0, 0]}
+             "loop_spans_not_found": 0, "tokens_by_role": [0, 0, 0, 0],
+             **({"truncated": 0, "truncated_empty": 0} if max_tokens else {})}
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
     out = []
+    packer = Packer(seq, pad) if pack else None
+
+    def emit(done):
+        for name, x, r in done:
+            out.append({"id": name, "ids": x, "role": r.tolist()})
+            for q in range(4):
+                stats["tokens_by_role"][q] += int((r == q).sum())
+
+    def add(sid: str, ids: list[int], troles: np.ndarray) -> None:  # one segment: cap, then pack or window it
+        stats["segments"] += 1
+        if max_tokens and len(ids) > max_tokens:
+            ids, troles = ids[:max_tokens], troles[:max_tokens]
+            stats["truncated"] += 1
+            if not (troles[1:] > 0).any():
+                stats["truncated_empty"] += 1
+                return
+        if packer is not None and len(ids) <= seq:
+            emit(packer.add(sid, ids, troles))
+        else:
+            emit([(f"{sid}/w{w}", x, r) for w, (x, r) in enumerate(windows(ids, troles, seq, stride, pad))])
+
     for row in rows:
         stats["rows"] += 1
+        if "messages" not in row:  # plain text: <bos> + tokens, all scored but <bos>
+            stats["text_rows"] = stats.get("text_rows", 0) + 1
+            bos = [tok.bos_token_id] if tok.bos_token_id is not None else []
+            ids = bos + tok(row["text"], add_special_tokens=False).input_ids
+            troles = np.full(len(ids), TEACHER, np.int8)
+            troles[: len(bos)] = IGNORE
+            add(f"{row.get('id', stats['rows'])}/s0", ids, troles)
+            continue
         msgs = _norm(row["messages"])
+        if tool_preamble == "reasoning":
+            msgs = preamble_to_reasoning(msgs)
         if history in HISTORY_CONTEXT:
             try:
                 items = render_turns(tok, msgs, row.get("tools"), history, code_args, stats)
@@ -338,12 +403,9 @@ def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = 
                 except NotPrefixError:  # noqa: PERF203 (refuse one segment, keep the others)
                     stats["refused_not_prefix"] += 1
         for k, (text, roles) in enumerate(items):
-            stats["segments"] += 1
             ids, troles = token_roles(tok, text, roles)
-            for w, (x, r) in enumerate(windows(ids, troles, seq, stride, pad)):
-                out.append({"id": f"{row.get('id', stats['rows'])}/s{k}/w{w}", "ids": x, "role": r.tolist()})
-                for q in range(4):
-                    stats["tokens_by_role"][q] += int((r == q).sum())
+            add(f"{row.get('id', stats['rows'])}/s{k}", ids, troles)
+    emit(packer.flush() if packer is not None else [])
     stats["windows"] = len(out)
     return out, stats
 
@@ -605,8 +667,13 @@ def main() -> None:
     ap.add_argument("--template-kwargs", help="--capture: the server's --chat-template-kwargs JSON (request "
                     "kwargs override it), e.g. '{\"enable_thinking\": true}'; '{}' when the server sets none")
     ap.add_argument("--loop-spans", help="--capture: JSONL {request, field, start, end} (automaticum export)")
-    ap.add_argument("--pack", action="store_true", help="--capture: examples shorter than --seq share windows "
+    ap.add_argument("--pack", action="store_true", help="examples shorter than --seq share windows "
                     "back to back (chat replay), instead of one padded window each")
+    ap.add_argument("--tool-preamble", choices=["keep", "reasoning"], default="keep",
+                    help="--in: assistant text beside a tool call; reasoning = move it into the reasoning (OpenAI-form "
+                    "SFT sets on Gemma-4, whose template renders such text after the tool responses)")
+    ap.add_argument("--max-tokens", type=int, default=0, help="--in: cut each rendered segment to this many tokens "
+                    "(an SFT corpus's per-document cap); 0 = whole")
     ap.add_argument("--verify-server", help="--capture: llama-server URL; refuse examples whose /apply-template "
                     "prompt differs from the builder's render (answers cached in <out>.verify.jsonl)")
     ap.add_argument("--allow-live-capture", action="store_true", help="--capture: build from a capture dir that "
@@ -630,7 +697,8 @@ def main() -> None:
         out, stats = build_capture(tok, items, a.seq, stride, json.loads(a.template_kwargs), code_args, verify, a.pack)
     else:
         rows = [json.loads(ln) for ln in Path(a.inp).open() if ln.strip()]
-        out, stats = build(tok, rows, a.seq, stride, code_args, a.history_reasoning)
+        out, stats = build(tok, rows, a.seq, stride, code_args, a.history_reasoning, a.pack, a.max_tokens,
+                           a.tool_preamble)
     from .runctl import atomic_json, atomic_write
 
     data = "".join(json.dumps(w) + "\n" for w in out)
