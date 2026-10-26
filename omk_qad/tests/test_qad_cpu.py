@@ -508,6 +508,41 @@ def test_a_resumed_run_trains_in_train_mode(setup, monkeypatch):
     assert modes == [True, True, True], modes
 
 
+def test_numbered_snapshots_keep_the_newest_by_default(setup, monkeypatch):
+    """bm-889: run1 and run2 kept only the rolling last.pt, so no earlier step could be gated.
+
+    Numbered snapshots are on by default and the oldest are pruned past --snapshot-keep (default 4).
+    """
+    import json
+    import shutil
+
+    from omk_qad import train as T
+
+    model, lay = setup["moe"]
+    out = WORK / "run_snapshots"
+    if out.exists():
+        shutil.rmtree(out)  # test scratch of this test only
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    T.main([*TRAIN, "--model", str(model), "--layout", str(lay), "--cache", str(setup["cache"]), "--out", str(out),
+            "--steps", "5", "--bs", "1", "--eval-every", "5", "--save-every", "1", "--snapshot-every", "1"])
+    run = out / "stage1"
+    assert sorted(p.name for p in run.glob("ckpt_step*.pt")) == [f"ckpt_step{s:07d}.pt" for s in (2, 3, 4, 5)]
+    args = json.loads((run / "summary.json").read_text())["args"]
+    assert args["snapshot_keep"] == 4
+    snap = torch.load(run / "ckpt_step0000003.pt", weights_only=False)
+    assert snap["step"] == 3
+
+
+def test_prune_snapshots_orders_by_step_and_zero_keeps_all(tmp_path):
+    from omk_qad import train as T
+
+    for s in (5, 100, 20, 1000):
+        (tmp_path / f"ckpt_step{s:07d}.pt").touch()
+    assert T.prune_snapshots(tmp_path, 0) == []
+    assert [p.name for p in T.prune_snapshots(tmp_path, 2)] == ["ckpt_step0000005.pt", "ckpt_step0000020.pt"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt_step0000100.pt", "ckpt_step0001000.pt"]
+
+
 def test_refresh_window_defers_encodes_and_resumes_bitwise(setup):
     """--refresh / --ggml-refresh N: fewer encodes than every update; PAUSE + relaunch == straight run (bitwise)."""
     import shutil

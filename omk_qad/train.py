@@ -1041,11 +1041,20 @@ def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = 
     return ck
 
 
+def prune_snapshots(run: Path, keep: int) -> list[Path]:
+    """Delete all but the ``keep`` newest numbered ``ckpt_stepN.pt`` of ``run`` (0 = keep all); returns the deleted."""
+    snaps = sorted(run.glob("ckpt_step*.pt"), key=lambda p: int(p.stem.removeprefix("ckpt_step")))
+    old = snaps[:-keep] if keep > 0 else []
+    for p in old:
+        p.unlink()
+    return old
+
+
 # Settings that do not change what a run computes: they may differ between the segments of one run.
 RUNTIME_ARGS = {"phase", "device", "stop_at", "log_every", "eval_every", "save_every", "save_minutes", "snapshot_every",
-                "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change", "llama_cpp",
-                "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf", "loss_chunk",
-                "eval_set"}  # an eval set only measures: a run may gain one on resume
+                "snapshot_keep", "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change",
+                "llama_cpp", "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf",
+                "loss_chunk", "eval_set"}  # an eval set only measures: a run may gain one on resume
 
 
 def _model_id(model: str) -> dict:
@@ -1475,6 +1484,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
         if a.snapshot_every and step % a.snapshot_every == 0:
             checkpoint(step, run / f"ckpt_step{step:07d}.pt")
+            for old in prune_snapshots(run, a.snapshot_keep):
+                say(f"SNAPSHOT pruned {old.name} (keep {a.snapshot_keep})")
         st.update(step=step, loss=loss)
         mode = control.mode()
         why = f"pause file {pause_file}" if pause_file.exists() else ("drain" if mode == "drain" else "")
@@ -1628,7 +1639,9 @@ def main(argv=None) -> None:
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--save-every", type=int, default=100, help="rolling last.pt every N steps")
     ap.add_argument("--save-minutes", type=float, default=20.0, help="... and at least every M minutes")
-    ap.add_argument("--snapshot-every", type=int, default=0, help="also keep numbered ckpt_stepN.pt (0 = off)")
+    ap.add_argument("--snapshot-every", type=int, default=100,
+                    help="also keep numbered ckpt_stepN.pt every N steps (0 = off); last.pt alone is overwritten")
+    ap.add_argument("--snapshot-keep", type=int, default=4, help="newest numbered snapshots kept (0 = all)")
     ap.add_argument("--guard-ratio", type=float, default=0.0, help="divergence guard: loss above this x the EMA "
                     "of healthy losses counts as diverging (0 = off); see Guard")
     ap.add_argument("--guard-patience", type=int, default=3, help="consecutive diverging steps before a rollback")
