@@ -3,6 +3,7 @@
 
 --phase cache   run the frozen teacher once over the training stream and the eval rows; store tokens +
 top-K teacher log-probs (the teacher is never on the GPU during training);
+--phase evalset teacher top-K of a held-out role eval set (.roles.jsonl) beside a finished cache (--eval-set N).
 --phase train   student latents (fp16) fake-quantized per the layout (omk_qad.layout: llama.cpp's plan,
 e.g. IQ2_M with experts fixed at IQ2_XXS), loss = Jaccard over top-K + rest (Bolt), updates
 applied inside backward (omk_qad.fakequant), small fp tensors on AdamW;
@@ -244,9 +245,13 @@ class Telemetry:
 
     def eval(self, r: dict, step: int) -> None:
         """One evaluate() result: overall metrics plus every eval family."""
-        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "tag")}
+        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "sets", "tag")}
         for fam, m in (r.get("families") or {}).items():
             flat.update({f"eval/{fam}/{k}": v for k, v in m.items()})
+        for nm, s in (r.get("sets") or {}).items():  # --eval-set: eval/<set>/<metric>, eval/<set>/<family>/<metric>
+            flat.update({f"eval/{nm}/{k}": v for k, v in s.items() if k != "families"})
+            for fam, m in (s.get("families") or {}).items():
+                flat.update({f"eval/{nm}/{fam}/{k}": v for k, v in m.items()})
         self.log(flat, step)
 
     def finish(self) -> None:
@@ -520,6 +525,110 @@ def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
     say("CACHE_DONE")
 
 
+def cache_ref(cache) -> str | dict:
+    """What identifies a finished cache to its eval sets: its identity hash, or (before identity) its cache.json."""
+    meta = json.loads((Path(cache) / "cache.json").read_text())
+    return meta["identity"] if "identity" in meta else file_id(Path(cache) / "cache.json")
+
+
+def evalset_path(cache, name: str) -> Path:
+    """Where ``--phase evalset`` keeps the named eval set of a cache."""
+    return Path(cache) / f"evalset_{name}.pt"
+
+
+def phase_evalset(a) -> None:
+    """Teacher top-K of a held-out role eval set, kept beside a finished cache as ``evalset_<name>.pt``.
+
+    The cache itself is not touched (its identity names its own --eval-data; a new family there would refuse every
+    shard). The set comes from the cache's teacher, tokenizer, seq and topk (checked against its identity.json);
+    of each ``.roles.jsonl`` file ``--n-eval`` rows spread evenly over it are kept (none twice), and only
+    teacher-scored positions are computed and scored.
+    Use rollouts the cache never trained on.
+    """
+    cache = Path(a.cache)
+    fams = [q for q in a.eval_data.split(",") if q]
+    if not a.eval_set or not fams or not all(q.endswith(".roles.jsonl") for q in fams):
+        raise SystemExit("--phase evalset needs --eval-set NAME and --eval-data f.roles.jsonl[,g.roles.jsonl]")
+    names = [Path(q).name.removesuffix(".roles.jsonl") for q in fams]
+    if len(set(names)) != len(names):
+        raise SystemExit(f"eval families need distinct names: {names}")
+    if not (cache / "cache.json").exists():
+        raise SystemExit(f"{cache}: no finished cache (cache.json) to put an eval set beside")
+    if (cache / "identity.json").exists():
+        have = json.loads((cache / "identity.json").read_text())["identity"]
+        mine = json.loads(json.dumps(cache_identity(a), default=str))
+        keys = ("teacher", "tokenizer", "seq", "topk")
+    else:  # a cache from before identity.json: its recorded args
+        have, mine = json.loads((cache / "cache.json").read_text())["args"], vars(a)
+        keys = ("model", "teacher_gguf", "seq", "topk")
+    bad = {k: (have.get(k), mine.get(k)) for k in keys if (have.get(k) or "") != (mine.get(k) or "")}  # unset = ""
+    if bad:
+        raise SystemExit(f"RUN_REFUSED evalset: cache {cache} was made with other settings {bad}")
+    ex, rs, fam = [], [], []
+    for k, q in enumerate(fams):
+        passes: list = []
+        stream, rows = _role_rows(q, a.seq, passes), []
+        while True:  # one whole pass (its window count is checked against the .stats.json); no row is used twice
+            row = next(stream)
+            if passes:
+                break
+            rows.append(row)
+        # --n-eval rows spread evenly over the file (rows come grouped by rollout: the first n would be one or two)
+        pick = range(len(rows)) if len(rows) <= a.n_eval else [i * len(rows) // a.n_eval for i in range(a.n_eval)]
+        for i in pick:
+            ex.append(rows[i][0])
+            rs.append(rows[i][1])
+        fam += [k] * len(pick)
+        say(f"evalset {a.eval_set}: {names[k]} {len(pick)} of {len(rows)} rows")
+    x, role = torch.stack(ex).to(torch.int32), torch.stack(rs)
+    want = teacher_scored(role[:, 1:])
+    ident = {"cache": cache_ref(cache), "seq": a.seq, "topk": a.topk,
+             "eval_data": [[q, file_id(q)] for q in fams]}
+    out = evalset_path(cache, a.eval_set)
+    if out.exists():
+        old = torch.load(out)
+        if old.get("identity") == ident and torch.equal(old["x"], x):
+            say(f"{out} kept: same rows and identity")
+            return
+        raise SystemExit(f"RUN_REFUSED evalset: {out} holds other rows or another identity; use another --eval-set")
+    topk_of, close, gguf = _eval_teacher(a)
+    try:
+        parts = [topk_of(x[i : i + 4], want[i : i + 4]) for i in range(0, len(x), 4)]
+    finally:
+        close()
+    n = int(want.sum())
+    ev = {"x": x, "idx": torch.cat([q[0] for q in parts]), "val": torch.cat([q[1] for q in parts]), "role": role,
+          # a GGUF teacher sums its NLL over the wanted positions only; the torch head sums all of them
+          "teacher_ppl": math.exp(sum(q[2] for q in parts) / n) if gguf else None,
+          "family": torch.tensor(fam, dtype=torch.int32), "families": names, "identity": ident}
+    atomic_torch_save(ev, out)
+    say(f"EVALSET_DONE {out}: {len(x)} x {a.seq} tokens, {n} teacher-scored ({n / want.numel():.1%}); teacher ppl "
+        f"{ev['teacher_ppl'] if ev['teacher_ppl'] is None else round(ev['teacher_ppl'], 3)}")
+
+
+def _eval_teacher(a):
+    """``(topk(x, want) -> (idx, val, nll), close, is_gguf)``: the cache's teacher without the cache pass's hooks."""
+    if a.teacher_gguf:
+        from transformers import AutoTokenizer
+
+        from .gguf_teacher import GGUFTeacher
+
+        tok = AutoTokenizer.from_pretrained(a.model)
+        g = GGUFTeacher(a.teacher_gguf, a.seq, a.topk, len(tok), a.teacher_gguf_bin, a.teacher_ngl, a.teacher_ubatch,
+                        log=say)
+        return g, g.close, True
+    teacher, _ = load_text_causal_lm(a.model, a.device, torch.float32 if a.device == "cpu" else torch.bfloat16)
+    teacher.requires_grad_(False)
+    cap = softcap_of(teacher)
+
+    @torch.no_grad()
+    def topk(x, want=None):
+        x = x.to(a.device)
+        return head_topk(teacher, teacher.get_decoder()(input_ids=x).last_hidden_state, x, cap, a.topk, a.loss_chunk)
+
+    return topk, lambda: None, False
+
+
 def anchor_pass(a, dtype, st: State, control: RunControl) -> None:
     """Add the ANCHOR model's top-K (``aidx``/``aval``) to every cached shard holding anchor-role positions.
 
@@ -685,15 +794,32 @@ def distill_loss(logits, idx, val, a) -> torch.Tensor:
     return DISTILL[a.loss](logits.float(), idx.long(), val.float())
 
 
+def teacher_scored(role: torch.Tensor) -> torch.Tensor:
+    """Positions whose loss is distillation from the teacher (roles 1 and 3; 2 = anchor, 0 = not trained)."""
+    return (role == 1) | (role == 3)
+
+
 @torch.no_grad()
-def evaluate(student, head, ev, a, tag, extra=None) -> dict:
+def evaluate(student, head, ev, a, tag, extra=None, sets=None) -> dict:
     """Jaccard / KL(top-K) / top-1 / ppl of the student against the cached teacher on the eval rows.
 
     With an MTP head also ``*_mtp``: its prediction of x_{t+2} vs the teacher's distribution at t+1
-    (``top1_mtp`` is the draft-acceptance proxy).
+    (``top1_mtp`` is the draft-acceptance proxy). ``sets`` (--eval-set): named role eval sets, scored only where
+    training distils from the teacher, reported under ``sets`` beside the cache's own eval.
     """
-    cuda = a.device != "cpu"
     student.eval()
+    res = {"tag": tag, **_score(student, head, ev, a)}
+    if sets:
+        res["sets"] = {nm: _score(student, head, s, a) for nm, s in sets.items()}
+    student.train()
+    res.update(extra or {})
+    say("EVAL", json.dumps(res))
+    return res
+
+
+def _score(student, head, ev, a) -> dict:
+    """The metrics of one eval set: every position, or with a ``role`` only the teacher-scored ones (+ ``scored``)."""
+    cuda = a.device != "cpu"
     wh = head.served()
     mtp = has_mtp(student)
     tot = dict.fromkeys(("jac", "klk", "rkl", "nll", "top1", "jac_m", "klk_m", "top1_m"), 0.0)
@@ -701,6 +827,11 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
     names = ev.get("families") or []
     fam = ev["family"].tolist() if "family" in ev else [0] * len(ev["x"])
     per = [dict.fromkeys(("jac", "klk", "rkl", "nll", "top1", "n"), 0.0) for _ in names]
+    role = ev.get("role")
+
+    def mask(i, t0, t1):  # None: every position counts
+        return None if role is None else teacher_scored(role[i, t0:t1]).to(a.device)
+
     for i0 in range(0, len(ev["x"]), 4):
         x = ev["x"][i0 : i0 + 4].long().to(a.device)
         h = hidden_of(student, x, cuda)
@@ -708,42 +839,54 @@ def evaluate(student, head, ev, a, tag, extra=None) -> dict:
         for i in range(len(x)):
             for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
+                m = mask(i0 + i, c0 + 1, c1 + 1)  # the role of the predicted token, as in training
+                if m is not None and not m.any():
+                    continue
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                     lg = softcap(F.linear(h[i, c0:c1], wh), getattr(a, "softcap", None))
                 ei, ev_ = ev["idx"][i0 + i, c0:c1].to(a.device), ev["val"][i0 + i, c0:c1].to(a.device)
                 j, k, ce, t1 = token_terms(lg, ei, ev_, x[i, c0 + 1 : c1 + 1])
                 rk = rkl_topk_rest(lg.float(), ei.long(), ev_.float())
+                if m is not None:
+                    j, k, ce, t1, rk = j[m], k[m], ce[m], t1[m], rk[m]
                 terms = {"jac": j.sum().item(), "klk": k.sum().item(), "rkl": rk.sum().item(), "nll": ce.sum().item(),
                          "top1": t1.sum().item()}
+                cnt = c1 - c0 if m is None else int(m.sum())
                 for key, v in terms.items():
                     tot[key] += v
                     if per:
                         per[fam[i0 + i]][key] += v
                 if per:
-                    per[fam[i0 + i]]["n"] += c1 - c0
-                n += c1 - c0
+                    per[fam[i0 + i]]["n"] += cnt
+                n += cnt
             if mtp:  # z_t (t <= T-3) predicts x_{t+2}; teacher distribution at t+1
                 for c0 in range(0, x.shape[1] - 2, a.loss_chunk):
                     c1 = min(c0 + a.loss_chunk, x.shape[1] - 2)
+                    m = mask(i0 + i, c0 + 2, c1 + 2)
+                    if m is not None and not m.any():
+                        continue
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                         lg = softcap(F.linear(z[i, c0:c1], wh), getattr(a, "softcap", None))
                     j, k, _, t1 = token_terms(lg, ev["idx"][i0 + i, c0 + 1 : c1 + 1].to(a.device),
                                               ev["val"][i0 + i, c0 + 1 : c1 + 1].to(a.device), x[i, c0 + 2 : c1 + 2])
+                    if m is not None:
+                        j, k, t1 = j[m], k[m], t1[m]
                     tot["jac_m"] += j.sum().item()
                     tot["klk_m"] += k.sum().item()
                     tot["top1_m"] += t1.sum().item()
-                    n_m += c1 - c0
-    student.train()
-    res = {"tag": tag, "jaccard": tot["jac"] / n, "klk": tot["klk"] / n, "rkl": tot["rkl"] / n,
+                    n_m += c1 - c0 if m is None else int(m.sum())
+    if not n:
+        raise SystemExit("eval set without a teacher-scored position (roles 1 / 3)")
+    res = {"jaccard": tot["jac"] / n, "klk": tot["klk"] / n, "rkl": tot["rkl"] / n,
            "top1": tot["top1"] / n, "ppl": math.exp(tot["nll"] / n), "teacher_ppl": ev.get("teacher_ppl")}
+    if role is not None:
+        res["scored"] = n
     if mtp:
         res.update(jaccard_mtp=tot["jac_m"] / n_m, klk_mtp=tot["klk_m"] / n_m, top1_mtp=tot["top1_m"] / n_m)
     if len(per) > 1:  # the same metrics per eval family (rows of each family are disjoint)
         res["families"] = {nm: {"jaccard": f["jac"] / f["n"], "klk": f["klk"] / f["n"], "rkl": f["rkl"] / f["n"],
                                 "top1": f["top1"] / f["n"], "ppl": math.exp(f["nll"] / f["n"])}
                            for nm, f in zip(names, per, strict=True)}
-    res.update(extra or {})
-    say("EVAL", json.dumps(res))
     return res
 
 
@@ -896,7 +1039,8 @@ def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = 
 # Settings that do not change what a run computes: they may differ between the segments of one run.
 RUNTIME_ARGS = {"phase", "device", "stop_at", "log_every", "eval_every", "save_every", "save_minutes", "snapshot_every",
                 "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change", "llama_cpp",
-                "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf", "loss_chunk"}
+                "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf", "loss_chunk",
+                "eval_set"}  # an eval set only measures: a run may gain one on resume
 
 
 def _model_id(model: str) -> dict:
@@ -1146,6 +1290,14 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     if final.exists():
         raise SystemExit(f"{final} exists: this stage/branch is finished and immutable (use a new --branch)")
     ev = torch.load(os.path.join(a.cache, "eval.pt"))
+    sets = {}
+    for nm in (q for q in a.eval_set.split(",") if q):  # role eval sets (--phase evalset) of this very cache
+        sets[nm] = torch.load(evalset_path(a.cache, nm))
+        if sets[nm]["identity"]["cache"] != cache_ref(a.cache):
+            raise SystemExit(f"eval set {nm} was made beside another cache ({sets[nm]['identity']['cache']} vs "
+                             f"{cache_ref(a.cache)})")
+        say(f"eval set {nm}: {len(sets[nm]['x'])} rows, {int(teacher_scored(sets[nm]['role'][:, 1:]).sum())} "
+            "teacher-scored positions")
     bf16 = a.mode == "bf16"
     if a.imatrix == "auto":  # bf16 mode encodes nothing: no imatrix
         a.imatrix = str(Path(a.cache) / "imatrix.pt") if (Path(a.cache) / "imatrix.pt").exists() and not bf16 \
@@ -1202,7 +1354,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             say(f"LOSSLESS_GATE klk={g['klk']:.6f} (max {a.gate})")
             if g["klk"] > a.gate:
                 raise SystemExit("unquantized student does not reproduce the teacher cache")
-        results.append(evaluate(student, head, ev, a, "init", dict(ctl.stats)))
+        results.append(evaluate(student, head, ev, a, "init", dict(ctl.stats), sets))
     tel = Telemetry(a, run, {**vars(a), "origin": origin, "cache_meta": {k: meta[k] for k in ("n_seq", "seq", "topk")
                                                                          if k in meta}},
                     resume_step=start - 1 if resume else None)
@@ -1253,7 +1405,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                         **{f"quant/{k}": v for k, v in ctl.stats.items()}})
         tel.log(row, step)
         if step % a.eval_every == 0 or step == last:
-            results.append(evaluate(student, head, ev, a, f"step{step}", dict(ctl.stats)))
+            results.append(evaluate(student, head, ev, a, f"step{step}", dict(ctl.stats), sets))
             tel.eval(results[-1], step)
             atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
         if a.snapshot_every and step % a.snapshot_every == 0:
@@ -1338,7 +1490,7 @@ def phase_export(a) -> None:
 def main(argv=None) -> None:
     """CLI entry point."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", choices=["cache", "train", "export"], required=True)
+    ap.add_argument("--phase", choices=["cache", "evalset", "train", "export"], required=True)
     ap.add_argument("--mode", choices=["qad", "bf16"], default="qad",
                     help="qad: fake-quantized latents per --layout; bf16: train the model's own bf16 weights in "
                     "--train-scope, no quantizer (omk_qad.recovery)")
@@ -1369,6 +1521,8 @@ def main(argv=None) -> None:
     ap.add_argument("--eval-data", default="", help="comma list of eval files, one family each (name = file stem)")
     ap.add_argument("--n-seq", type=int, default=16000)
     ap.add_argument("--n-eval", type=int, default=32, help="eval rows per eval family")
+    ap.add_argument("--eval-set", default="", help="evalset: the name of the role eval set to build beside --cache; "
+                    "train: comma list of such sets, scored at their teacher-scored positions on every eval")
     ap.add_argument("--seq", type=int, default=4096)
     ap.add_argument("--topk", type=int, default=64)
     ap.add_argument("--shard", type=int, default=1000)
@@ -1427,7 +1581,7 @@ def main(argv=None) -> None:
     ap.add_argument("--load", default="", help="train: resume from this full checkpoint (default: <run>/last.pt "
                     "if present); export: checkpoint whose weights to export")
     a = ap.parse_args(argv)
-    {"cache": phase_cache, "train": phase_train, "export": phase_export}[a.phase](a)
+    {"cache": phase_cache, "evalset": phase_evalset, "train": phase_train, "export": phase_export}[a.phase](a)
 
 
 if __name__ == "__main__":

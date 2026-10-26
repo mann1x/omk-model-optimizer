@@ -282,3 +282,86 @@ def test_bf16_trains_on_roles(g4, roles_cache):
     losses = [float(ln.split("loss=")[1].split()[0]) for ln in (out / "stage1" / "log.txt").read_text().splitlines()
               if ln.startswith("step ") and "loss=" in ln]
     assert losses and all(0 < q < 50 for q in losses), losses
+
+
+def _snapshot(d: Path) -> dict:
+    return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in d.iterdir() if p.is_file()}
+
+
+@pytest.fixture(scope="module")
+def held_set(g4, roles_cache):
+    """Role windows of conversations the cache never saw -> evalset_held.pt beside cache_roles."""
+    from omk_qad.tests.test_rollouts_cpu import CONV, TOOLS
+
+    rows = []
+    for k in range(10, 13):
+        conv = json.loads(json.dumps(CONV))
+        conv[1]["content"] = f"Fix level{k}.js"
+        rows.append({"id": f"h{k}", "messages": conv, "tools": TOOLS})
+    src = WORK / "held.jsonl"
+    src.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    rfile = WORK / "held.roles.jsonl"
+    _run("omk_qad.rollouts", "--model", str(g4["student"]), "--in", str(src), "--out", str(rfile), "--seq", "64",
+         "--stride", "32", "--history-reasoning", "keep")
+    out = roles_cache / "evalset_held.pt"
+    for f in ("evalset_held.pt", "evalset_held4.pt"):  # this test's own artifacts: built fresh every run
+        (roles_cache / f).unlink(missing_ok=True)
+    before = _snapshot(roles_cache)
+    args = ("omk_qad.train", "--phase", "evalset", "--model", str(g4["teacher"]), "--cache", str(roles_cache),
+            "--device", "cpu", "--eval-set", "held", "--eval-data", str(rfile), "--n-eval", "500", "--seq", "64")
+    proc = _run(*args)
+    after = _snapshot(roles_cache)
+    assert {k: v for k, v in after.items() if k != out.name} == before  # the cache itself is untouched
+    return {"rfile": rfile, "out": out, "args": args, "log": proc.stdout + proc.stderr}
+
+
+def test_an_eval_set_reads_each_held_out_row_once_beside_an_untouched_cache(g4, roles_cache, held_set):
+    from omk_qad.train import cache_ref, teacher_scored
+
+    ev = torch.load(held_set["out"])
+    rows = [json.loads(ln) for ln in held_set["rfile"].read_text().splitlines() if ln.strip()]
+    assert len(rows) < 500  # --n-eval above the file: every row once, in file order, none repeated
+    assert ev["x"].tolist() == [r["ids"] for r in rows] and ev["role"].tolist() == [r["role"] for r in rows]
+    n_rows = len(rows)
+    few = [*held_set["args"]]
+    few[few.index("--eval-set") + 1], few[few.index("--n-eval") + 1] = "held4", "4"
+    _run(*few)
+    ev4 = torch.load(roles_cache / "evalset_held4.pt")
+    spread = [i * n_rows // 4 for i in range(4)]  # spread over the whole file, not its first rows
+    assert ev4["x"].tolist() == [rows[i]["ids"] for i in spread] and spread[-1] >= n_rows // 2
+    assert ev["role"].shape == ev["x"].shape and ev["idx"].shape[:2] == (n_rows, 63)
+    assert ev["identity"]["cache"] == cache_ref(roles_cache)
+    assert f"{int(teacher_scored(ev['role'][:, 1:]).sum())} teacher-scored" in held_set["log"]
+    again = _run(*held_set["args"])
+    assert "kept: same rows and identity" in again.stdout + again.stderr
+    other = [*held_set["args"]]
+    other[other.index(str(g4["teacher"]))] = str(g4["student"])  # another teacher than the cache's
+    proc = _run(*other, check=False)
+    assert proc.returncode != 0 and "was made with other settings" in proc.stdout + proc.stderr
+
+
+def test_an_eval_set_scores_only_the_teacher_scored_positions(g4, roles_cache, held_set):
+    import shutil
+
+    from omk_qad.train import teacher_scored
+
+    ev = torch.load(held_set["out"])
+    keep = teacher_scored(ev["role"][:, 1:])
+    for name, garble in (("offmask", ~keep), ("onmask", keep)):  # garbage teacher targets where the mask says
+        g = {**ev, "idx": ev["idx"].clone(), "val": ev["val"].clone()}
+        g["idx"][garble] = 7
+        g["val"][garble] = 0.0
+        torch.save(g, roles_cache / f"evalset_{name}.pt")
+    out = WORK / "run_evalset"
+    shutil.rmtree(out, ignore_errors=True)
+    proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(roles_cache),
+                "--out", str(out), "--steps", "1", "--eval-every", "1", "--eval-set", "held,offmask,onmask")
+    evals = [json.loads(ln.split("EVAL ", 1)[1]) for ln in (proc.stdout + proc.stderr).splitlines()
+             if ln.startswith("EVAL ")]
+    assert evals and all(set(e["sets"]) == {"held", "offmask", "onmask"} for e in evals)
+    for e in evals:
+        held, off, on = (e["sets"][k] for k in ("held", "offmask", "onmask"))
+        assert held["scored"] == int(keep.sum()) and "scored" not in e  # the cache's own eval keeps every position
+        assert {k: off[k] for k in ("klk", "rkl", "jaccard", "top1")} == {k: held[k] for k in ("klk", "rkl",
+                                                                                                "jaccard", "top1")}
+        assert on["klk"] != held["klk"]
