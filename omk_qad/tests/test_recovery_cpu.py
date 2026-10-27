@@ -7,6 +7,7 @@ Artifacts go to $OMK_QAD_WORK (persistent disk; /tmp is tmpfs on solidpc).
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -153,6 +154,10 @@ def test_bf16_trial_configs_train_and_descend(g4, name, extra):
     m, _ = load_text_causal_lm(str(g4["student"]), "cpu", torch.float32)
     scope = extra[1] if extra[0] == "--train-scope" else "gemma4"
     assert set(ck["latents"]) == set(scope_params(m, scope))
+    log = proc.stdout + proc.stderr
+    tel = re.findall(r"rows \[([\d, ]+)\] tokens (\d+) grad_norm ([\d.e+-]+) update_ratio ([\d.e+-]+)", log)
+    assert tel, log[-2000:]  # every logged step carries its rows, scored tokens, gradient norm and update ratio
+    assert all(int(t) > 0 and float(g) > 0 and float(u) > 0 for _, t, g, u in tel), tel
     if name == "moe_scope":
         assert any(".router." in n for n in ck["latents"]) and any(".experts." in n for n in ck["latents"])
     else:

@@ -1250,3 +1250,48 @@ def test_a_run_from_before_data_order_resumes_in_cache_order(tmp_path):
     assert T.legacy_data_order(run, "shuffle", log=lambda *_: None) == "cache"
     (run / "identity.json").write_text(json.dumps({"identity": {"seed": 0, "data_order": "shuffle"}}))
     assert T.legacy_data_order(run, "shuffle", log=lambda *_: None) == "shuffle"
+
+
+def test_weight_class_names_the_gemma_and_qwen_moe_parts():
+    """Telemetry classes: routed experts, router (Gemma router.proj / Qwen mlp.gate), attention, dense MLP, head."""
+    from omk_qad.fakequant import weight_class
+
+    assert weight_class("model.layers.3.experts.gate_up_proj") == "experts"
+    assert weight_class("model.layers.3.mlp.experts.7.down_proj.weight") == "experts"
+    assert weight_class("model.layers.3.router.proj.weight") == "router"
+    assert weight_class("model.layers.3.mlp.gate.weight") == "router"
+    assert weight_class("model.layers.3.mlp.gate_proj.weight") == "mlp"
+    assert weight_class("model.layers.3.self_attn.q_proj.weight") == "attn"
+    assert weight_class("model.embed_tokens.weight") == "head"
+
+
+@pytest.mark.parametrize("chunk", [None, 64])
+def test_update_telemetry_matches_the_applied_step(monkeypatch, chunk):
+    """opt_metrics reports the step the update really applied, then resets its sums.
+
+    Checked: ||w1 - w0|| / ||w0|| over the active experts, the update and gradient RMS, the clip share and the
+    active-expert share. ``chunk`` forces the row-chunked big-matrix path (``_update_big``).
+    """
+    from omk_qad import fakequant as fq
+
+    if chunk:
+        monkeypatch.setattr(fq, "CHUNK_ELEMS", chunk)
+    torch.manual_seed(0)
+    ctl = fq.Control(lr=1e-2, clip=1.0)
+    p = torch.nn.Parameter(torch.randn(4, 8, 16))
+    lat = fq.Latent("model.layers.0.experts.gate_up_proj", p, [], ctl, None, torch.float32)
+    w0 = lat.param.data.clone()
+    g = torch.randn(4, 8, 16)
+    g[[1, 3]] = 0  # experts 1 and 3 were routed no token
+    lat.update(g)
+    m = fq.opt_metrics(ctl)
+    act = [0, 2]
+    d, w = (lat.param.data - w0)[act], w0[act]
+    assert torch.equal(lat.param.data[[1, 3]], w0[[1, 3]])
+    assert m["opt/experts/active_frac"] == pytest.approx(0.5)
+    assert m["opt/experts/update_ratio"] == pytest.approx(float(d.norm() / w.norm()), rel=1e-4)
+    assert m["opt/experts/update_rms"] == pytest.approx(float(d.square().mean().sqrt()), rel=1e-4)
+    assert m["opt/experts/grad_rms"] == pytest.approx(float(g[act].square().mean().sqrt()), rel=1e-4)
+    assert m["opt/grad_norm"] == pytest.approx(float(g.norm()), rel=1e-4)
+    assert 0.0 <= m["opt/experts/clip_frac"] <= 1.0 and m["opt/experts/u_rms"] > 0
+    assert ctl.opt == {} and fq.opt_metrics(ctl) == {}

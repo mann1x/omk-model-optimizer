@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -189,6 +190,51 @@ class Control:
     state_dtype: torch.dtype = torch.float32  # storage of the accumulation buffer and the momentum
     dummy: torch.Tensor = field(default_factory=lambda: torch.zeros((), requires_grad=True))
     stats: dict = field(default_factory=lambda: {"encodes": 0, "updates": 0, "undelivered": 0})
+    opt: dict = field(default_factory=dict)  # per weight class: device sums of this step's updates (opt_metrics)
+
+
+def weight_class(name: str) -> str:
+    """Telemetry class of a trained weight: experts | router | attn | mlp | head | other."""
+    n = name.lower()
+    if "experts" in n:
+        return "experts"
+    if "router" in n or "gate_inp" in n or re.search(r"(^|\.)gate\.weight$", n):
+        return "router"
+    if "attn" in n or "attention" in n:
+        return "attn"
+    if "mlp" in n or "ffn" in n:
+        return "mlp"
+    if "embed" in n or "lm_head" in n:
+        return "head"
+    return "other"
+
+
+def opt_metrics(ctl: Control) -> dict:
+    """This step's gradient / update telemetry per weight class (one device sync), then reset the sums.
+
+    Per class ``c`` (units = matrices, or experts of a 3-D weight; only active units count, i.e. units whose
+    gradient is not all zero): ``opt/c/grad_rms`` raw gradient RMS, ``opt/c/update_rms`` RMS of the applied step
+    (lr x normalised update), ``opt/c/update_ratio`` ||step|| / ||weight||, ``opt/c/clip_frac`` share of active
+    units whose normalised update hit the RMS clip, ``opt/c/u_rms`` their mean pre-clip RMS, ``opt/c/active_frac``
+    active units / units. Totals: ``opt/grad_norm`` (L2 of every latent gradient) and ``opt/update_ratio``.
+    """
+    out, tot = {}, {"gsq": 0.0, "dsq": 0.0, "wsq": 0.0}
+    for c, d in sorted(ctl.opt.items()):
+        v = {k: float(x) for k, x in d.items()}
+        n, act = max(v.get("n", 0.0), 1.0), max(v.get("active", 0.0), 1.0)
+        out[f"opt/{c}/grad_rms"] = math.sqrt(v.get("gsq", 0.0) / n)
+        out[f"opt/{c}/update_rms"] = math.sqrt(v.get("dsq", 0.0) / n)
+        out[f"opt/{c}/update_ratio"] = math.sqrt(v.get("dsq", 0.0) / max(v.get("wsq", 0.0), 1e-30))
+        out[f"opt/{c}/clip_frac"] = v.get("clipped", 0.0) / act
+        out[f"opt/{c}/u_rms"] = v.get("u_rms", 0.0) / act
+        out[f"opt/{c}/active_frac"] = v.get("active", 0.0) / max(v.get("units", 0.0), 1.0)
+        for k in tot:
+            tot[k] += v.get(k, 0.0)
+    if ctl.opt:
+        out["opt/grad_norm"] = math.sqrt(tot["gsq"])
+        out["opt/update_ratio"] = math.sqrt(tot["dsq"] / max(tot["wsq"], 1e-30))
+    ctl.opt = {}
+    return out
 
 
 class Latent:
@@ -198,6 +244,7 @@ class Latent:
                  latent_dtype: torch.dtype):
         """Convert ``param`` in place to ``latent_dtype`` storage; it no longer requires grad."""
         self.name, self.param, self.segments, self.ctl, self.codec = name, param, segments, ctl, codec
+        self.kind = weight_class(name)
         param.requires_grad_(False)
         self.shape = tuple(param.shape)
         self.cols = self.shape[-1]
@@ -450,6 +497,12 @@ class Latent:
         m.copy_(sr_cast(mu, m.dtype))
         return mu
 
+    def _opt(self, **sums) -> None:
+        """Add this update's telemetry sums (device scalars or numbers) to its weight class (``opt_metrics``)."""
+        d = self.ctl.opt.setdefault(self.kind, {})
+        for k, v in sums.items():
+            d[k] = d[k] + v if k in d else v
+
     @torch.no_grad()
     def update(self, grad: torch.Tensor) -> None:
         """Momentum-free Adafactor step (factored 2nd moments, unit-RMS clip), per expert for 3-D weights."""
@@ -468,6 +521,7 @@ class Latent:
             sl = slice(s0, min(s0 + per, b))
             g = g3[sl]
             active = g.flatten(1).abs().amax(1) > 0
+            self._opt(units=active.numel())
             if not active.any():
                 continue
             g2 = g.square() + ctl.eps
@@ -483,8 +537,12 @@ class Latent:
             rms = u.square().mean((1, 2)).sqrt()
             u /= (rms / ctl.clip).clamp(min=1.0)[:, None, None]
             u = self._momentum(u, (sl,), active)
-            new = lat3[sl].float() - ctl.lr * u * a[:, None, None]
-            lat3[sl] = sr_cast(new, self.param.dtype)
+            w = lat3[sl].float()
+            step = ctl.lr * u * a[:, None, None]
+            self._opt(gsq=g.square().sum(), dsq=step.square().sum(), wsq=(w.square() * a[:, None, None]).sum(),
+                      n=a.sum() * g[0].numel(), active=a.sum(), clipped=((rms > ctl.clip) & active).sum(),
+                      u_rms=(rms * a).sum())
+            lat3[sl] = sr_cast(w - step, self.param.dtype)
         self.version += 1
         ctl.stats["updates"] += 1
 
@@ -499,6 +557,7 @@ class Latent:
         n_r = g.shape[0]
         step = max(1, CHUNK_ELEMS // self.cols)
         spans = [(r0, min(r0 + step, n_r)) for r0 in range(0, n_r, step)]
+        self._opt(units=1)
         if not any(bool(g[r0:r1].abs().amax() > 0) for r0, r1 in spans):
             return
         b2 = ctl.beta2
@@ -519,10 +578,17 @@ class Latent:
         sq = torch.zeros((), device=g.device)
         for r0, r1 in spans:
             sq += u_of(r0, r1).square().sum()
-        scale = ((sq / g.numel()).sqrt() / ctl.clip).clamp(min=1.0)
+        rms = (sq / g.numel()).sqrt()
+        scale = (rms / ctl.clip).clamp(min=1.0)
+        gsq, dsq, wsq = (torch.zeros((), device=g.device) for _ in range(3))
         for r0, r1 in spans:
             u = self._momentum((u_of(r0, r1) / scale)[None], (slice(e, e + 1), slice(r0, r1)))[0]
-            lat[r0:r1] = sr_cast(lat[r0:r1].float() - ctl.lr * u, self.param.dtype)
+            w = lat[r0:r1].float()
+            gsq += g[r0:r1].float().square().sum()
+            dsq += (ctl.lr * u).square().sum()
+            wsq += w.square().sum()
+            lat[r0:r1] = sr_cast(w - ctl.lr * u, self.param.dtype)
+        self._opt(gsq=gsq, dsq=dsq, wsq=wsq, n=g.numel(), active=1, clipped=(rms > ctl.clip).float(), u_rms=rms)
 
 
 class _Served(torch.autograd.Function):

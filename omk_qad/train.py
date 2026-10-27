@@ -20,6 +20,7 @@ python -m omk_qad.train --phase export --model M --layout L.pt [--load O/state.p
 """
 
 import argparse
+import collections
 import copy
 import hashlib
 import json
@@ -41,6 +42,7 @@ from .fakequant import (
     cosine_lr,
     install,
     load_adafactor_state,
+    opt_metrics,
 )
 from .losses import jaccard_topk_rest, kl_topk_rest, rkl_topk_rest
 from .ptq import load_text_causal_lm
@@ -904,13 +906,16 @@ def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
 
 
 def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None, aidx=None, aval=None,
-               apply: bool = True) -> float:
+               apply: bool = True, info: dict | None = None) -> float:
     """One micro-batch (an update when ``apply``): body forward, head + loss per chunk, head gradient, backward.
 
     The latents update inside backward (accumulating instead while ``apply`` is False).
 
     With ``role`` (role data, omk_qad.rollouts) only scored positions count: teacher / anchor / loop losses per
     the target token's role, normalised by the number of scored positions.
+
+    ``info`` (telemetry): gets ``tokens`` += scored positions, ``row_loss`` += each row's own mean loss over its
+    scored positions (trunk loss, MTP excluded), and ``fp_grad_norm`` (pre-clip) on an applied fp-param step.
     """
     cuda = a.device != "cpu"
     h = hidden_of(student, x, cuda)
@@ -920,6 +925,7 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     wh = head.served() if frozen else head.served().requires_grad_()
     n_tok = x.shape[0] * (x.shape[1] - 1) if role is None else max(1, int((role[:, 1:] > 0).sum()))
     tot = 0.0
+    rsum = [0.0] * x.shape[0]  # per row: its loss summed over scored positions (telemetry)
     for i in range(x.shape[0]):
         for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
             c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
@@ -934,18 +940,21 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                     loss = ce.sum() / n_tok
                     loss.backward()
                     tot += loss.item()
+                    rsum[i] += loss.item() * n_tok
                     continue
                 per = role_loss(lg, x[i, c0 + 1 : c1 + 1], r, idx[i, c0:c1], val[i, c0:c1],
                                 None if aidx is None else aidx[i, c0:c1], None if aval is None else aval[i, c0:c1], a)
                 loss = (per.sum() + a.ce_weight * ce.sum()) / n_tok
                 loss.backward()
                 tot += loss.item()
+                rsum[i] += loss.item() * n_tok
                 continue
             d = distill_loss(lg, idx[i, c0:c1], val[i, c0:c1], a)
             ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none")
             loss = (d.sum() + a.ce_weight * ce.sum()) / n_tok
             loss.backward()
             tot += loss.item()
+            rsum[i] += loss.item() * n_tok
     if a.mtp == "train" and has_mtp(student):  # MTP distillation: only mtp.* learns (trunk/embed/head detached)
         z = mtp_hidden(student, x, h, cuda)
         zd = z.detach().requires_grad_()
@@ -972,9 +981,15 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
             for p in fp_params:
                 if p.grad is not None:
                     p.grad.div_(a.accum)
-        torch.nn.utils.clip_grad_norm_(fp_params, 1.0)
+        gn = torch.nn.utils.clip_grad_norm_(fp_params, 1.0)
+        if info is not None:
+            info["fp_grad_norm"] = float(gn)
         opt.step()
         opt.zero_grad(set_to_none=True)
+    if info is not None:
+        info["tokens"] = info.get("tokens", 0) + n_tok
+        per_row = [x.shape[1] - 1] * x.shape[0] if role is None else (role[:, 1:] > 0).sum(1).tolist()
+        info.setdefault("row_loss", []).extend(r / max(1, n) for r, n in zip(rsum, per_row, strict=True))
     return tot
 
 
@@ -1470,6 +1485,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 f"reserved={torch.cuda.max_memory_reserved(a.device) / 2**30:.2f}GiB")
 
     step = start - 1
+    recent = collections.deque(maxlen=50)  # last losses: the median a SPIKE line is judged against
     guard.take(step)
     # bm-888: from_pretrained returns an eval-mode model and HF gradient checkpointing only runs while training; the
     # init eval's trailing train() is skipped on resume, which left a resumed run without checkpointing (25 -> 80 GiB)
@@ -1480,22 +1496,35 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         if opt is not None:
             for gq in opt.param_groups:
                 gq["lr"] = a.fp_lr * ctl.lr / a.lr
-        loss = 0.0
+        loss, info, ids = 0.0, {}, []
         for k in range(a.accum):  # one update = accum micro-batches of bs rows; latents apply on the last
             ctl.apply = k == a.accum - 1
-            b = rows.batch(((step - 1) * a.accum + k) * a.bs, a.bs)
+            s0 = ((step - 1) * a.accum + k) * a.bs
+            ids += rows.rows[s0 : s0 + a.bs]
+            b = rows.batch(s0, a.bs)
             x = b["x"].long().to(a.device)
             idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
             roles = {r: None if b[r] is None else b[r].to(a.device) for r in ("role", "aidx", "aval")}
             loss += train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles,
-                               apply=ctl.apply) / a.accum
+                               apply=ctl.apply, info=info) / a.accum
         rolled = guard.observe(step, loss)
-        row = {"train/loss": loss, "train/lr": ctl.lr, **({"train/guard_rollback": 1} if rolled else {})}
+        om = opt_metrics(ctl)
+        rl = info.get("row_loss") or [loss]
+        row = {"train/loss": loss, "train/lr": ctl.lr, "train/tokens": info.get("tokens", 0),
+               "train/row_loss_max": max(rl), "train/row_loss_min": min(rl), **om,
+               **({"opt/fp_grad_norm": info["fp_grad_norm"]} if "fp_grad_norm" in info else {}),
+               **({"train/guard_rollback": 1} if rolled else {})}
+        recent.append(loss)
+        med = sorted(recent)[len(recent) // 2]
+        if len(recent) >= 10 and loss > 3 * med:  # the rows behind a spike, to look them up in the cache
+            say(f"SPIKE step {step} loss={loss:.4f} (median {med:.4f}) rows {ids} "
+                f"row_loss {[round(v, 4) for v in rl]} grad_norm {om.get('opt/grad_norm', 0):.4g}")
         if step % a.log_every == 0 or step <= 3:
             mem = torch.cuda.max_memory_allocated(a.device) / 2**30 if a.device != "cpu" else 0.0
             sps = (time.time() - t0) / (step - start + 1)
             say(f"step {step} loss={loss:.5f} lr={ctl.lr:.2e} {sps:.2f}s/step "
-                f"{mem:.1f}GiB {json.dumps(ctl.stats)}")
+                f"{mem:.1f}GiB {json.dumps(ctl.stats)} rows {ids} tokens {info.get('tokens', 0)} "
+                f"grad_norm {om.get('opt/grad_norm', 0):.4g} update_ratio {om.get('opt/update_ratio', 0):.3g}")
             row.update({"train/s_per_step": sps, "train/peak_mem_gib": mem,
                         **{f"quant/{k}": v for k, v in ctl.stats.items()}})
         tel.log(row, step)
