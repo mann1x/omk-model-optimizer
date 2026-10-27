@@ -251,7 +251,10 @@ def test_role_loss_terms():
     a_val, a_idx = lp_s.topk(v, -1)  # the anchor IS the student: zero anchor loss
     x_next = torch.randint(0, v, (n,))
     ns = argparse.Namespace(loss="kl", anchor_weight=1.0, ul_weight=1.0)
-    r = torch.tensor([0, 1, 2, 3, 0, 2])
+    r = torch.tensor([0, 1, 2, 3, 0, 2, 4])
+    lg, x_next = torch.cat([lg, lg[3:4]]), torch.cat([x_next, x_next[3:4]])  # position 6 = position 3 as lead-in
+    t_idx, t_val, a_idx, a_val = (torch.cat([t, t[3:4]]) for t in (t_idx, t_val, a_idx, a_val))
+    lp_s = F.log_softmax(lg, -1)
     per = role_loss(lg, x_next, r, t_idx, t_val, a_idx, a_val, ns)
     assert per[0] == 0 and per[4] == 0  # ignored positions
     assert per[2].abs() < 1e-5 and per[5].abs() < 1e-5  # anchor == student
@@ -259,6 +262,7 @@ def test_role_loss_terms():
     ul = -torch.log(1 - lp_s.exp().gather(-1, x_next[:, None]).squeeze(-1))
     torch.testing.assert_close(per[1], kl_t[1], rtol=1e-4, atol=1e-5)
     torch.testing.assert_close(per[3], kl_t[3] + ul[3], rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(per[6], kl_t[3], rtol=1e-4, atol=1e-5)  # lead-in: teacher KL, no unlikelihood
     with pytest.raises(SystemExit, match="anchor"):
         role_loss(lg, x_next, r, t_idx, t_val, None, None, ns)
 

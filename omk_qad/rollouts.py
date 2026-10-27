@@ -4,7 +4,8 @@
 Input: JSONL rows ``{"id", "messages", "tools"?}`` in OpenAI chat form (assistant ``reasoning_content``,
 ``content``, ``tool_calls``; ``tool`` results). An assistant message may carry ``loop_spans``:
 ``[{"field": "reasoning_content" | "content", "start": c0, "end": c1}]`` (character offsets in that field,
-e.g. from automaticum's detectors).
+e.g. from automaticum's detectors), or ``{"field": "tool_calls", "index": k}`` (the k-th tool call of the turn,
+as rendered, a repeated call); ``"lead": n`` marks the n characters before the span (inside the turn) lead-in.
 
 Each token gets a role (what the trainer does at the position that PREDICTS it):
 
@@ -14,6 +15,8 @@ Each token gets a role (what the trainer does at the position that PREDICTS it):
   2 anchor   generated code: string values of code-carrying tool arguments (``--code-args``) and the inside
              of fenced code blocks in prose -> KL to the original student (keeps its coding)
   3 loop     generated text inside a loop span -> teacher KL plus unlikelihood of the repeated token
+  4 lead     generated text just before a loop span (``lead``) -> teacher KL (the turn into the loop; the
+             trainer's ``--loop-weight`` scales roles 3 and 4)
 
 Rendering is the model's own chat template, so the context of every scored token is what the model saw when
 it generated it. Templates that drop the reasoning of turns before the last user message (Gemma-4) are
@@ -57,14 +60,34 @@ from pathlib import Path
 
 import numpy as np
 
-IGNORE, TEACHER, ANCHOR, LOOP = 0, 1, 2, 3
-PRIORITY = np.array([0, 2, 1, 3])  # a token spanning several roles takes the highest: loop > teacher > anchor
+IGNORE, TEACHER, ANCHOR, LOOP, LEAD = 0, 1, 2, 3, 4
+N_ROLES = 5
+PRIORITY = np.array([0, 2, 1, 4, 3])  # a token spanning several roles takes the highest: loop > lead > teacher > anchor
 # "new_text"/"old_text": the Cerebriline SDK's editor (the automaticum pool, bm-889) -- 690k of the pool's code
 # chars; without them the pool had 496 anchor tokens. The rest are other harnesses' editors (not verified on data).
 CODE_ARGS = ("content", "new_text", "old_text", "new_string", "old_string", "new_str", "old_str", "code", "patch",
              "diff", "file_text", "replace", "search", "text")
 THOUGHT_OPEN, THOUGHT_CLOSE = "<|channel>thought\n", "<channel|>"  # Gemma-4 thinking channel
+CALL_OPEN, CALL_CLOSE = "<|tool_call>", "<tool_call|>"  # Gemma-4 rendered tool call
 FENCE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+CALL_FIELD = re.compile(r"tool_calls\[(\d+)\]")  # automaticum D117: "tool_calls[<i>].function.arguments"
+
+
+def code_like(s: str) -> bool:
+    """Text that reads as code: a ``` fence, or at least half its non-blank lines indented or ending in {};)."""
+    if "```" in s:
+        return True
+    lines = [x for x in s.splitlines() if x.strip()]
+    hits = sum(x.startswith(("    ", "\t")) or x.rstrip().endswith(("{", "}", ";", ")")) for x in lines)
+    return bool(lines) and hits / len(lines) >= 0.5
+
+
+def in_fence(field: str, start: int, end: int) -> bool:
+    """Whether ``field[start:end]`` overlaps a fenced code block of the field (closed or still open at its end)."""
+    for f in re.finditer(r"```[^\n`]*\n(.*?)(?:```|\Z)", field, re.DOTALL):
+        if f.start(1) < end and start < f.end(1):
+            return True
+    return False
 
 
 class NotPrefixError(ValueError):
@@ -256,14 +279,39 @@ def _label_turn(text: str, roles: np.ndarray, g0: int, g1: int, m: dict, code_ar
     if content and base >= 0:
         for f in FENCE.finditer(content):
             roles[g0 + base + f.start(1) : g0 + base + f.end(1)] = ANCHOR
+    found = []
     for ls in m.get("loop_spans") or []:
-        field = m.get(ls["field"]) or ""
-        at = span.find(field) if field else -1
-        if at < 0:
+        if ls["field"] == "tool_calls":
+            s0 = _nth_call(span, ls["index"])
+            hit = None if s0 is None else (s0, span.index(CALL_CLOSE, s0) + len(CALL_CLOSE))
+        else:
+            field = m.get(ls["field"]) or ""
+            if ls.get("drop_code") and (code_like(field[ls["start"] : ls["end"]])
+                                        or in_fence(field, ls["start"], ls["end"])):
+                if stats is not None:
+                    stats["loop_spans_code_dropped"] = stats.get("loop_spans_code_dropped", 0) + 1
+                continue  # a detector repeat inside code is a re-drafted edit, not a loop to unlearn
+            at = span.find(field) if field else -1
+            hit = None if at < 0 else (at + ls["start"], at + ls["end"])
+        if hit is None:
             if stats is not None:
                 stats["loop_spans_not_found"] += 1
             continue
-        roles[g0 + at + ls["start"] : g0 + at + ls["end"]] = LOOP
+        found.append((g0 + hit[0], g0 + hit[1], ls.get("lead", 0)))
+    for s0, _, lead in found:  # lead-ins first: a loop span overlapping another's lead-in stays loop
+        roles[max(g0, s0 - lead) : s0] = LEAD
+    for s0, s1, _ in found:
+        roles[s0:s1] = LOOP
+
+
+def _nth_call(span: str, k: int) -> int | None:
+    """Offset of the k-th (0-based) rendered tool call ``<|tool_call>..<tool_call|>`` in a turn, or None."""
+    at = -1
+    for _ in range(k + 1):
+        at = span.find(CALL_OPEN, at + 1)
+        if at < 0:
+            return None
+    return at if span.find(CALL_CLOSE, at) >= 0 else None
 
 
 def _find_value(span: str, key: str, val: str) -> int | None:
@@ -351,7 +399,7 @@ def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = 
     after ``<bos>`` scored (role 1), no template and no end token.
     """
     stats = {"rows": 0, "segments": 0, "refused_not_prefix": 0, "windows": 0, "code_args_not_found": 0,
-             "loop_spans_not_found": 0, "tokens_by_role": [0, 0, 0, 0],
+             "loop_spans_not_found": 0, "tokens_by_role": [0] * N_ROLES,
              **({"truncated": 0, "truncated_empty": 0} if max_tokens else {})}
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
     out = []
@@ -360,7 +408,7 @@ def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = 
     def emit(done):
         for name, x, r in done:
             out.append({"id": name, "ids": x, "role": r.tolist()})
-            for q in range(4):
+            for q in range(N_ROLES):
                 stats["tokens_by_role"][q] += int((r == q).sum())
 
     def add(sid: str, ids: list[int], troles: np.ndarray) -> None:  # one segment: cap, then pack or window it
@@ -449,12 +497,15 @@ def parse_response(body: str) -> tuple[dict, str | None]:
     return msg, finish
 
 
-def read_capture(root: Path, loop_spans: Path | None = None):
+def read_capture(root: Path, loop_spans: Path | None = None, lead: int = 0, drop_code: bool = False):
     """Captured (id, request, response or None) in send order, with loop spans attached to their response.
 
     ``loop_spans``: JSONL rows ``{"request": "<session>/<stem>.json", "field", "start", "end", "source"}``
     (automaticum D106: ``source`` is ``guard`` (an SDK reasoning_loop cut) or ``detector``; ``field``
-    ``reasoning`` names the response's reasoning_content).
+    ``reasoning`` names the response's reasoning_content), or ``{"request", "field": "tool_calls", "index",
+    "source", "detail"?}`` (a repeated tool call; automaticum D117 names it ``"field":
+    "tool_calls[<i>].function.arguments"``). ``lead``: lead-in characters before each span (role 4).
+    ``drop_code``: detector (not guard) text spans that read as code or sit in a fence are dropped when labelled.
     """
     spans: dict[str, list] = {}
     if loop_spans:
@@ -462,8 +513,15 @@ def read_capture(root: Path, loop_spans: Path | None = None):
             if ln.strip():
                 r = json.loads(ln)
                 field = FIELD_ALIAS.get(r["field"], r["field"])
+                call = CALL_FIELD.match(field)
+                if call:
+                    field, r = "tool_calls", {**r, "index": int(call.group(1))}
+                at = {"index": r["index"]} if field == "tool_calls" else {"start": r["start"], "end": r["end"]}
+                src = r.get("source", "detector")
                 spans.setdefault(r["request"], []).append(
-                    {"field": field, "start": r["start"], "end": r["end"], "source": r.get("source", "detector")})
+                    {"field": field, **at, "source": src, "lead": lead,
+                     **({"detail": r["detail"]} if "detail" in r else {}),
+                     **({"drop_code": True} if drop_code and src != "guard" and field != "tool_calls" else {})})
     for f in sorted(root.glob("**/*.json")):
         if f.name.endswith(".response.json"):
             continue
@@ -617,7 +675,7 @@ def build_capture(tok, items, seq: int, stride: int, server_kwargs: dict, code_a
                   pack: bool = False):
     """Windows of every captured request + response (see module doc) plus build statistics."""
     stats = {"requests": 0, "examples": 0, "cut": 0, "windows": 0, "code_args_not_found": 0,
-             "loop_spans_not_found": 0, "refused": {}, "tokens_by_role": [0, 0, 0, 0]}
+             "loop_spans_not_found": 0, "refused": {}, "tokens_by_role": [0] * N_ROLES}
     pad = tok.pad_token_id if tok.pad_token_id is not None else 0
     out = []
     packer = Packer(seq, pad) if pack else None
@@ -625,7 +683,7 @@ def build_capture(tok, items, seq: int, stride: int, server_kwargs: dict, code_a
     def emit(done):
         for name, x, r in done:
             out.append({"id": name, "ids": x, "role": r.tolist()})
-            for q in range(4):
+            for q in range(N_ROLES):
                 stats["tokens_by_role"][q] += int((r == q).sum())
 
     for rid, req, resp, spans in items:
@@ -666,7 +724,12 @@ def main() -> None:
                     "example per assistant turn")
     ap.add_argument("--template-kwargs", help="--capture: the server's --chat-template-kwargs JSON (request "
                     "kwargs override it), e.g. '{\"enable_thinking\": true}'; '{}' when the server sets none")
-    ap.add_argument("--loop-spans", help="--capture: JSONL {request, field, start, end} (automaticum export)")
+    ap.add_argument("--loop-spans", help="--capture: JSONL {request, field, start, end} or {request, field: "
+                    "tool_calls, index} (automaticum export)")
+    ap.add_argument("--loop-lead-chars", type=int, default=0, help="lead-in role (4) on this many generated "
+                    "characters before each loop span (--in: spans without their own \"lead\")")
+    ap.add_argument("--loop-drop-code-detector", action="store_true", help="--capture: drop detector (non-guard) "
+                    "text loop spans that read as code or sit in a ``` fence (re-drafted edits, quoted output)")
     ap.add_argument("--pack", action="store_true", help="examples shorter than --seq share windows "
                     "back to back (chat replay), instead of one padded window each")
     ap.add_argument("--tool-preamble", choices=["keep", "reasoning"], default="keep",
@@ -692,11 +755,15 @@ def main() -> None:
     if a.capture:
         if not a.allow_live_capture:
             refuse_live_capture(Path(a.capture))
-        items = read_capture(Path(a.capture), Path(a.loop_spans) if a.loop_spans else None)
+        items = read_capture(Path(a.capture), Path(a.loop_spans) if a.loop_spans else None, a.loop_lead_chars,
+                             a.loop_drop_code_detector)
         verify = (TemplateVerifier(a.verify_server, Path(a.out + ".verify.jsonl")) if a.verify_server else None)
         out, stats = build_capture(tok, items, a.seq, stride, json.loads(a.template_kwargs), code_args, verify, a.pack)
     else:
         rows = [json.loads(ln) for ln in Path(a.inp).open() if ln.strip()]
+        for m in (m for r in rows for m in r.get("messages") or []):
+            for ls in m.get("loop_spans") or []:
+                ls.setdefault("lead", a.loop_lead_chars)
         out, stats = build(tok, rows, a.seq, stride, code_args, a.history_reasoning, a.pack, a.max_tokens,
                            a.tool_preamble)
     from .runctl import atomic_json, atomic_write

@@ -13,6 +13,7 @@ import pytest
 from omk_qad.rollouts import (
     ANCHOR,
     IGNORE,
+    LEAD,
     LOOP,
     TEACHER,
     build,
@@ -151,6 +152,31 @@ def test_build_statistics_and_refusal(tok):
     assert st2["loop_spans_not_found"] == 1
 
 
+def test_a_repeated_tool_call_is_loop_with_its_lead_in(tok):
+    """A tool_calls span: the whole k-th rendered call is loop (its code too), ``lead`` chars before it lead-in.
+
+    The first call stays teacher/anchor; an index past the turn's calls is counted, not guessed.
+    """
+    from omk_qad.rollouts import _norm
+
+    call = {"type": "function", "function": {"name": "write_file",
+                                             "arguments": json.dumps({"path": "game.js", "content": CODE})}}
+    turn = {"role": "assistant", "reasoning_content": "Write it.", "content": "",
+            "tool_calls": [{**call, "id": "c1"}, {**call, "id": "c2"}],
+            "loop_spans": [{"field": "tool_calls", "index": 1, "lead": 12}]}
+    text, roles = render_segment(tok, _norm([*CONV[:2], turn]), TOOLS, 3)
+    sp = _spans(tok, text, roles)
+    by = {q: "".join(s for r, s in sp if r == q) for q in (TEACHER, ANCHOR, LOOP, LEAD)}
+    assert by[LOOP].startswith("<|tool_call>call:write_file") and by[LOOP].endswith("<tool_call|>")
+    assert CODE in by[LOOP] and CODE in by[ANCHOR]  # loop > anchor in the repeat; the first call keeps its code
+    assert by[LOOP].count("<|tool_call>") == 1 and "<|tool_call>call:write_file" in by[TEACHER]
+    assert [q for q, _ in sp].count(LEAD) == 1 and any(q0 == LEAD and q1 == LOOP for (q0, _), (q1, _) in pairwise(sp))
+    st = {"code_args_not_found": 0, "loop_spans_not_found": 0}
+    turn["loop_spans"] = [{"field": "tool_calls", "index": 2}]
+    _, roles = render_segment(tok, _norm([*CONV[:2], turn]), TOOLS, 3, stats=st)
+    assert st["loop_spans_not_found"] == 1 and not (roles == LOOP).any()
+
+
 def test_stripped_history_one_example_per_turn(tok):
     """opencoti-provider rollouts: earlier reasoning is not re-sent, so each turn is its own example."""
     from omk_qad.rollouts import _norm, render_turns
@@ -242,7 +268,8 @@ def test_request_capture(tok, tmp_path):
                                  "source": "guard"}))  # automaticum's export names (D106)
     items = list(read_capture(root, spans))
     assert [len(x[3]) for x in items] == [0, 0, 1, 0] and items[3][2] is None
-    assert items[2][3] == [{"field": "reasoning_content", "start": 14, "end": 14 + len(loop), "source": "guard"}]
+    assert items[2][3] == [{"field": "reasoning_content", "start": 14, "end": 14 + len(loop), "source": "guard",
+                            "lead": 0}]
 
     text, roles = render_captured(tok, body, done, [], kw)
     sp = _spans(tok, text, roles)
@@ -270,6 +297,45 @@ def test_request_capture(tok, tmp_path):
     out, st = build_capture(tok, read_capture(root, spans), 256, 128, kw)
     assert st["requests"] == 4 and st["examples"] == 3 and st["cut"] == 1 and st["refused"] == {"no_response": 1}
     assert st["tokens_by_role"][LOOP] > 0 and st["tokens_by_role"][ANCHOR] > 0
+
+
+def test_code_detector_spans_are_dropped_and_d117_calls_are_read(tok, tmp_path):
+    """--loop-drop-code-detector: a detector repeat in code is dropped (guard and prose kept); D117 call fields."""
+    from omk_qad.rollouts import code_like, in_fence, read_capture, render_captured
+
+    assert code_like("    x = 1\n    y = 2") and code_like("```js\nx\n```") and not code_like("I should look.")
+    assert in_fence("a\n```py\nx = 1\n```\nb", 9, 14) and not in_fence("a\n```py\nx = 1\n```\nb", 0, 1)
+    assert in_fence("Plan.\n```py\nx = 1\n", 13, 18)  # a fence still open at the end of the field
+    draft = "```js\nlet a = 1;\n```\n"
+    reason = "Plan. Plan. " + draft + draft
+    call = {"index": 0, "id": "c1", "function": {"name": "write_file", "arguments": '{"path": "a.js", "content": "x"}'}}
+    resp = {"status": 200, "complete": True, "body": _sse({"reasoning_content": reason},
+                                                          {"tool_calls": [call]}, {"tool_calls": [{**call, "index": 1,
+                                                                                                   "id": "c2"}]},
+                                                          finish="tool_calls")}
+    body = {"model": "g", "messages": _wire(CONV[:2]), "tools": TOOLS, "stream": True}
+    root = _capture(tmp_path, [(body, resp)])
+    rid = next(str(f.relative_to(root)) for f in root.glob("**/*.json") if "response" not in f.name)
+    d2 = len("Plan. Plan. ") + len(draft)
+    rows = [{"request": rid, "field": "reasoning", "start": 6, "end": 11, "source": "detector"},  # prose: kept
+            {"request": rid, "field": "reasoning", "start": d2, "end": d2 + len(draft), "source": "detector"},
+            {"request": rid, "field": "reasoning", "start": d2 + 6, "end": d2 + 16, "source": "guard"},  # kept
+            {"request": rid, "field": "tool_calls[1].function.arguments", "start": 0, "end": 33,
+             "source": "detector", "detail": "repeated_tool_call"}]
+    spans = tmp_path / "spans.jsonl"
+    spans.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    (_, _, _, got), = read_capture(root, spans, drop_code=True)
+    assert [g.get("drop_code", False) for g in got] == [True, True, False, False]
+    assert got[3]["field"] == "tool_calls" and got[3]["index"] == 1 and "start" not in got[3]
+    st = {"code_args_not_found": 0, "loop_spans_not_found": 0}
+    text, roles = render_captured(tok, body, resp, got, {"enable_thinking": True}, stats=st)
+    sp = _spans(tok, text, roles)
+    loop = [s for q, s in sp if q == LOOP]
+    assert st.get("loop_spans_code_dropped") == 1 and st["loop_spans_not_found"] == 0
+    assert any(x.strip() == "Plan." for x in loop) and any("let a = 1" in x for x in loop)  # prose + guard
+    assert any(x.startswith("<|tool_call>") for x in loop) and len(loop) == 3
+    (_, _, _, kept), = read_capture(root, spans)  # without the flag nothing is marked
+    assert not any("drop_code" in g for g in kept)
 
 
 def test_pack_shares_windows_and_keeps_roles():

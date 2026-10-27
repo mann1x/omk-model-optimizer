@@ -797,8 +797,14 @@ def distill_loss(logits, idx, val, a) -> torch.Tensor:
 
 
 def teacher_scored(role: torch.Tensor) -> torch.Tensor:
-    """Positions whose loss is distillation from the teacher (roles 1 and 3; 2 = anchor, 0 = not trained)."""
-    return (role == 1) | (role == 3)
+    """Positions whose loss is distillation from the teacher (roles 1, 3, 4; 2 = anchor, 0 = not trained)."""
+    return (role == 1) | (role >= 3)
+
+
+def role_weight(role: torch.Tensor, a) -> torch.Tensor:
+    """Per-position loss weight: 0 unscored, ``--loop-weight`` on loop (3) and lead-in (4) positions, else 1."""
+    w = (role > 0).float()
+    return torch.where(role >= 3, w * getattr(a, "loop_weight", 1.0), w)
 
 
 @torch.no_grad()
@@ -893,8 +899,8 @@ def _score(student, head, ev, a) -> dict:
 
 
 def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
-    """Per-token loss of one chunk under roles (omk_qad.rollouts): 1 teacher, 2 anchor, 3 teacher + unlikelihood."""
-    per = distill_loss(lg, idx, val, a) * ((r == 1) | (r == 3))
+    """Per-token loss of one chunk under roles (omk_qad.rollouts): 1/4 teacher, 2 anchor, 3 teacher + unlikelihood."""
+    per = distill_loss(lg, idx, val, a) * teacher_scored(r)
     if (r == 2).any():
         if aidx is None:
             raise SystemExit("anchor-role positions without anchor targets (run --phase cache --anchor)")
@@ -912,10 +918,12 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     The latents update inside backward (accumulating instead while ``apply`` is False).
 
     With ``role`` (role data, omk_qad.rollouts) only scored positions count: teacher / anchor / loop losses per
-    the target token's role, normalised by the number of scored positions.
+    the target token's role, a weighted mean with ``--loop-weight`` on loop and lead-in positions (1 elsewhere).
 
     ``info`` (telemetry): gets ``tokens`` += scored positions, ``row_loss`` += each row's own mean loss over its
-    scored positions (trunk loss, MTP excluded), and ``fp_grad_norm`` (pre-clip) on an applied fp-param step.
+    scored positions (trunk loss, MTP excluded), ``fp_grad_norm`` (pre-clip) on an applied fp-param step, and with
+    role data ``role_loss`` / ``loop_loss`` (the trunk loss and its loop + lead-in part), ``loop_tokens`` /
+    ``lead_tokens``.
     """
     cuda = a.device != "cpu"
     h = hidden_of(student, x, cuda)
@@ -923,8 +931,9 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     frozen = getattr(head, "frozen", False)  # bf16 mode: a head outside the scope gets no weight gradient
     head.add_use()
     wh = head.served() if frozen else head.served().requires_grad_()
-    n_tok = x.shape[0] * (x.shape[1] - 1) if role is None else max(1, int((role[:, 1:] > 0).sum()))
-    tot = 0.0
+    wt = None if role is None else role_weight(role[:, 1:], a)
+    n_tok = x.shape[0] * (x.shape[1] - 1) if role is None else max(1e-6, float(wt.sum()))
+    tot, lsum = 0.0, 0.0
     rsum = [0.0] * x.shape[0]  # per row: its loss summed over scored positions (telemetry)
     for i in range(x.shape[0]):
         for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
@@ -934,8 +943,8 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                 lg = softcap(F.linear(hd[i, c0:c1], wh), getattr(a, "softcap", None))
             if role is not None:
-                r = role[i, c0 + 1 : c1 + 1].long()
-                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * (r > 0)
+                r, w = role[i, c0 + 1 : c1 + 1].long(), wt[i, c0:c1]
+                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * w
                 if a.loss == "ce":  # SFT: every scored position is plain next-token CE (no teacher targets)
                     loss = ce.sum() / n_tok
                     loss.backward()
@@ -944,7 +953,10 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                     continue
                 per = role_loss(lg, x[i, c0 + 1 : c1 + 1], r, idx[i, c0:c1], val[i, c0:c1],
                                 None if aidx is None else aidx[i, c0:c1], None if aval is None else aval[i, c0:c1], a)
-                loss = (per.sum() + a.ce_weight * ce.sum()) / n_tok
+                per = per * w + a.ce_weight * ce
+                loss = per.sum() / n_tok
+                if info is not None and (r >= 3).any():
+                    lsum += float(per[r >= 3].sum()) / n_tok
                 loss.backward()
                 tot += loss.item()
                 rsum[i] += loss.item() * n_tok
@@ -987,9 +999,17 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
         opt.step()
         opt.zero_grad(set_to_none=True)
     if info is not None:
-        info["tokens"] = info.get("tokens", 0) + n_tok
-        per_row = [x.shape[1] - 1] * x.shape[0] if role is None else (role[:, 1:] > 0).sum(1).tolist()
-        info.setdefault("row_loss", []).extend(r / max(1, n) for r, n in zip(rsum, per_row, strict=True))
+        if role is None:
+            info["tokens"] = info.get("tokens", 0) + n_tok
+            per_row = [x.shape[1] - 1] * x.shape[0]
+        else:
+            rt = role[:, 1:]
+            info["tokens"] = info.get("tokens", 0) + int((rt > 0).sum())
+            per_row = wt.sum(1).tolist()  # rsum is weighted: its weighted mean
+            for k, q in (("role_loss", sum(rsum) / n_tok), ("loop_loss", lsum),
+                         ("loop_tokens", int((rt == 3).sum())), ("lead_tokens", int((rt == 4).sum()))):
+                info[k] = info.get(k, 0) + q
+        info.setdefault("row_loss", []).extend(r / max(1e-6, n) for r, n in zip(rsum, per_row, strict=True))
     return tot
 
 
@@ -1115,6 +1135,8 @@ def train_identity(a) -> dict:
     if ident.get("accum") == 1 and not ident.get("beta1"):  # likewise every run before --accum/--beta1
         for k in ("accum", "beta1", "state_dtype"):
             ident.pop(k, None)
+    if ident.get("loop_weight") == 1.0:  # likewise every run before --loop-weight
+        ident.pop("loop_weight", None)
     ident["id_model"] = _model_id(a.model)
     cmeta = json.loads((Path(a.cache) / "cache.json").read_text())
     ident["id_cache"] = ({k: cmeta.get(k) for k in ("identity", "n_seq", "anchor_model")} if "identity" in cmeta
@@ -1513,6 +1535,9 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         row = {"train/loss": loss, "train/lr": ctl.lr, "train/tokens": info.get("tokens", 0),
                "train/row_loss_max": max(rl), "train/row_loss_min": min(rl), **om,
                **({"opt/fp_grad_norm": info["fp_grad_norm"]} if "fp_grad_norm" in info else {}),
+               **({"train/loop_share": info["loop_loss"] / max(1e-12, info["role_loss"]),
+                   "train/loop_tokens": info["loop_tokens"], "train/lead_tokens": info["lead_tokens"]}
+                  if "role_loss" in info else {}),
                **({"train/guard_rollback": 1} if rolled else {})}
         recent.append(loss)
         med = sorted(recent)[len(recent) // 2]
@@ -1524,7 +1549,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             sps = (time.time() - t0) / (step - start + 1)
             say(f"step {step} loss={loss:.5f} lr={ctl.lr:.2e} {sps:.2f}s/step "
                 f"{mem:.1f}GiB {json.dumps(ctl.stats)} rows {ids} tokens {info.get('tokens', 0)} "
-                f"grad_norm {om.get('opt/grad_norm', 0):.4g} update_ratio {om.get('opt/update_ratio', 0):.3g}")
+                f"grad_norm {om.get('opt/grad_norm', 0):.4g} update_ratio {om.get('opt/update_ratio', 0):.3g}"
+                + (f" loop_share {row['train/loop_share']:.3f}" if "train/loop_share" in row else ""))
             row.update({"train/s_per_step": sps, "train/peak_mem_gib": mem,
                         **{f"quant/{k}": v for k, v in ctl.stats.items()}})
         tel.log(row, step)
@@ -1627,6 +1653,8 @@ def main(argv=None) -> None:
                     "anchor-role positions of an existing role cache (bf16 recovery: the original student)")
     ap.add_argument("--anchor-weight", type=float, default=1.0, help="train: weight of the anchor-role loss")
     ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens")
+    ap.add_argument("--loop-weight", type=float, default=1.0, help="train: weight of loop (3) and lead-in (4) "
+                    "positions in the weighted-mean loss (train/loop_share logs the realised share)")
     ap.add_argument("--model", required=True, help="HF model dir (weights) of the teacher / student base")
     ap.add_argument("--teacher-gguf", default="", help="cache: the teacher as a GGUF, run by libllama "
                     "(omk_qad.gguf_teacher); --model then gives the tokenizer only. No imatrix")

@@ -175,6 +175,36 @@ def test_cpu_model_runs_torch_kernels_whether_or_not_a_gpu_is_visible(setup):
     assert torch.equal(here, torch.load(ref))
 
 
+def test_loop_weight_is_a_weighted_mean_and_reports_its_share(setup):
+    """--loop-weight W: loop (3) and lead-in (4) positions weigh W in a weighted mean; info carries the share."""
+    from omk_qad import train as T
+
+    model, lay = setup["moe"]
+    sh = torch.load(setup["cache"] / "train_0000.pt")
+    x, idx, val = sh["x"][:2].long(), sh["idx"][:2], sh["val"][:2]
+    role = torch.ones_like(x, dtype=torch.int8)
+    role[:, :5] = 0
+    role[0, 10:14], role[1, 20:24] = 3, 4
+    got = {}
+    for w in (1.0, 5.0):
+        a = _args(model, mtp="freeze", anchor_weight=1.0, ul_weight=1.0, loop_weight=w)
+        student, lats, fp, _, head = T.build_student(a, torch.load(lay, weights_only=False))
+        for lat in lats.values():
+            lat.update = lambda g: None  # no step: both weights see the same model
+        info = {}
+        loss = T.train_step(student, lats, lats[head], fp, None, x, idx, val, a, role=role, info=info)
+        got[w] = (loss, info)
+    (l1, i1), (l5, i5) = got[1.0], got[5.0]
+    n = int((role[:, 1:] > 0).sum())
+    assert i1["tokens"] == i5["tokens"] == n and i1["loop_tokens"] == 4 == i1["lead_tokens"]
+    assert abs(i1["role_loss"] - l1) < 1e-5 * max(1, l1)  # MTP frozen: the trunk loss is the whole loss
+    s1 = i1["loop_loss"] / i1["role_loss"]
+    assert 0 < s1 < 1
+    sl, so = s1 * l1 * n, (1 - s1) * l1 * n  # unweighted loop / other loss sums
+    assert abs(i5["loop_loss"] / i5["role_loss"] - 5 * sl / (5 * sl + so)) < 1e-4
+    assert abs(l5 - (5 * sl + so) / (n - 8 + 5 * 8)) < 1e-4 * l5
+
+
 @pytest.mark.parametrize("kind", ["moe", "dense_tied"])
 def test_gradients_match_autograd(setup, kind):
     """Hook path (served weights, use counting, checkpoint recompute, chunked head) == plain autograd.
