@@ -421,6 +421,7 @@ def test_sft_trains_on_role_windows_with_no_teacher_targets(g4, roles_cache):
     assert proc.returncode == 0 or "is finished and immutable" in log, log[-3000:]
     text = (out / "stage1" / "log.txt").read_text()
     assert f"DATA sft {n} rows, order shuffle" in text
+    assert "SRCLOSS window 32 rows, trained share {\"conv\": 1.0}" in text and "SRCLOSS step 1 fixmix" in text
     ck = _ckpt(out)
     assert ck["step"] == steps and all(torch.isfinite(t.float()).all() for t in ck["latents"].values())
     losses = [float(ln.split("loss=")[1].split()[0]) for ln in text.splitlines() if ln.startswith("step ")]

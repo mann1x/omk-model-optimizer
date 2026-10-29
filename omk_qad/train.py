@@ -150,6 +150,41 @@ def _stream(path: str, tok, seq: int, eos: int, passes: list):
     return ((x, None) for x in _packed(path, tok, seq, eos, passes))
 
 
+def source_names(paths: list[str]) -> list[str]:
+    """Short distinct names of training source files (the W&B ``train/src/<name>`` keys): file name less its suffix."""
+    names = []
+    for p in paths:
+        n = Path(p).name
+        for suf in (".roles.jsonl", ".jsonl", ".txt"):
+            n = n.removesuffix(suf)
+        names.append(n if n not in names else f"{n}#{len(names)}")
+    return names
+
+
+def cache_row_sources(meta: dict) -> list[str] | None:
+    """The source of every cached row, redrawn from the cache's own seeded picks (``_phase_cache``), or None.
+
+    The cache interleaves its sources (``rng.choices`` by weight, per shard) and records only their totals, so the
+    row -> source map is the same seeded draw. None when the redraw does not reproduce ``rows_per_source``.
+    """
+    args = meta.get("args", {})
+    srcs = [(q.split("=")[0], float(q.split("=")[1]) if "=" in q else 1.0)
+            for q in args.get("data", "").split(",") if q]
+    if not srcs or "rows_per_source" not in meta:
+        return None
+    rng, picks = random.Random(args.get("seed", 0)), []
+    for s0 in range(0, meta["n_seq"], meta["shard"]):
+        picks += rng.choices(range(len(srcs)), [w for _, w in srcs], k=min(meta["shard"], meta["n_seq"] - s0))
+    paths = [p for p, _ in srcs]
+    redrawn: dict = {}
+    for k in picks:
+        redrawn[paths[k]] = redrawn.get(paths[k], 0) + 1
+    if redrawn != meta["rows_per_source"]:
+        return None
+    names = source_names(paths)
+    return [names[k] for k in picks]
+
+
 # ===================================================================================================== telemetry
 # The API key IS the switch (omnimergekit's gepo_brevity / train_grpo_efficiency pattern): WANDB_API_KEY, else the
 # api.wandb.ai entry of ~/.netrc. A key anywhere on the host means the run logs to W&B with nothing to remember on
@@ -1099,7 +1134,8 @@ STATE_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 RUNTIME_ARGS = {"phase", "device", "stop_at", "log_every", "eval_every", "save_every", "save_minutes", "snapshot_every",
                 "snapshot_keep", "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change",
                 "llama_cpp", "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf",
-                "loss_chunk", "eval_set"}  # an eval set only measures: a run may gain one on resume
+                "loss_chunk", "eval_set",  # an eval set only measures: a run may gain one on resume
+                "source_window"}  # telemetry only
 
 
 def _model_id(model: str) -> dict:
@@ -1302,8 +1338,9 @@ class CacheRows:
     """The cached training rows in the order a run consumes them, one batch at a time.
 
     ``shuffle`` (default): one permutation of every cached row, seeded by ``--seed`` alone, so a resume continues it
-    and a batch mixes sources and documents. Cache rows follow their source files' order, and a rollout source is
-    sorted by run: in that order bm-889 trained one rollout at a time (steps 201-300 were a single run). Shards are
+    and a batch mixes sources and documents. Cache rows interleave their sources (a seeded draw by weight, see
+    ``cache_row_sources``) but follow each source file's own order, and a rollout source is sorted by run: in that
+    order bm-889 trained one rollout at a time (steps 201-300 were a single run). Shards are
     memory-mapped, so a batch reads only its rows. ``cache``: the cache's own order, one shard in memory at a time
     (the order of runs made before --data-order).
     """
@@ -1356,14 +1393,15 @@ class SftRows:
 
     def __init__(self, files: list[str], seq: int, order: str, seed: int):
         """Read every row of ``files`` (``seq`` tokens each) and fix their order."""
-        xs, rs = [], []
-        for f in files:
+        xs, rs, self.source = [], [], []
+        for f, name in zip(files, source_names(files), strict=True):
             done: list = []
             for x, r in _role_rows(f, seq, done):
                 if done:
                     break
                 xs.append(x.to(torch.int32))
                 rs.append(r)
+                self.source.append(name)
         if not xs:
             raise SystemExit("--sft-data: no rows")
         self.x, self.role = torch.stack(xs), torch.stack(rs)
@@ -1379,6 +1417,44 @@ class SftRows:
         """Rows ``s0 .. s0+bs`` of the order (as ``CacheRows.batch``, teacher keys None)."""
         sel = torch.tensor(self.rows[s0 : s0 + bs])
         return {"x": self.x[sel], "role": self.role[sel], "idx": None, "val": None, "aidx": None, "aval": None}
+
+
+class SourceLoss:
+    """Per-source training loss, so a trend is readable under a changing batch mix.
+
+    A batch draws a few rows from sources whose losses differ ~10x (bm-889 sft1: FineWeb ~2.4, opencode ~0.3), so
+    ``train/loss`` swings with the mix and hid a 0.68 -> 0.49 drop on the code sources. Each row's own loss goes to
+    its source: ``train/src/<name>`` (this step's rows of it), ``train/src_avg/<name>`` (mean of its last ``window``
+    rows) and ``train/loss_fixmix`` (the ``src_avg`` means weighted by each source's share of the rows the run
+    trains on: the mix-free curve, logged once every source has rows). The window starts empty on a resume.
+    """
+
+    def __init__(self, source: list[str], trained: list[int], window: int):
+        """``source``: name of every row; ``trained``: the rows the run consumes (its share weights)."""
+        self.source = source
+        n = collections.Counter(source[i] for i in trained)
+        self.share = {k: v / len(trained) for k, v in n.items()}
+        self.recent = {k: collections.deque(maxlen=window) for k in self.share}
+
+    def row(self, ids: list[int], losses: list[float]) -> dict:
+        """W&B keys of one step from its rows ``ids`` and their own losses (none when they do not pair up)."""
+        if len(ids) != len(losses):
+            return {}
+        now: dict = collections.defaultdict(list)
+        for i, q in zip(ids, losses, strict=True):
+            now[self.source[i]].append(q)
+        for k, v in now.items():
+            self.recent[k].extend(v)
+        out = {f"train/src/{k}": sum(v) / len(v) for k, v in now.items()}
+        avg = self.averages()
+        out.update({f"train/src_avg/{k}": v for k, v in avg.items()})
+        if len(avg) == len(self.share):
+            out["train/loss_fixmix"] = sum(self.share[k] * avg[k] for k in self.share)
+        return out
+
+    def averages(self) -> dict:
+        """Mean of each source's recent rows (sources with none yet left out)."""
+        return {k: sum(d) / len(d) for k, d in self.recent.items() if d}
 
 
 def legacy_data_order(run: Path, order: str, log=print) -> str:
@@ -1493,6 +1569,15 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     src = f"sft {len(rows)} rows, " if sft else ""
     how = f" (seed {a.seed}): first rows {rows.rows[:8]}" if a.data_order == "shuffle" else ": cache rows in sequence"
     say(f"DATA {src}order {a.data_order}{how}")
+    per_src = None
+    if a.source_window:
+        names = rows.source if sft else cache_row_sources(meta)
+        if names is None:
+            say("SRCLOSS off: the cache's row sources cannot be redrawn (its rows_per_source does not match)")
+        else:
+            per_src = SourceLoss(names, rows.rows[: last * a.bs * a.accum], a.source_window)
+            say(f"SRCLOSS window {a.source_window} rows, trained share "
+                + json.dumps({k: round(v, 4) for k, v in per_src.share.items()}))
     t0, t_save = time.time(), time.time()
 
     def checkpoint(step, path=last_ck):
@@ -1539,6 +1624,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                    "train/loop_tokens": info["loop_tokens"], "train/lead_tokens": info["lead_tokens"]}
                   if "role_loss" in info else {}),
                **({"train/guard_rollback": 1} if rolled else {})}
+        if per_src is not None and "row_loss" in info:
+            row.update(per_src.row(ids, rl))
         recent.append(loss)
         med = sorted(recent)[len(recent) // 2]
         if len(recent) >= 10 and loss > 3 * med:  # the rows behind a spike, to look them up in the cache
@@ -1553,6 +1640,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 + (f" loop_share {row['train/loop_share']:.3f}" if "train/loop_share" in row else ""))
             row.update({"train/s_per_step": sps, "train/peak_mem_gib": mem,
                         **{f"quant/{k}": v for k, v in ctl.stats.items()}})
+            if per_src is not None and per_src.averages():
+                fm = row.get("train/loss_fixmix")
+                say(f"SRCLOSS step {step} fixmix {'-' if fm is None else f'{fm:.4f}'} "
+                    + json.dumps({k: round(v, 4) for k, v in per_src.averages().items()}))
         tel.log(row, step)
         if step % a.eval_every == 0 or step == last:
             results.append(evaluate(student, head, ev, a, f"step{step}", dict(ctl.stats), sets))
@@ -1735,6 +1826,9 @@ def main(argv=None) -> None:
     ap.add_argument("--branch", default="", help="stage-2 branch name (each variant of stage 2 is its own branch)")
     ap.add_argument("--init-from", default="", help="stage 2: stage-1 final.pt (default <out>/stage1/final.pt)")
     ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--source-window", type=int, default=32,
+                    help="per-source loss telemetry (train/src*, train/loss_fixmix): rows per source in the running "
+                    "mean; 0 turns it off")
     ap.add_argument("--wandb-project", default="", help="W&B project (default $WANDB_PROJECT or omk-qad). W&B is on "
                     "by itself when a key exists (WANDB_API_KEY or ~/.netrc); naming any --wandb-* makes it required")
     ap.add_argument("--wandb-name", default="", help="W&B run name (default <run>-<student>-<stage>)")

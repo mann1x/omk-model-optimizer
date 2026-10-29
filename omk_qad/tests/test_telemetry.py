@@ -139,3 +139,42 @@ def test_resume_without_rewind_skips_the_rows_wandb_holds(tmp_path, fake_wandb, 
     for step in (41, 45, 46):
         t.log({"train/loss": float(step)}, step)
     assert t.wb.rows == [(46, {"train/loss": 46.0})]
+
+
+def test_source_loss_tracks_each_source_and_a_fixed_mix():
+    src = ["web", "web", "code", "code", "code", "code"]
+    sl = T.SourceLoss(src, trained=list(range(6)), window=2)
+    assert sl.share == {"web": 1 / 3, "code": 2 / 3}
+    first = sl.row([0, 2], [2.4, 0.3])
+    assert first["train/src/web"] == 2.4 and first["train/src/code"] == 0.3
+    assert first["train/loss_fixmix"] == pytest.approx(2.4 / 3 + 0.3 * 2 / 3)
+    nxt = sl.row([3, 4], [0.2, 0.1])  # an all-code batch: the raw loss drops, the fixed mix only by code's share
+    assert "train/src/web" not in nxt and nxt["train/src/code"] == pytest.approx(0.15)
+    assert nxt["train/src_avg/code"] == pytest.approx(0.15)  # window 2: the 0.3 has left
+    assert nxt["train/loss_fixmix"] == pytest.approx(2.4 / 3 + 0.15 * 2 / 3)
+    assert sl.row([0, 1], [1.0]) == {}  # losses that do not pair with the rows log nothing
+
+
+def test_source_loss_waits_for_every_source_before_the_fixed_mix():
+    sl = T.SourceLoss(["a", "b", "c"], trained=[0, 1, 2], window=4)
+    assert "train/loss_fixmix" not in sl.row([0, 1], [1.0, 2.0])
+    assert "train/loss_fixmix" in sl.row([2], [3.0])
+
+
+def test_cache_row_sources_redraws_the_seeded_interleave():
+    import random
+
+    data, n_seq, shard, seed = "dir/pool.roles.jsonl=3,dir/text.txt=1", 20, 8, 5
+    rng, picks = random.Random(seed), []
+    for s0 in range(0, n_seq, shard):  # as _phase_cache draws them
+        picks += rng.choices(range(2), [3.0, 1.0], k=min(shard, n_seq - s0))
+    rps = {"dir/pool.roles.jsonl": picks.count(0), "dir/text.txt": picks.count(1)}
+    meta = {"args": {"data": data, "seed": seed}, "n_seq": n_seq, "shard": shard, "rows_per_source": rps}
+    assert T.cache_row_sources(meta) == [("pool", "text")[k] for k in picks]
+    assert T.cache_row_sources({**meta, "rows_per_source": {**rps, "dir/text.txt": rps["dir/text.txt"] + 1}}) is None
+    assert T.cache_row_sources({**meta, "args": {"seed": seed}}) is None
+
+
+def test_source_names_are_short_and_distinct():
+    assert T.source_names(["a/sft_x_train.roles.jsonl", "b/sft_x_train.roles.jsonl", "c/web.txt"]) == \
+        ["sft_x_train", "sft_x_train#1", "web"]
