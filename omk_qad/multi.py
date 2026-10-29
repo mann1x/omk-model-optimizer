@@ -437,7 +437,7 @@ def phase_report(spec: dict, students: list[dict]) -> dict:
                "fixed": lay.get("fixed"), "teacher_ppl": last.get("teacher_ppl"),
                **{c: last.get(c) for c in COLS}, **{f"init_{c}": init.get(c) for c in COLS}}
         for fam, m in last.get("families", {}).items():
-            row[f"klk:{fam}"] = m["klk"]
+            row[f"klk:{fam}"] = m.get("klk")  # an SFT run's families carry nll / ppl only
         if exp.exists():
             row["gguf_mib"] = round(json.loads(exp.read_text())["size_bytes"] / 2**20, 1)
         rows.append(row)

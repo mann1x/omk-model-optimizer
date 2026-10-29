@@ -8,6 +8,7 @@ Artifacts go to $OMK_QAD_WORK (persistent disk; /tmp is tmpfs on solidpc).
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -414,14 +415,22 @@ def test_sft_trains_on_role_windows_with_no_teacher_targets(g4, roles_cache):
     n = json.loads(rfile.with_suffix(".stats.json").read_text())["windows"]
     steps = max(1, n // 2)
     out = WORK / "run_sft"
-    sft = ("--loss", "ce", "--sft-data", str(rfile), "--mtp", "freeze")
+    shutil.rmtree(out, ignore_errors=True)  # a finished run refuses a relaunch: its log would be the last run's
+    efile = WORK / "conv_eval.roles.jsonl"  # held-out stand-in: another file (same windows; mechanics only)
+    efile.write_bytes(rfile.read_bytes())
+    efile.with_suffix(".stats.json").write_bytes(rfile.with_suffix(".stats.json").read_bytes())
+    sft = ("--loss", "ce", "--sft-data", str(rfile), "--mtp", "freeze", "--sft-eval", str(efile))
     proc = _run("omk_qad.train", *TRAIN, *sft, "--model", str(g4["student"]), "--cache", str(roles_cache),
                 "--out", str(out), "--steps", str(steps), "--eval-every", str(steps), check=False)
     log = proc.stdout + proc.stderr
-    assert proc.returncode == 0 or "is finished and immutable" in log, log[-3000:]
+    assert proc.returncode == 0, log[-3000:]
     text = (out / "stage1" / "log.txt").read_text()
     assert f"DATA sft {n} rows, order shuffle" in text
     assert "SRCLOSS window 32 rows, trained share {\"conv\": 1.0}" in text and "SRCLOSS step 1 fixmix" in text
+    assert f"SFT_EVAL {n} held-out rows" in text
+    evals = [json.loads(ln.split("EVAL ", 1)[1]) for ln in text.splitlines() if ln.startswith("EVAL ")]
+    assert [e["tag"] for e in evals] == ["init", f"step{steps}"], evals
+    assert all(set(e["families"]) == {"conv_eval"} and "klk" not in e and 0 < e["nll"] < 50 for e in evals), evals
     ck = _ckpt(out)
     assert ck["step"] == steps and all(torch.isfinite(t.float()).all() for t in ck["latents"].values())
     losses = [float(ln.split("loss=")[1].split()[0]) for ln in text.splitlines() if ln.startswith("step ")]
@@ -431,6 +440,8 @@ def test_sft_trains_on_role_windows_with_no_teacher_targets(g4, roles_cache):
                        (("--loss", "ce", "--mtp", "freeze"), "--loss ce trains on --sft-data"),
                        ((*sft, "--ce-weight", "1"), "count it twice"),
                        (("--loss", "ce", "--sft-data", str(rfile)), "--mtp freeze"),
+                       (sft[:-2], "needs --sft-eval"),
+                       ((*sft[:-1], str(rfile)), "are trained on"),
                        ((*sft, "--steps", str(n)), f"--sft-data holds {n} rows")):
         bad = _run(*base, *extra, "--out", str(WORK / "run_sft_refused"), check=False)
         assert bad.returncode != 0 and why in bad.stdout + bad.stderr, (extra, (bad.stdout + bad.stderr)[-800:])

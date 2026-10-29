@@ -860,6 +860,47 @@ def evaluate(student, head, ev, a, tag, extra=None, sets=None) -> dict:
     return res
 
 
+@torch.no_grad()
+def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) -> dict:
+    """``--loss ce``: next-token CE on the corpus's held-out rows (``--sft-eval``) where training scores (role > 0).
+
+    ``nll`` / ``ppl`` pool every scored token; ``nll_mean`` weighs each source equally (the held-out mix differs from
+    the trained one); ``families`` has each source's own. ``sets`` (``--eval-set``): teacher-KL role sets, a
+    stage-2 distillation diagnostic reported beside it, only when named.
+    """
+    student.eval()
+    cuda = a.device != "cpu"
+    wh = head.served()
+    acc: dict = {}  # source -> [nll sum, scored tokens]
+    for i0 in range(0, len(ev), 4):
+        sel = list(range(i0, min(i0 + 4, len(ev))))
+        x = ev.x[sel].long().to(a.device)
+        h = hidden_of(student, x, cuda)
+        for i, r in enumerate(sel):
+            for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
+                c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
+                m = (ev.role[r, c0 + 1 : c1 + 1] > 0).to(a.device)  # the predicted token's role, as in training
+                if not m.any():
+                    continue
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
+                    lg = softcap(F.linear(h[i, c0:c1], wh), getattr(a, "softcap", None))
+                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none")[m]
+                s = acc.setdefault(ev.source[r], [0.0, 0])
+                s[0] += ce.sum().item()
+                s[1] += int(m.sum())
+    n = sum(c for _, c in acc.values())
+    nll = sum(v for v, _ in acc.values()) / max(1, n)
+    fam = {k: {"nll": v / c, "ppl": math.exp(v / c), "scored": c} for k, (v, c) in acc.items()}
+    mean = sum(f["nll"] for f in fam.values()) / max(1, len(fam))
+    res = {"tag": tag, "nll": nll, "ppl": math.exp(nll), "nll_mean": mean, "scored": n, "families": fam}
+    if sets:
+        res["sets"] = {nm: _score(student, head, s, a) for nm, s in sets.items()}
+    student.train()
+    res.update(extra or {})
+    say("EVAL", json.dumps(res))
+    return res
+
+
 def _score(student, head, ev, a) -> dict:
     """The metrics of one eval set: every position, or with a ``role`` only the teacher-scored ones (+ ``scored``)."""
     cuda = a.device != "cpu"
@@ -1135,7 +1176,7 @@ RUNTIME_ARGS = {"phase", "device", "stop_at", "log_every", "eval_every", "save_e
                 "snapshot_keep", "wandb_project", "wandb_name", "wandb_entity", "no_wandb", "load", "allow_change",
                 "llama_cpp", "teacher_gguf_bin", "teacher_ngl", "teacher_ubatch", "cache_bs", "gguf", "out_hf",
                 "loss_chunk", "eval_set",  # an eval set only measures: a run may gain one on resume
-                "source_window"}  # telemetry only
+                "source_window", "sft_eval"}  # telemetry / measurement only
 
 
 def _model_id(model: str) -> dict:
@@ -1158,6 +1199,26 @@ def sft_files(a) -> list[str]:
         raise SystemExit("--loss ce is the CE: --ce-weight would count it twice")
     if files and a.mtp == "train":
         raise SystemExit("--loss ce has no teacher targets for an MTP head: pass --mtp freeze")
+    return files
+
+
+def sft_eval_files(a, train: list[str]) -> list[str]:
+    """``--sft-eval`` files: a ``--loss ce`` run is measured on its own corpus's held-out rows, never the cache's.
+
+    The cache's eval rows (and ``--eval-set`` role sets) are a distillation eval against the cache's teacher; on an
+    SFT run they say nothing about the SFT (bm-889 sft1 reported them as its held-out for five hours).
+    """
+    files = [f for f in getattr(a, "sft_eval", "").split(",") if f]
+    if train and not files:
+        raise SystemExit("RUN_REFUSED --loss ce needs --sft-eval: the held-out .roles.jsonl of its own corpus (the "
+                         "cache's eval rows measure distillation against the cache's teacher, not this SFT)")
+    if files and not train:
+        raise SystemExit("--sft-eval measures a --loss ce run (--sft-data)")
+    if not all(f.endswith(".roles.jsonl") for f in files):
+        raise SystemExit("--sft-eval takes .roles.jsonl files (omk_qad.rollouts)")
+    same = {str(Path(f).resolve()) for f in files} & {str(Path(f).resolve()) for f in train}
+    if same:
+        raise SystemExit(f"--sft-eval rows are trained on (also in --sft-data): {sorted(same)}")
     return files
 
 
@@ -1476,10 +1537,14 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     sh = meta["shard"]
     last = a.stop_at or a.steps
     sft = sft_files(a)
+    sft_ev = None
     if sft:
         rows = SftRows(sft, meta["seq"], a.data_order, a.seed)
         if len(rows) < last * a.bs * a.accum:
             raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs * a.accum}")
+        sft_ev = SftRows(sft_eval_files(a, sft), meta["seq"], "cache", a.seed)
+        say(f"SFT_EVAL {len(sft_ev)} held-out rows, {int((sft_ev.role[:, 1:] > 0).sum())} scored positions: "
+            + json.dumps(collections.Counter(sft_ev.source)))
     elif meta["n_seq"] < last * a.bs * a.accum:
         raise SystemExit(f"cache holds {meta['n_seq']} sequences, the run needs {last * a.bs * a.accum}")
     if not sft and sh % a.bs:
@@ -1526,6 +1591,12 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     results: list = []
     start = 1
     guard = Guard(a, latents, student, opt)
+
+    def run_eval(tag: str) -> dict:  # an SFT run on its own held-out rows; a distillation run on the cache's
+        if sft_ev is not None:
+            return sft_evaluate(student, head, sft_ev, a, tag, dict(ctl.stats), sets)
+        return evaluate(student, head, ev, a, tag, dict(ctl.stats), sets)
+
     if a.load and last_ck.exists() and Path(a.load).resolve() != last_ck.resolve() and "load" not in allow:
         raise SystemExit(f"RUN_REFUSED --load {a.load}: {last_ck} exists and would be overwritten by a resume from "
                          "another checkpoint (use a new --branch, or --allow-change load)")
@@ -1556,7 +1627,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             say(f"LOSSLESS_GATE klk={g['klk']:.6f} (max {a.gate})")
             if g["klk"] > a.gate:
                 raise SystemExit("unquantized student does not reproduce the teacher cache")
-        results.append(evaluate(student, head, ev, a, "init", dict(ctl.stats), sets))
+        results.append(run_eval("init"))
     tel = Telemetry(a, run, {**vars(a), "origin": origin, "cache_meta": {k: meta[k] for k in ("n_seq", "seq", "topk")
                                                                          if k in meta}},
                     resume_step=start - 1 if resume else None)
@@ -1646,7 +1717,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                     + json.dumps({k: round(v, 4) for k, v in per_src.averages().items()}))
         tel.log(row, step)
         if step % a.eval_every == 0 or step == last:
-            results.append(evaluate(student, head, ev, a, f"step{step}", dict(ctl.stats), sets))
+            results.append(run_eval(f"step{step}"))
             tel.eval(results[-1], step)
             atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
         if a.snapshot_every and step % a.snapshot_every == 0:
@@ -1796,7 +1867,10 @@ def main(argv=None) -> None:
                     help="distillation loss over the teacher top-K + rest: jaccard | kl = KL(t||s) | rkl = KL(s||t); "
                     "ce = SFT: cross-entropy on the scored positions of --sft-data, no teacher targets")
     ap.add_argument("--sft-data", default="", help="--loss ce: comma list of .roles.jsonl (omk_qad.rollouts) whose "
-                    "rows are the training data; --cache then only gives the eval rows and eval sets")
+                    "rows are the training data (--cache then gives only seq and the optional --eval-set sets)")
+    ap.add_argument("--sft-eval", default="", help="--loss ce (required): comma list of .roles.jsonl held-out rows of "
+                    "the SFT corpus (not in --sft-data); every eval is CE on them per source. The cache's eval rows "
+                    "are not used; --eval-set adds teacher-KL sets as a distillation diagnostic")
     ap.add_argument("--ce-weight", type=float, default=0.0, help="Bolt: no CE term")
     ap.add_argument("--loss-chunk", type=int, default=1024, help="tokens per head/loss chunk (bounds logits memory)")
     ap.add_argument("--mtp", choices=["train", "freeze"], default="train",
