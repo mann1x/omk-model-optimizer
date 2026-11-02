@@ -106,6 +106,40 @@ def test_softcapped_head_is_the_models_own_logits(g4):
     assert raw.abs().max() > 30.0 or not torch.allclose(raw, ref, atol=1e-4)  # the uncapped head is not the model's
 
 
+def test_fp16_storage_cuts_the_rounding_noise_of_a_sub_ulp_step():
+    from omk_qad.fakequant import sr_cast
+
+    torch.manual_seed(0)
+    start, step, n = 1.0 + 2.0 ** -3, 1e-4, 100
+    out = {}
+    for dtype in (torch.bfloat16, torch.float16):
+        w = torch.full((400_000,), start)
+        assert torch.equal(w, w.to(dtype).float())
+        for _ in range(n):
+            w = sr_cast(w - step, dtype).float()
+        out[dtype] = w - start
+    for moved in out.values():  # both unbiased: the rounding keeps the intended movement on average
+        assert abs(moved.mean().item() + n * step) < 2e-4
+    noise = out[torch.float16].std() / out[torch.bfloat16].std()
+    assert 0.3 < noise < 0.4  # ulp 8x finer, noise sqrt(8)x lower
+
+
+def test_bf16_mode_stores_fp16_serves_bf16_and_refuses_a_storage_change(g4):
+    out = WORK / "fp16_storage"
+    shutil.rmtree(out, ignore_errors=True)
+    args = ("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+            "--save-every", "1", "--steps", "4", "--stop-at", "2", "--out", str(out))
+    log = _run(*args).stdout
+    assert "stored fp16" in log
+    last = out / "stage1" / "last.pt"
+    latents = torch.load(last, map_location="cpu", weights_only=False)["latents"]
+    assert {t.dtype for t in latents.values()} == {torch.float16}
+    bad = _run(*args, "--bf16-latent", "bf16", check=False)
+    assert bad.returncode != 0 and "bf16_latent" in bad.stderr
+    bad = _run(*args, "--bf16-latent", "bf16", "--allow-change", "bf16_latent", check=False)  # no identity
+    assert bad.returncode != 0 and "latents stored as torch.float16" in bad.stdout + bad.stderr
+
+
 def _ckpt(out: Path) -> dict:
     return torch.load(out / "stage1" / "final.pt", map_location="cpu", weights_only=False)
 
@@ -127,10 +161,10 @@ def test_bf16_mode_trains_only_the_scope_and_descends(g4):
     m, _ = load_text_causal_lm(str(g4["student"]), "cpu", torch.float32)
     assert set(ck["latents"]) == set(scope_params(m, "gemma4"))
     assert ck["fp"] == {}  # norms are outside the gemma4 scope: nothing else is written
-    assert all(t.dtype == torch.bfloat16 for t in ck["latents"].values())
+    assert all(t.dtype == torch.float16 for t in ck["latents"].values())
     res = ck["results"]
     assert res[0]["tag"] == "init" and res[-1]["klk"] < res[0]["klk"], [r["klk"] for r in res]
-    moved = [n for n, t in ck["latents"].items() if not torch.equal(t, dict(m.named_parameters())[n].bfloat16())]
+    moved = [n for n, t in ck["latents"].items() if not torch.equal(t.float(), dict(m.named_parameters())[n])]
     assert len(moved) == len(ck["latents"])
 
 
@@ -228,7 +262,8 @@ def test_bf16_export_replaces_only_trained_tensors(g4):
         assert (hf / f).read_bytes() == (g4["student"] / f).read_bytes()
     with safe_open(hf / "model.safetensors", "pt") as f:
         for n, t in ck["latents"].items():
-            assert torch.equal(f.get_tensor(n), t), n
+            w = f.get_tensor(n)
+            assert torch.equal(w, t.to(w.dtype)), n  # the same cast as the forward: the export is what was evaluated
     from transformers import AutoModelForCausalLM
 
     m = AutoModelForCausalLM.from_pretrained(hf, dtype=torch.float32)  # loads as a normal HF checkpoint

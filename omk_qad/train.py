@@ -797,10 +797,33 @@ def build_student(a, layout: dict):
     return student, latents, fp_params, ctl, head_name
 
 
-def hidden_of(student, x, cuda: bool):
+def hidden_of(student, x, cuda: bool, **kwargs):
     """Final hidden states of the decoder body (the head is applied per chunk by the caller)."""
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
-        return student.get_decoder()(input_ids=x).last_hidden_state
+        return student.get_decoder()(input_ids=x, **kwargs).last_hidden_state
+
+
+def isolated_hidden(student, x, cuda: bool):
+    """``--loss ce``: hidden states of a packed batch with each conversation isolated (bug-864).
+
+    A ``--pack`` window holds unrelated conversations back to back, each with its own <bos>; forwarded as one sequence,
+    each would attend to the ones before it and sit at a position it never has when served. Here attention stops at
+    <bos> and positions restart there, so every example computes what it computes alone. It stays ONE forward: a latent
+    used twice keeps a float32 gradient buffer until its last use (``Latent.on_grad``), and 24.5B of them do not fit
+    next to the model (bug-867). Padding follows its last example, never reaches one, and is never scored.
+    """
+    cfg = student.config.get_text_config()
+    if not set(cfg.layer_types) <= {"full_attention", "sliding_attention"}:
+        raise ValueError(f"isolated_hidden: no mask for layer types {set(cfg.layer_types)}")
+    n = x.shape[1]
+    idx = torch.arange(n, device=x.device)
+    bos = x == cfg.bos_token_id
+    example = bos.cumsum(1)  # a window of a long segment starts mid-conversation, with no <bos>: example 0
+    full = (example[:, None] == example[:, :, None]) & (idx[:, None] >= idx)
+    near = full & (idx[:, None] - idx < cfg.sliding_window)
+    masks = {"full_attention": full[:, None], "sliding_attention": near[:, None]}
+    position_ids = idx - torch.where(bos, idx, 0).cummax(1).values
+    return hidden_of(student, x, cuda, attention_mask=masks, position_ids=position_ids)
 
 
 def has_mtp(student) -> bool:
@@ -875,7 +898,7 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
     for i0 in range(0, len(ev), 4):
         sel = list(range(i0, min(i0 + 4, len(ev))))
         x = ev.x[sel].long().to(a.device)
-        h = hidden_of(student, x, cuda)
+        h = isolated_hidden(student, x, cuda)
         for i, r in enumerate(sel):
             for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
@@ -1002,7 +1025,7 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     ``lead_tokens``.
     """
     cuda = a.device != "cpu"
-    h = hidden_of(student, x, cuda)
+    h = isolated_hidden(student, x, cuda) if a.loss == "ce" else hidden_of(student, x, cuda)
     hd = h.detach().requires_grad_()
     frozen = getattr(head, "frozen", False)  # bf16 mode: a head outside the scope gets no weight gradient
     head.add_use()
@@ -1130,6 +1153,11 @@ def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = 
     ck = torch.load(path, map_location="cpu", weights_only=False)
     if set(ck["latents"]) != set(latents):
         raise SystemExit(f"{path}: latent set differs from this student's")
+    changed = {n: ck["latents"][n].dtype for n, lat in latents.items() if ck["latents"][n].dtype != lat.param.dtype}
+    if changed and not weights_only:  # the rounding of every later step would differ from the steps already taken
+        n, was = next(iter(changed.items()))
+        raise SystemExit(f"{path}: {len(changed)} latents stored as {was}, this run stores "
+                         f"{latents[n].param.dtype} ({n})")
     was = ck.get("folded", {})  # latents stored in the ternary (Hadamard-folded) basis, with their block
     for n, lat in latents.items():
         now = lat.basis is not None
@@ -1808,6 +1836,8 @@ def main(argv=None) -> None:
     ap.add_argument("--mode", choices=["qad", "bf16"], default="qad",
                     help="qad: fake-quantized latents per --layout; bf16: train the model's own bf16 weights in "
                     "--train-scope, no quantizer (omk_qad.recovery)")
+    ap.add_argument("--bf16-latent", choices=["fp16", "bf16"], default="fp16",
+                    help="bf16 mode: storage of the trained weights, between steps (--latent-dtype is QAD only)")
     ap.add_argument("--train-scope", default="gemma4", help="bf16 mode: gemma4 | classes:<a,b,...>")
     ap.add_argument("--train-router", action="store_true", help="bf16 mode, gemma4 scope: also train router.proj")
     ap.add_argument("--out-hf", default="", help="bf16 export: output HF checkpoint dir (must be new/empty)")

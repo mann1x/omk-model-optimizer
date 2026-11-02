@@ -113,12 +113,15 @@ def build_student_bf16(a, load_fn, say):
     trained = set(scope_params(student, a.train_scope, getattr(a, "train_router", False)))
     ctl = Control(compute_dtype=torch.bfloat16 if cuda else torch.float32, beta2=a.beta2, clip=a.clip,
                   dummy=torch.zeros((), requires_grad=True, device=a.device))
+    # a step is far below the bf16 ulp: bf16 storage turns it into coin-flip whole-ulp jumps (bm-889). fp16 holds every
+    # bf16 value at the same 2 bytes with an 8x finer ulp; the forward and the export still run bf16.
+    storage = {"fp16": torch.float16, "bf16": torch.bfloat16}[a.bf16_latent]
     latents, fp_params = {}, []
     for n, p in student.named_parameters():
         if n not in trained:
             p.requires_grad_(False)
         elif p.ndim >= 2:
-            latents[n] = Latent(n, p, [], ctl, None, torch.bfloat16)
+            latents[n] = Latent(n, p, [], ctl, None, storage)
         else:
             p.data = p.data.float()
             p.requires_grad_(True)
@@ -132,7 +135,8 @@ def build_student_bf16(a, load_fn, say):
     a.softcap = softcap_of(student)
     n_frozen = sum(p.numel() for n, p in student.named_parameters() if n not in trained)
     say(f"student (bf16 mode, scope {a.train_scope}{' +router' if getattr(a, 'train_router', False) else ''}): "
-        f"{len(latents)} latents {sum(lat.param.numel() for lat in latents.values()) / 1e9:.3f}B bf16, "
+        f"{len(latents)} latents {sum(lat.param.numel() for lat in latents.values()) / 1e9:.3f}B "
+        f"stored {a.bf16_latent}, "
         f"fp params {sum(p.numel() for p in fp_params) / 1e6:.2f}M, frozen {n_frozen / 1e9:.3f}B, "
         f"head {head_name} ({'trained' if head_name in latents else 'frozen'}), softcap {a.softcap}")
     return student, latents, fp_params, ctl, head

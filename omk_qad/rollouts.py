@@ -217,12 +217,18 @@ def render_turns(tok, messages: list[dict], tools, history: str, code_args=CODE_
     """One (text, char roles) per assistant turn, for clients whose re-sent history changes every turn.
 
     The context of turn i is every earlier message as the client re-sent it (``HISTORY_CONTEXT[history]``),
-    followed by turn i as generated, reasoning included; only turn i is scored.
+    followed by turn i as generated, reasoning included; only turn i is scored. An assistant turn marked
+    ``"score": false`` is context only and makes no example (a regenerated corpus whose history turns were
+    written by another model: only the regenerated turns are trained).
     """
     kw = {"tools": tools, "tokenize": False, "enable_thinking": True}
     out = []
     for i, m in enumerate(messages):
         if m["role"] != "assistant":
+            continue
+        if m.get("score") is False:
+            if stats is not None:
+                stats["context_only_turns"] = stats.get("context_only_turns", 0) + 1
             continue
         ctx = HISTORY_CONTEXT[history](messages[:i])
         p, gen = _prompt_and_generated(tok, ctx, m, kw, i)

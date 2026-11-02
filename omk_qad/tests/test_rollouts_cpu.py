@@ -195,6 +195,25 @@ def test_stripped_history_one_example_per_turn(tok):
     assert st["segments"] == 3 and st["refused_not_prefix"] == 0 and len(out) == 3
 
 
+def test_a_context_only_turn_makes_no_example(tok):
+    """``"score": false`` (bm-889 sft2: history written by another model): context for later turns, never trained."""
+    from omk_qad.rollouts import _norm, render_turns
+
+    conv = [dict(m) for m in CONV]
+    first = next(i for i, m in enumerate(conv) if m["role"] == "assistant")
+    conv[first]["score"] = False
+    st = {}
+    items = render_turns(tok, _norm(conv), TOOLS, "strip", stats=st)
+    assert len(items) == 2 and st["context_only_turns"] == 1
+    sp = [_spans(tok, t, r) for t, r in items]
+    scored = ["".join(s for q, s in x if q != IGNORE) for x in sp]
+    assert CODE in items[0][0] and CODE not in scored[0]  # its tool call is still the next turn's context
+    assert not any("I should look" in s for s in scored)  # its reasoning is trained nowhere
+    assert "Done." in scored[0] and "Adding tests." in scored[1]
+    out, bst = build(tok, [{"id": "a", "messages": conv, "tools": TOOLS}], seq=256, stride=128, history="strip")
+    assert bst["segments"] == 2 and len(out) == 2
+
+
 def test_last_inline_history_matches_the_sdk(tok):
     """Cerebriline SDK >= 4.100.260 (ai-sdk.ts): only the newest reasoning is re-sent, as <think>R</think> text."""
     from omk_qad.rollouts import _context_last_inline, _norm, render_turns
