@@ -1,0 +1,52 @@
+{
+ "counts": {
+  "train_in": 2715,
+  "train_out": 2715,
+  "values_changed": 5449,
+  "trail_removed": 5449,
+  "train_rows_changed": 1726,
+  "lead_removed": 157,
+  "eval_in": 45,
+  "eval_out": 45,
+  "eval_rows_changed": 37
+ },
+ "by_field": {
+  "write_file.content": 5136,
+  "execute_code.code": 162,
+  "terminal.command": 134,
+  "skill_manage.content": 10,
+  "skill_manage.file_content": 7
+ },
+ "examples": [
+  [
+   "execute_code.code",
+   "' match else \"\u274c NO MATCH\"\\n    print(f\"\\'{test}\\' -> {status}\")\\n'",
+   "'f match else \"\u274c NO MATCH\"\\n    print(f\"\\'{test}\\' -> {status}\")'"
+  ],
+  [
+   "write_file.content",
+   "'rsor: {edge.cursor[:30]}...)\")\\n    \\n    asyncio.run(demo())\\n'",
+   "'ursor: {edge.cursor[:30]}...)\")\\n    \\n    asyncio.run(demo())'"
+  ],
+  [
+   "write_file.content",
+   "\"# Validation\\n    'ValidationResult',\\n    'DataValidator',\\n]\\n\"",
+   "\" # Validation\\n    'ValidationResult',\\n    'DataValidator',\\n]\""
+  ],
+  [
+   "write_file.content",
+   "\"_all__ = [\\n    'DataTransformer',\\n    'DimensionBuilder',\\n]\\n\"",
+   "\"__all__ = [\\n    'DataTransformer',\\n    'DimensionBuilder',\\n]\""
+  ],
+  [
+   "write_file.content",
+   "\"se import DataWarehouse\\n\\n__all__ = [\\n    'DataWarehouse',\\n]\\n\"",
+   "\"use import DataWarehouse\\n\\n__all__ = [\\n    'DataWarehouse',\\n]\""
+  ],
+  [
+   "write_file.content",
+   "'    self.logger.info(f\"Summary exported to: {output_path}\")\\n'",
+   "'     self.logger.info(f\"Summary exported to: {output_path}\")'"
+  ]
+ ]
+}
