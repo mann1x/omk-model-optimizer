@@ -1,0 +1,23 @@
+{
+ "name": "nous_func_calling",
+ "path": "src/nous/func_calling.parquet",
+ "rows": 1893,
+ "outcome": {
+  "PASS": 927,
+  "no_final_answer": 163,
+  "orphan_response": 10,
+  "bad_call": 793
+ },
+ "passing_thinking": {
+  "none": 927
+ },
+ "passing_flags": {},
+ "tokens": {
+  "p50": 1579,
+  "p90": 2465,
+  "max": 5053,
+  "le16k": 927,
+  "le32k": 927,
+  "le64k": 927
+ }
+}

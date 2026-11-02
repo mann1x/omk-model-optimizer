@@ -1,0 +1,25 @@
+{
+ "name": "nous_glaive_func_calling",
+ "path": "src/nous/glaive_func_calling.parquet",
+ "rows": 5209,
+ "outcome": {
+  "PASS": 5021,
+  "no_final_answer": 185,
+  "bad_call": 3
+ },
+ "passing_thinking": {
+  "none": 5021
+ },
+ "passing_flags": {
+  "no_tool_call": 865,
+  "duplicate": 2
+ },
+ "tokens": {
+  "p50": 625,
+  "p90": 855,
+  "max": 4747,
+  "le16k": 5021,
+  "le32k": 5021,
+  "le64k": 5021
+ }
+}

@@ -1,0 +1,2 @@
+{"reason": "eval segment whose first scored token (thought open) ends a 200-gram of a harness tool output identical in a train row; gate sft2_overlap.py, 2026-11-02",
+ "ids": ["lambda_kimi/05f7bc53-9d44-4e9a-a93c-a00c96f9a05b", "lambda_kimi/bcb1de66-b888-47b8-b75e-96d93dd89ad2", "lambda_kimi/1b203b44-c0d2-40db-af5a-5959fe4852df", "lambda_kimi/f6a15113-42a1-4595-beed-5d996f6c6be0", "lambda_kimi/8f6b6914-e444-41a3-9232-66790d66ca05"]}

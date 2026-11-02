@@ -1,0 +1,31 @@
+{
+ "lambda_kimi": {
+  "validated": 6031,
+  "KEEP": 2766,
+  "turn_without_thinking": 3248,
+  "think_loop": 17,
+  "tokens_total": 40828663,
+  "p50": 10036,
+  "p90": 27024,
+  "max": 210795,
+  "le16k": 2084,
+  "le32k": 2570,
+  "le64k": 2701,
+  "with_calls": 2766
+ },
+ "interstellarninja": {
+  "validated": 32942,
+  "turn_without_thinking": 3075,
+  "KEEP": 24304,
+  "python_response": 5556,
+  "think_loop": 7,
+  "tokens_total": 41017483,
+  "p50": 1465,
+  "p90": 3000,
+  "max": 4472,
+  "le16k": 24304,
+  "le32k": 24304,
+  "le64k": 24304,
+  "with_calls": 10243
+ }
+}

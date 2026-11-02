@@ -1,0 +1,32 @@
+{
+ "rows": 64,
+ "segments": 64,
+ "refused_not_prefix": 0,
+ "windows": 6,
+ "code_args_not_found": 0,
+ "loop_spans_not_found": 0,
+ "tokens_by_role": [
+  40800,
+  150595,
+  5213,
+  0,
+  0
+ ],
+ "dropped_long_segments": 0,
+ "dropped_long_windows": 0,
+ "sha256": "696faacfd516468c7bc81d3b6dd82a3187831f893388eb865973c37b0872f374",
+ "complete": true,
+ "args": {
+  "model": "/mnt/sdc/ml/models/gemma-4-26B-A4B-it",
+  "inp": "/mnt/sdc/omk-model-optimizer/g4_recovery/sft2_build/data_v3/multilingual.eval.conv.jsonl",
+  "out": "render_32k/multilingual.eval.roles.jsonl",
+  "seq": 32768,
+  "stride": 16384,
+  "code_args": "content,new_text,old_text,new_string,old_string,new_str,old_str,code,patch,diff,file_text,replace,search,text",
+  "history_reasoning": "strip",
+  "pack": true,
+  "tool_preamble": "keep",
+  "max_tokens": 0,
+  "long_segments": "dropped"
+ }
+}

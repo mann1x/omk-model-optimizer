@@ -1,0 +1,24 @@
+{
+ "name": "nous_func_calling_singleturn",
+ "path": "src/nous/func_calling_singleturn.parquet",
+ "rows": 1893,
+ "outcome": {
+  "no_final_answer": 1090,
+  "PASS": 10,
+  "bad_call": 793
+ },
+ "passing_thinking": {
+  "none": 10
+ },
+ "passing_flags": {
+  "no_tool_call": 10
+ },
+ "tokens": {
+  "p50": 708,
+  "p90": 1221,
+  "max": 1238,
+  "le16k": 10,
+  "le32k": 10,
+  "le64k": 10
+ }
+}

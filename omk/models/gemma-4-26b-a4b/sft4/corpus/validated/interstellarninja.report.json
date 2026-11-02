@@ -1,0 +1,29 @@
+{
+ "name": "interstellarninja",
+ "path": "src/interstellarninja/default.parquet",
+ "rows": 51004,
+ "outcome": {
+  "no_final_answer": 13025,
+  "PASS": 32942,
+  "unbalanced_tags": 2399,
+  "bad_call": 2628,
+  "orphan_response": 10
+ },
+ "passing_thinking": {
+  "partial": 3075,
+  "full": 29867
+ },
+ "passing_flags": {
+  "no_tool_call": 14066,
+  "python_response": 5670,
+  "think_loop": 7
+ },
+ "tokens": {
+  "p50": 1363,
+  "p90": 2916,
+  "max": 4532,
+  "le16k": 32942,
+  "le32k": 32942,
+  "le64k": 32942
+ }
+}

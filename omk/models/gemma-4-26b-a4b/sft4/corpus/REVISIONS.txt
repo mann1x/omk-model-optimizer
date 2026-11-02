@@ -1,0 +1,4 @@
+interstellarninja/hermes_reasoning_tool_use c27e454925db6295b160d20ad8a756aa75bfdb77
+NousResearch/hermes-function-calling-v1 dae3e1d28cfbcf4b915c04ea1e072030529b4bda
+Jofthomas/hermes-function-calling-thinking-V1 ee5bf6e5737351f5d444b72689f7ab0ad37fc75f
+lambda/hermes-agent-reasoning-traces b92885e4f0161d4b2536512710e004d4892cac6e

@@ -1,0 +1,26 @@
+{
+ "name": "lambda_kimi",
+ "path": "src/lambda_kimi.parquet",
+ "rows": 7646,
+ "outcome": {
+  "PASS": 6031,
+  "no_final_answer": 1548,
+  "unbalanced_tags": 31,
+  "bad_call": 36
+ },
+ "passing_thinking": {
+  "full": 2783,
+  "partial": 3248
+ },
+ "passing_flags": {
+  "think_loop": 30
+ },
+ "tokens": {
+  "p50": 15356,
+  "p90": 46832,
+  "max": 210795,
+  "le16k": 3256,
+  "le32k": 4848,
+  "le64k": 5723
+ }
+}

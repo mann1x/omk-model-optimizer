@@ -1,0 +1,33 @@
+{
+ "rows": 1446,
+ "segments": 1446,
+ "refused_not_prefix": 0,
+ "windows": 193,
+ "code_args_not_found": 0,
+ "loop_spans_not_found": 0,
+ "tokens_by_role": [
+  3821383,
+  2401557,
+  101284,
+  0,
+  0
+ ],
+ "context_only_turns": 2421,
+ "dropped_long_segments": 0,
+ "dropped_long_windows": 0,
+ "sha256": "9da4b77290b7bea6ddb0193b3d460155769f268911e09cb6130e08e621813e46",
+ "complete": true,
+ "args": {
+  "model": "/mnt/sdc/ml/models/gemma-4-26B-A4B-it",
+  "inp": "/mnt/sdc/omk-model-optimizer/g4_recovery/sft2_build/data_v3/ifchat_v1.train.conv.jsonl",
+  "out": "render_32k/ifchat_v1.train.roles.jsonl",
+  "seq": 32768,
+  "stride": 16384,
+  "code_args": "content,new_text,old_text,new_string,old_string,new_str,old_str,code,patch,diff,file_text,replace,search,text",
+  "history_reasoning": "strip",
+  "pack": true,
+  "tool_preamble": "keep",
+  "max_tokens": 0,
+  "long_segments": "dropped"
+ }
+}

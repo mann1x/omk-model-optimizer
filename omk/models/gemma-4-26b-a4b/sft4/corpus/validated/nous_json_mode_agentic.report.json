@@ -1,0 +1,23 @@
+{
+ "name": "nous_json_mode_agentic",
+ "path": "src/nous/json_mode_agentic.parquet",
+ "rows": 1342,
+ "outcome": {
+  "PASS": 1342
+ },
+ "passing_thinking": {
+  "none": 1342
+ },
+ "passing_flags": {
+  "no_tool_call": 1342,
+  "duplicate": 41
+ },
+ "tokens": {
+  "p50": 566,
+  "p90": 1011,
+  "max": 3030,
+  "le16k": 1342,
+  "le32k": 1342,
+  "le64k": 1342
+ }
+}

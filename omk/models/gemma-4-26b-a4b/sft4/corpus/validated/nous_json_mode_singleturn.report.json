@@ -1,0 +1,22 @@
+{
+ "name": "nous_json_mode_singleturn",
+ "path": "src/nous/json_mode_singleturn.parquet",
+ "rows": 1241,
+ "outcome": {
+  "PASS": 1241
+ },
+ "passing_thinking": {
+  "none": 1241
+ },
+ "passing_flags": {
+  "no_tool_call": 1241
+ },
+ "tokens": {
+  "p50": 366,
+  "p90": 528,
+  "max": 1356,
+  "le16k": 1241,
+  "le32k": 1241,
+  "le64k": 1241
+ }
+}

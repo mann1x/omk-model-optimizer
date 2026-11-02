@@ -1,0 +1,32 @@
+{
+ "rows": 438,
+ "segments": 495,
+ "refused_not_prefix": 22,
+ "windows": 16,
+ "code_args_not_found": 0,
+ "loop_spans_not_found": 0,
+ "tokens_by_role": [
+  300518,
+  222757,
+  1013,
+  0,
+  0
+ ],
+ "dropped_long_segments": 0,
+ "dropped_long_windows": 0,
+ "sha256": "e4dd65672744eb59558ff96bf146aa7105838e57b0d994d1430c53848f52a734",
+ "complete": true,
+ "args": {
+  "model": "/mnt/sdc/ml/models/gemma-4-26B-A4B-it",
+  "inp": "conv_v2/interstellarninja.eval.conv.jsonl",
+  "out": "render_32k_v2/interstellarninja.eval.roles.jsonl",
+  "seq": 32768,
+  "stride": 16384,
+  "code_args": "content,new_text,old_text,new_string,old_string,new_str,old_str,code,patch,diff,file_text,replace,search,text",
+  "history_reasoning": "keep",
+  "pack": true,
+  "tool_preamble": "keep",
+  "max_tokens": 0,
+  "long_segments": "dropped"
+ }
+}

@@ -1,0 +1,6 @@
+conv_v2/interstellarninja.train.conv.jsonl render_32k_v2/interstellarninja.train.roles.jsonl keep keep
+conv_v2/lambda_kimi.train.conv.jsonl render_32k_v2/lambda_kimi.train.roles.jsonl keep keep
+conv_v2/lambda_kimi_pre2r.train.conv.jsonl render_32k_v2_kimi_pre2r/lambda_kimi_pre2r.train.roles.jsonl keep reasoning
+conv_v2/interstellarninja.eval.conv.jsonl render_32k_v2/interstellarninja.eval.roles.jsonl keep keep
+conv_v2/lambda_kimi.eval.conv.jsonl render_32k_v2/lambda_kimi.eval.roles.jsonl keep keep
+conv_v2/lambda_kimi_pre2r.eval.conv.jsonl render_32k_v2_kimi_pre2r/lambda_kimi_pre2r.eval.roles.jsonl keep reasoning

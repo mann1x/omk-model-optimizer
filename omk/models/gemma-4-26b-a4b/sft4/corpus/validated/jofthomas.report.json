@@ -1,0 +1,24 @@
+{
+ "name": "jofthomas",
+ "path": "src/jofthomas/default.parquet",
+ "rows": 3570,
+ "outcome": {
+  "bad_call": 3511,
+  "unbalanced_tags": 21,
+  "PASS": 38
+ },
+ "passing_thinking": {
+  "none": 38
+ },
+ "passing_flags": {
+  "no_tool_call": 38
+ },
+ "tokens": {
+  "p50": 767,
+  "p90": 1094,
+  "max": 1996,
+  "le16k": 38,
+  "le32k": 38,
+  "le64k": 38
+ }
+}
