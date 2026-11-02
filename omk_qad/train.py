@@ -116,6 +116,15 @@ def _packed(path: str, tok, seq: int, eos: int, passes: list):
             raise SystemExit(f"{path}: no documents")
 
 
+def _sft_window(path: str) -> int:
+    """Token length of the first window of a ``.roles.jsonl`` source (``_role_rows`` then holds every row to it)."""
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                return len(json.loads(line)["ids"])
+    raise SystemExit(f"{path}: no rows")
+
+
 def _role_rows(path: str, seq: int, passes: list):
     """Endless stream of (ids, role) rows of a ``.roles.jsonl`` source (omk_qad.rollouts windows, ``seq`` long).
 
@@ -895,8 +904,10 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
     cuda = a.device != "cpu"
     wh = head.served()
     acc: dict = {}  # source -> [nll sum, scored tokens]
-    for i0 in range(0, len(ev), 4):
-        sel = list(range(i0, min(i0 + 4, len(ev))))
+    # bm-889 sft4: rows per forward keep sft3's eval attention load (4 x 16k^2): 4 at 16k, 1 at 32k (4 at 32k ran OOM)
+    nb = max(1, int(4 * (16384 / ev.x.shape[1]) ** 2))
+    for i0 in range(0, len(ev), nb):
+        sel = list(range(i0, min(i0 + nb, len(ev))))
         x = ev.x[sel].long().to(a.device)
         h = isolated_hidden(student, x, cuda)
         for i, r in enumerate(sel):
@@ -1566,11 +1577,16 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     last = a.stop_at or a.steps
     sft = sft_files(a)
     sft_ev = None
+    # bm-889 sft4: --loss ce takes no targets from the cache, so its windows are as long as the corpus made them (every
+    # row is checked against it); the cache's own eval rows and eval sets keep their length. Distillation keeps the
+    # cache's seq. (Sizing by --seq instead broke callers that render short windows without passing --seq.)
+    sft_seq = _sft_window(sft[0]) if (sft and a.loss == "ce") else meta["seq"]
     if sft:
-        rows = SftRows(sft, meta["seq"], a.data_order, a.seed)
+        say(f"SFT_SEQ {sft_seq} (from {sft[0]})" if a.loss == "ce" else f"SFT_SEQ {sft_seq} (the cache's)")
+        rows = SftRows(sft, sft_seq, a.data_order, a.seed)
         if len(rows) < last * a.bs * a.accum:
             raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs * a.accum}")
-        sft_ev = SftRows(sft_eval_files(a, sft), meta["seq"], "cache", a.seed)
+        sft_ev = SftRows(sft_eval_files(a, sft), sft_seq, "cache", a.seed)
         say(f"SFT_EVAL {len(sft_ev)} held-out rows, {int((sft_ev.role[:, 1:] > 0).sum())} scored positions: "
             + json.dumps(collections.Counter(sft_ev.source)))
     elif meta["n_seq"] < last * a.bs * a.accum:
