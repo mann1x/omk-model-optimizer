@@ -1,6 +1,10 @@
-# omk_qad — model-agnostic 2-bit QAD (IQ2 family) → GGUF
+# omk_qad — QAD to GGUF, ternary recovery, BF16 recovery training
 
 Repo overview, recipes, datasets, evaluations and per-model results: [`.github/README.md`](../.github/README.md).
+
+User guides, one per mode: [QAD](../omk/docs/qad.md) · [ternary recovery](../omk/docs/ternary.md) ·
+[BF16 recovery](../omk/docs/bf16-recovery.md) · [QAD + ternary on one or more GPUs](../omk/docs/qad-ternary-together.md).
+This page is the module reference.
 
 omk additions on top of NVIDIA Model-Optimizer (this repo is a private mirror of `NVIDIA/Model-Optimizer`;
 `upstream` remote = NVIDIA, push disabled). Everything omk lives in `omk_qad/`; upstream files are untouched,

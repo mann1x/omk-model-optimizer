@@ -1,17 +1,31 @@
 # omk-model-optimizer
 
-**Quantization-aware distillation straight to llama.cpp GGUF.** `omk_qad` trains a quantized student against its
-own full-precision teacher, with every weight fake-quantized in the exact format and block order the GGUF will hold
-(IQ1/IQ2/IQ3, K-quants, Q8_0, and the ternary PQ2_0 / PTQ1_0), then writes that GGUF and verifies every tensor.
-Model-agnostic: the layout comes from llama.cpp's own converter and `llama-quantize` rules, not from per-model code.
+**Train models for llama.cpp: quantization-aware distillation to GGUF, ternary recovery, and BF16 recovery
+training.** `omk_qad` is one trainer with three modes. In QAD it trains a quantized student against its own
+full-precision teacher, with every weight fake-quantized in the exact format and block order the GGUF will hold
+(IQ1/IQ2/IQ3, K-quants, Q8_0), then writes that GGUF and verifies every tensor. With ternary types in the layout it
+recovers a PrismML ternary (PQ2_0 / PTQ1_0) model. In BF16 mode it trains a model's own bf16 weights, by distillation
+from a bigger teacher or by SFT on role-masked agentic traces, and writes an HF checkpoint back. Model-agnostic: the
+layout comes from llama.cpp's own converter and `llama-quantize` rules, not from per-model code.
 
 This is the omk fork of [NVIDIA Model-Optimizer](https://github.com/NVIDIA/Model-Optimizer): upstream's README is the
 root [`README.md`](../README.md), untouched. Everything omk adds lives in `omk_qad/` and `omk/`.
 
+## The three modes
+
+| mode | what it trains | output | runs on | guide |
+|---|---|---|---|---|
+| **QAD** (`--mode qad`, default) | fp16 latents served fake-quantized at their GGUF type (IQ2_XXS, IQ3, K-quants, …); distillation on the teacher's cached top-K | GGUF, every tensor verified | stock llama.cpp, ollama | [`omk/docs/qad.md`](../omk/docs/qad.md) |
+| **Ternary recovery** (QAD with `pq2_0` / `ptq1_0` classes) | folded Hadamard-basis latents served as PrismML ternary; KL distillation recovers the ternarized model | ternary GGUF (types 142/143 + `prism.hadamard.*`) | PrismML fork, opencoti llamafile | [`omk/docs/ternary.md`](../omk/docs/ternary.md) |
+| **BF16 recovery** (`--mode bf16`) | the model's own bf16 weights in a chosen scope, no quantizer; distillation (any same-tokenizer teacher, GGUF teachers included) or SFT (`--loss ce`) | HF checkpoint, only trained tensors replaced | anything (then quantize) | [`omk/docs/bf16-recovery.md`](../omk/docs/bf16-recovery.md) |
+
+QAD and ternary students of one model share one teacher cache and train side by side, on one GPU or several:
+[`omk/docs/qad-ternary-together.md`](../omk/docs/qad-ternary-together.md).
+
 | | |
 |---|---|
 | [Install](#install) | conda env, llama.cpp, CUDA toolkit |
-| [How it works](#how-it-works) | the pipeline in one screen |
+| [How it works](#how-it-works) | the QAD / ternary pipeline in one screen |
 | [Recipes](#recipes) | one spec per trained model |
 | [Datasets](#datasets) | the corpus catalogue |
 | [Evaluations](#evaluations) | protocol and results |
@@ -50,6 +64,10 @@ python -m omk_qad.multi --spec SPEC.yaml all     # plan -> cache -> preflight ->
 | `report` | one table per student and eval family. |
 
 Module reference: [`omk_qad/README.md`](../omk_qad/README.md).
+
+BF16 recovery skips `plan` and the GGUF types: `rollouts` (conversations → role-masked windows), `cache` (teacher
+top-K, or only eval sets for SFT), `train --mode bf16`, `export --out-hf`. See
+[`omk/docs/bf16-recovery.md`](../omk/docs/bf16-recovery.md).
 
 ## Recipes
 
