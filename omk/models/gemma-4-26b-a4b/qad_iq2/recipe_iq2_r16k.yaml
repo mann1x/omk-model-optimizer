@@ -1,0 +1,30 @@
+# bm-892 r16k: Gemma-4-26B-A4B agentic (sft11 final) -> IQ2_XXS QAD on bs2 GPU0, ASSISTANT-ONLY distillation.
+# Owner 2026-11-13 13:17: "Assistant-only, seq 16384" + "Drop [the general text]". Why: the bf16 teacher's own output
+# moves by KL 0.256 (top-1 89.6 %) on context positions when only its batch-mates change, KL 0.0008 (99.6 %) on
+# assistant positions (bug-928) -- the all-position --roles-as-text cache (runs/g4_agentic_iq2) failed the lossless
+# gate at 0.137 and is kept as is. Here: the 11 sft11 role windows (16,384 tokens each, 4,217 train windows) go in
+# unchanged; the cache, the loss, every eval and the lossless gate (--eval-roles) see teacher-distilled positions only.
+# Weights = the families' real-token shares (one pass in expectation). Layout as before (8,953 MiB).
+model: /mnt/sdc/bm889-exports/gemma-4-26B-A4B-agentic
+out: /mnt/sdc/omk-model-optimizer/runs/g4_agentic_iq2_r16k
+llama_cpp: /mnt/sdc/ml/llama.cpp-b9700
+layout: {rest: IQ2_M}
+cache:
+  gpu: 0
+  data: >-
+    /mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/agentic.train.roles.jsonl=14.87,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/opencode.train.roles.jsonl=22.90,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v1.train.roles.jsonl=5.73,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/hermes.train.roles.jsonl=3.29,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v2.train.roles.jsonl=2.84,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/kimi31b.train.roles.jsonl=2.64,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/swe.train.roles.jsonl=1.03,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/multilingual.train.roles.jsonl=0.62,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/math.train.roles.jsonl=0.29,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/science.train.roles.jsonl=0.26,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/cp.train.roles.jsonl=0.19
+  eval_data: >-
+    /mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/agentic.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/opencode.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v1.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/hermes.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v2.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/kimi31b.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/swe.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/multilingual.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/math.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/science.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/cp.eval.roles.jsonl
+  eval_roles: true
+  n_seq: 4217
+  n_eval: 4
+  seq: 16384
+  shard: 250
+  topk: 64
+  imatrix_seqs: 256
+preflight_steps: 5
+students:
+  - name: iq2
+    gpu: 0
+    layout: {fixed: {routed_experts: iq2_xxs, dense_mlp: iq2_xxs}}
+    train: {lr: 1.0e-5, loss: jaccard, steps: 4217, bs: 1, warmup: 50, eval_every: 150, save_every: 50, anchor_as_teacher: true}

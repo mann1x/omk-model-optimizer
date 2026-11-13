@@ -331,6 +331,8 @@ def cache_identity(a) -> dict:
     ident["eval_data"] = [[q, file_id(q)] for q in a.eval_data.split(",") if q]
     if getattr(a, "roles_as_text", False):  # only when set: every earlier cache keeps its identity
         ident["roles_as_text"] = True
+    if getattr(a, "eval_roles", False):  # likewise: eval rows with role masks are a different eval.pt
+        ident["eval_roles"] = True
     return ident
 
 
@@ -467,12 +469,21 @@ def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
     names = [Path(q).stem for q in fams]
     if len(set(names)) != len(names):
         raise SystemExit(f"eval families need distinct file stems: {names}")
-    ex, fam = [], []
+    ex, er, fam = [], [], []
+    # --eval-roles: .roles.jsonl eval files give role windows, as training does, and eval.pt keeps their role masks,
+    # so every eval metric and the lossless gate score only teacher-distilled positions (bm-892: Gemma-4 A4B context
+    # positions move by KL 0.26 under bf16 rounding alone, assistant positions by 0.0008). Off: packed text, as before.
+    eval_roles = getattr(a, "eval_roles", False) and not getattr(a, "roles_as_text", False)
     for k, q in enumerate(fams):
-        stream = _packed(q, tok, a.seq, tok.eos_token_id, passes)
-        ex += [next(stream) for _ in range(a.n_eval)]
+        stream = _stream(q, tok, a.seq, tok.eos_token_id, passes, eval_roles)
+        rows = [next(stream) for _ in range(a.n_eval)]
+        ex += [r[0] for r in rows]
+        er += [r[1] for r in rows]
         fam += [k] * a.n_eval
     ex = torch.stack(ex)
+    ev_role = None
+    if any(r is not None for r in er):  # text rows inside a role eval: every position scored, as in training
+        ev_role = torch.stack([r if r is not None else torch.ones(a.seq, dtype=torch.int8) for r in er])
     ev_p = cache / "eval.pt"
     old_ev = torch.load(ev_p) if ev_p.exists() else None
     same_rows = old_ev is not None and torch.equal(old_ev["x"], ex.to(torch.int32))
@@ -484,11 +495,13 @@ def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
         if old_ev is not None:  # never silently replace the reference of runs that already used it
             raise SystemExit(f"RUN_REFUSED cache {cache}: eval.pt holds other rows or another identity; move it "
                              "aside (or use a new cache dir) to rebuild it")
-        parts = [topk_of(ex[i : i + 4]) for i in range(0, len(ex), 4)]
+        want = None if ev_role is None else ev_role[:, 1:] > 0
+        parts = [topk_of(ex[i : i + 4], None if want is None else want[i : i + 4]) for i in range(0, len(ex), 4)]
         ev = {"x": ex.to(torch.int32), "idx": torch.cat([q[0] for q in parts]),
               "val": torch.cat([q[1] for q in parts]),
               "teacher_ppl": math.exp(sum(q[2] for q in parts) / (len(ex) * (a.seq - 1))),
-              "family": torch.tensor(fam, dtype=torch.int32), "families": names, "identity": isha}
+              "family": torch.tensor(fam, dtype=torch.int32), "families": names, "identity": isha,
+              **({"role": ev_role} if ev_role is not None else {})}
         atomic_torch_save(ev, ev_p)
         say(f"eval: {len(ex)} x {a.seq} tokens ({a.n_eval} per family {names}); teacher ppl "
             f"{ev['teacher_ppl']:.3f}; top-{a.topk} mass {ev['val'].float().exp().sum(-1).mean().item():.4f}")
@@ -874,6 +887,16 @@ DISTILL = {"jaccard": jaccard_topk_rest, "kl": kl_topk_rest, "rkl": rkl_topk_res
 def distill_loss(logits, idx, val, a) -> torch.Tensor:
     """The per-token distillation loss ``--loss`` names (jaccard | kl = KL(t||s) | rkl = KL(s||t))."""
     return DISTILL[a.loss](logits.float(), idx.long(), val.float())
+
+
+def anchor_as_teacher(role: torch.Tensor) -> torch.Tensor:
+    """``--anchor-as-teacher``: anchor-role positions (2) become teacher positions (1).
+
+    A role corpus written for a recovery SFT (bm-889: 2 = the original student's behaviour to keep) quantized against
+    the model that SFT produced: that model is the teacher of every assistant position, anchor ones included. The cache
+    already holds teacher targets there (it caches every role > 0 position).
+    """
+    return role.masked_fill(role == 2, 1)
 
 
 def teacher_scored(role: torch.Tensor) -> torch.Tensor:
@@ -1460,9 +1483,12 @@ class CacheRows:
 
     KEYS = ("x", "idx", "val", "role", "aidx", "aval")
 
-    def __init__(self, cache: str, n_seq: int, shard: int, order: str, seed: int):
-        """Fix the order of all ``n_seq`` cached rows (``shard`` rows per file)."""
-        self.cache, self.shard, self.order = cache, shard, order
+    def __init__(self, cache: str, n_seq: int, shard: int, order: str, seed: int, anchor_teacher: bool = False):
+        """Fix the order of all ``n_seq`` cached rows (``shard`` rows per file).
+
+        ``anchor_teacher`` (``--anchor-as-teacher``): anchor-role positions (2) are distilled from the teacher (1).
+        """
+        self.cache, self.shard, self.order, self.anchor_teacher = cache, shard, order, anchor_teacher
         self.rows = list(range(n_seq))
         if order == "shuffle":
             random.Random(seed).shuffle(self.rows)
@@ -1493,6 +1519,8 @@ class CacheRows:
                 else:  # a shard without anchor positions: its own teacher targets stand in, masked by role != 2
                     vals.append(sh["idx" if key == "aidx" else "val"][j])
             out[key] = torch.stack(vals)
+        if self.anchor_teacher and out["role"] is not None:
+            out["role"] = anchor_as_teacher(out["role"])
         return out
 
 
@@ -1610,6 +1638,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     if final.exists():
         raise SystemExit(f"{final} exists: this stage/branch is finished and immutable (use a new --branch)")
     ev = torch.load(os.path.join(a.cache, "eval.pt"))
+    if getattr(a, "anchor_as_teacher", False) and ev.get("role") is not None:
+        ev["role"] = anchor_as_teacher(ev["role"])
     sets = {}
     for nm in (q for q in a.eval_set.split(",") if q):  # role eval sets (--phase evalset) of this very cache
         sets[nm] = torch.load(evalset_path(a.cache, nm))
@@ -1693,7 +1723,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     pause_file = run / "PAUSE"
     st.update(status="running", step=start - 1, steps=a.steps, last=last)
     if not sft:
-        rows = CacheRows(a.cache, meta["n_seq"], sh, a.data_order, a.seed)
+        rows = CacheRows(a.cache, meta["n_seq"], sh, a.data_order, a.seed,
+                         anchor_teacher=getattr(a, "anchor_as_teacher", False))
     src = f"sft {len(rows)} rows, " if sft else ""
     how = f" (seed {a.seed}): first rows {rows.rows[:8]}" if a.data_order == "shuffle" else ": cache rows in sequence"
     say(f"DATA {src}order {a.data_order}{how}")
@@ -1873,6 +1904,9 @@ def main(argv=None) -> None:
     ap.add_argument("--anchor", action="store_true", help="cache: add --model's top-K as the ANCHOR targets of the "
                     "anchor-role positions of an existing role cache (bf16 recovery: the original student)")
     ap.add_argument("--anchor-weight", type=float, default=1.0, help="train: weight of the anchor-role loss")
+    ap.add_argument("--anchor-as-teacher", action="store_true",
+                    help="train: distil anchor-role positions (2) from the teacher like role 1 (QAD of the model a "
+                         "recovery SFT produced, on that SFT's role corpus); no --anchor cache pass needed")
     ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens")
     ap.add_argument("--loop-weight", type=float, default=1.0, help="train: weight of loop (3) and lead-in (4) "
                     "positions in the weighted-mean loss (train/loop_share logs the realised share)")
@@ -1897,6 +1931,9 @@ def main(argv=None) -> None:
     ap.add_argument("--roles-as-text", action="store_true",
                     help="cache: read .roles.jsonl --data windows as pre-tokenized text (pad stripped, packed to "
                          "--seq, every position distilled) instead of role-masked windows")
+    ap.add_argument("--eval-roles", action="store_true",
+                    help="cache: .roles.jsonl --eval-data as role windows; eval.pt keeps the masks and every eval "
+                         "metric (and the lossless gate) scores only teacher-distilled positions")
     ap.add_argument("--eval-data", default="", help="comma list of eval files, one family each (name = file stem)")
     ap.add_argument("--n-seq", type=int, default=16000)
     ap.add_argument("--n-eval", type=int, default=32, help="eval rows per eval family")
