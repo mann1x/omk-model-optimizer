@@ -87,7 +87,9 @@ runs where it does not converge quickly. The
 pass curve below shows how the rate builds up minute by minute."""
 
 setup = """**Setup.** One task, run 20 times per model: repair a broken HTML game (`manic_miner`, a syntax error plus logic
-bugs) inside a coding-agent harness (Cerebriline SDK 4.100.277, VS Code host profile, LSP diagnostics after every edit
+bugs). The runs are orchestrated and scored by [automaticum](https://github.com/mann1x/automaticum), a test harness
+for coding agents whose oracle runs the game itself. The agent is the
+[Cerebriline SDK](https://github.com/mann1x/cline/tree/main/sdk) 4.100.277 (VS Code host profile, LSP diagnostics after every edit
 and the `check_file` / `ask_lsp` tools on, browser off) until the game's own oracle reports that it loads, reaches play
 and passes 23 logic checks. 30 minutes wall clock per run, one run at a time per model. Both models as BF16 GGUF on the
 same llama.cpp build, each on its own RTX PRO 6000 Blackwell (96 GB), f16 KV cache, Gemma-4 assistant drafter for
@@ -95,7 +97,8 @@ speculative decoding, thinking on (effort high), temperature 0.8 / top_p 0.95 / 
 presence_penalty 0.025. The two configurations differ only in the model file: harness, task, sampler, server build,
 chat template and guards are identical (checked from each run's recorded provenance). The harness guards were on for
 both: a reasoning block that repeats itself is cut and the request retried, a repeated identical tool call draws
-warnings, then a stop."""
+warnings, then a stop. Arms, server launchers, analysis scripts, the full report and per-run data:
+[`omk/models/gemma-4-26b-a4b/sft11/eval/`](https://github.com/mann1x/omk-model-optimizer/tree/omk-main/omk/models/gemma-4-26b-a4b/sft11/eval)."""
 
 if mode == "short":
     print(f"""## Results — head-to-head with the base model
