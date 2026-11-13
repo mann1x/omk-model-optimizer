@@ -158,9 +158,13 @@ def _role_rows(path: str, seq: int, passes: list):
         first = False
 
 
-def _stream(path: str, tok, seq: int, eos: int, passes: list):
-    """(ids, role or None) rows of one training source: role windows, or packed text (no role)."""
-    if path.endswith(".roles.jsonl"):
+def _stream(path: str, tok, seq: int, eos: int, passes: list, roles: bool = True):
+    """(ids, role or None) rows of one training source: role windows, or packed text (no role).
+
+    ``roles=False`` (``--roles-as-text``) reads a ``.roles.jsonl`` source as pre-tokenized text instead: its windows'
+    ``ids`` (trailing <pad> stripped) packed to ``seq``, every position distilled (QAD), the role masks unused.
+    """
+    if roles and path.endswith(".roles.jsonl"):
         return _role_rows(path, seq, passes)
     return ((x, None) for x in _packed(path, tok, seq, eos, passes))
 
@@ -325,6 +329,8 @@ def cache_identity(a) -> dict:
     ident["data"] = [[q.split("=")[0], q.split("=")[1] if "=" in q else "1", file_id(q.split("=")[0])]
                      for q in a.data.split(",") if q]
     ident["eval_data"] = [[q, file_id(q)] for q in a.eval_data.split(",") if q]
+    if getattr(a, "roles_as_text", False):  # only when set: every earlier cache keeps its identity
+        ident["roles_as_text"] = True
     return ident
 
 
@@ -507,7 +513,8 @@ def _phase_cache(a, dtype, st: State, control: RunControl) -> None:
         imat["collector"] = Collector(teacher, folded=folded if want_folded else None, block=block)
         if not a.layout:
             say("WARNING: no --layout: imatrix.pt only (no imatrix.gguf, no folded statistic for ternary students)")
-    streams = [_stream(p, tok, a.seq, tok.eos_token_id, passes) for p, _ in srcs]
+    roles = not getattr(a, "roles_as_text", False)
+    streams = [_stream(p, tok, a.seq, tok.eos_token_id, passes, roles) for p, _ in srcs]
     rng, n_src = random.Random(a.seed), [0] * len(srcs)
     t0 = time.time()
     for s0 in range(0, a.n_seq, a.shard):
@@ -1887,6 +1894,9 @@ def main(argv=None) -> None:
     # cache
     ap.add_argument("--data", default="",
                     help="comma list of path[=weight] (.txt | .jsonl/.parquet rows: ids | text | messages)")
+    ap.add_argument("--roles-as-text", action="store_true",
+                    help="cache: read .roles.jsonl --data windows as pre-tokenized text (pad stripped, packed to "
+                         "--seq, every position distilled) instead of role-masked windows")
     ap.add_argument("--eval-data", default="", help="comma list of eval files, one family each (name = file stem)")
     ap.add_argument("--n-seq", type=int, default=16000)
     ap.add_argument("--n-eval", type=int, default=32, help="eval rows per eval family")
