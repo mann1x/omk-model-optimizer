@@ -1,0 +1,34 @@
+# bm-892: Gemma-4-26B-A4B agentic (sft11 final) -> IQ2_XXS QAD on ONE RTX PRO 6000 (bs2 GPU0).
+# Owner 2026-11-13 10:23: "use bs2 gpu0 to start omk model opt qad to iq2xxs for 26b agentic".
+# Owner choices 2026-11-13: corpus = sft11 windows + general text; seq 4096.
+# Layout: routed experts + dense MLP at IQ2_XXS (their down projections fall back to IQ4_NL: 704 / 2112 input columns
+# are not multiples of the 256-value block), everything else the llama.cpp IQ2_M preset -> 8,953 MiB (dry run).
+# Data, weights = real (non-pad) tokens in millions:
+#   the 11 sft11 train families, pre-tokenized 16k --pack windows (omk_qad.rollouts, the exact rendering sft11 trained on:
+#   Gemma-4 template, tool declarations, full reasoning); the loader strips each window's trailing <pad> (20.8 % of
+#   the 69.09M window tokens) -> 54.7M real tokens;
+#   + AtomicChat calib-corpora gemma-4-20b-v9-agentic calib_train.txt (sha 33fef70c, Gemma-rendered, the GGUF imatrix
+#   corpus) 4.9M tokens of general text.
+# n_seq 14500 x 4096 = 59.4M tokens = one pass. Steps (bs 2 x 4096 = 8,192 tokens/update, 7,250 = one pass) are
+# provisional: fixed from the preflight's measured s/step and peak memory before `train` runs.
+model: /mnt/sdc/bm889-exports/gemma-4-26B-A4B-agentic
+out: /mnt/sdc/omk-model-optimizer/runs/g4_agentic_iq2
+llama_cpp: /mnt/sdc/ml/llama.cpp-b9700
+layout: {rest: IQ2_M}
+cache:
+  gpu: 0
+  data: >-
+    /mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/agentic.train.roles.jsonl=14.87,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/opencode.train.roles.jsonl=22.90,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v1.train.roles.jsonl=5.73,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/hermes.train.roles.jsonl=3.29,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v2.train.roles.jsonl=2.84,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/kimi31b.train.roles.jsonl=2.64,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/swe.train.roles.jsonl=1.03,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/multilingual.train.roles.jsonl=0.62,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/math.train.roles.jsonl=0.29,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/science.train.roles.jsonl=0.26,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/cp.train.roles.jsonl=0.19,/mnt/sdc/ml/calib/ac_gemma4_v9official/calib_train.txt=4.9
+  eval_data: >-
+    /mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/agentic.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/opencode.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v1.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/hermes.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/ifchat_v2.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/kimi31b.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/swe.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/multilingual.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/math.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/science.eval.roles.jsonl,/mnt/sdc/omk-model-optimizer/g4_recovery/sft11_build/render/cp.eval.roles.jsonl
+  n_seq: 14500
+  n_eval: 8
+  seq: 4096
+  shard: 500
+  topk: 64
+preflight_steps: 5
+students:
+  - name: iq2
+    gpu: 0
+    layout: {fixed: {routed_experts: iq2_xxs, dense_mlp: iq2_xxs}}
+    train: {lr: 1.0e-5, loss: jaccard, steps: 7250, bs: 2, warmup: 50, eval_every: 300, save_every: 100}

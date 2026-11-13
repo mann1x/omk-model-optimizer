@@ -77,8 +77,14 @@ def _texts(path: str, tok):
     if p.suffix == ".txt":
         yield tok(p.read_text()).input_ids, True
         return
+    pad = tok.pad_token_id
 
     def one(row):
+        if row.get("ids") is not None:  # pre-tokenized windows (rollouts --pack output): rendered exactly as trained
+            ids = [int(t) for t in row["ids"]]
+            while ids and ids[-1] == pad:  # a --pack window's tail padding is never served: not distilled either
+                ids.pop()
+            return ids, False
         if row.get("messages"):
             text = tok.apply_chat_template(row["messages"], tokenize=False)
             return tok(text, add_special_tokens=False).input_ids, False
@@ -93,7 +99,7 @@ def _texts(path: str, tok):
         import pyarrow.parquet as pq
 
         pf = pq.ParquetFile(p)
-        cols = [c for c in ("text", "messages") if c in pf.schema_arrow.names]
+        cols = [c for c in ("ids", "text", "messages") if c in pf.schema_arrow.names]
         for b in pf.iter_batches(batch_size=256, columns=cols):
             yield from (one(r) for r in b.to_pylist())
     else:
@@ -1879,7 +1885,8 @@ def main(argv=None) -> None:
                     help="order of the cached training rows: one seeded permutation (default), or the cache's own "
                     "order (the order of runs made before this flag; such runs resume in it)")
     # cache
-    ap.add_argument("--data", default="", help="comma list of path[=weight] (.txt | .jsonl text/messages | .parquet)")
+    ap.add_argument("--data", default="",
+                    help="comma list of path[=weight] (.txt | .jsonl/.parquet rows: ids | text | messages)")
     ap.add_argument("--eval-data", default="", help="comma list of eval files, one family each (name = file stem)")
     ap.add_argument("--n-seq", type=int, default=16000)
     ap.add_argument("--n-eval", type=int, default=32, help="eval rows per eval family")
