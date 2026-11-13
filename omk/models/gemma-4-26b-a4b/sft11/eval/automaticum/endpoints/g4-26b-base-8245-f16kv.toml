@@ -1,0 +1,8 @@
+# bm-889 .277 head-to-head (owner 2026-11-12 22:41): the UNTOUCHED base gemma-4-26B-A4B-it BF16 (eos106 GGUF) on GPU0.
+# /srv/ml/start-8245-g4-26b-base-bf16-f16kv.sh = the 8244 launcher (opencoti c14 r15, drafter, -c 1048576 -kvu, --parallel 4,
+# temp 0.8 / top_p 0.95 / top_k 64 / min_p 0 / presence 0.025) with f16 KV, 127.0.0.1:8245; containers reach it through
+# socat 172.17.0.1:8245. Sole alias = gemma-4-26b-a4b-it-bf16-eos106.
+kind = "llamacpp"
+base_url = "http://172.17.0.1:8245/v1"
+host = "blackswan-2"
+capacity = 1

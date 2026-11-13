@@ -128,12 +128,15 @@ regenerated turns, validator-checked, plus Gemma-4-31B regenerations of Kimi age
 RTX PRO 6000 Blackwell, 25.5 h. Weights: [ManniX-ITA/gemma-4-26B-A4B-agentic](https://huggingface.co/ManniX-ITA/gemma-4-26B-A4B-agentic),
 GGUF: [ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF](https://huggingface.co/ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF).
 
-| checkpoint (BF16 GGUF) | agentic gate pass (manic_miner, 10 runs) | loops / model-hour |
-|---|---|---|
-| base gemma-4-26B-A4B-it | 1 / 10 | 9.2 |
-| **agentic (sft11 final)** | **5 / 10** | **2.0** |
+Head-to-head on the `manic_miner` agentic repair task (SDK 4.100.277, 20 runs each, identical settings, BF16 GGUF):
 
-Corpus build, every script as run, reproduce commands and GGUF build in the model section.
+| | runs finished within the 30-min budget | reasoning-loop cuts per run (median) | tool calls per model-minute |
+|---|---|---|---|
+| base gemma-4-26B-A4B-it | 3 / 20 | 8 | 0.9 |
+| **agentic (sft11 final)** | **12 / 20** | **1** | **3.3** |
+
+Pass rate is relative to the 30-minute budget (Fisher exact p = 0.0079). Full analysis, known weaknesses, corpus build,
+every script as run, reproduce commands and GGUF build in the model section.
 
 ## Upstream
 

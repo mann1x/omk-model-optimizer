@@ -1,0 +1,250 @@
+{
+ "arm": "g4-26b-sft11-f16kv-sdk277-lsp-h2h",
+ "arm_id": "e78c51680b4d55a59d48c91b6b59b0bd8bc7e4fb51e6b1d322b842ce51a245d9",
+ "resolved_arm": {
+  "agent": {
+   "approval": "auto",
+   "bundled_skills": [],
+   "checkpoints": true,
+   "config_extensions": [],
+   "escalation": false,
+   "host_ide": "VS Code",
+   "lsp": {
+    "enabled": true
+   },
+   "max_iterations": 0,
+   "mistake_limit": 6,
+   "mode": "act",
+   "sub_agents": {
+    "spawn": false,
+    "teams": false
+   },
+   "task_progress": {
+    "enabled": true,
+    "interval": 2
+   },
+   "tool_result_cap": 64000
+  },
+  "compaction": {
+   "capped_thinking": true,
+   "council": true,
+   "enabled": true,
+   "force_full_from": 0,
+   "keep_recent_messages": true,
+   "strategy": "agentic",
+   "thinking_summary": true
+  },
+  "endpoint": "g4-26b-sft11-8244-f16kv",
+  "guards": {
+   "edit_verification": "nudge",
+   "loop_detection": {
+    "enabled": true,
+    "hard": 5,
+    "soft": 3
+   },
+   "reasoning_loop": {
+    "enabled": true
+   },
+   "reasoning_repetition": {
+    "enabled": true
+   },
+   "stale_read_rewrites": {
+    "enabled": true
+   },
+   "strong_nudges": {
+    "enabled": true
+   },
+   "tool_intent": {
+    "enabled": true
+   }
+  },
+  "harness": {
+   "sdk_release": "4.100.277"
+  },
+  "limits": {
+   "idle_s": 900,
+   "wall_s": 3600
+  },
+  "model": {
+   "context_window": 256000,
+   "model": "gemma-4-26b-a4b-it-bm889-sft11-sfinal-bf16-eos106",
+   "output_tokens": 0,
+   "provider": "opencoti"
+  },
+  "name": "g4-26b-sft11-f16kv-sdk277-lsp-h2h",
+  "protocol": {
+   "mode": "off"
+  },
+  "sampler": {
+   "min_p": 0,
+   "name": "owner-8244-2026-11-12",
+   "owner": "arm",
+   "presence_penalty": 0.025,
+   "repeat_last_n": 0,
+   "repeat_penalty": 1,
+   "temperature": 0.8,
+   "top_k": 64,
+   "top_p": 0.95
+  },
+  "thinking": {
+   "effort": "high",
+   "enabled": true,
+   "owner": "arm"
+  }
+ },
+ "settings": [
+  {
+   "name": "temperature",
+   "stated": "0.8",
+   "sent": "0.8",
+   "tag": "0.800000011920929",
+   "effective": "0.8",
+   "source": "sent"
+  },
+  {
+   "name": "top_p",
+   "stated": "0.95",
+   "sent": "0.95",
+   "tag": "0.949999988079071",
+   "effective": "0.95",
+   "source": "sent"
+  },
+  {
+   "name": "top_k",
+   "stated": "64",
+   "sent": "64",
+   "tag": "64",
+   "effective": "64",
+   "source": "sent"
+  },
+  {
+   "name": "min_p",
+   "stated": "0",
+   "sent": "0",
+   "tag": "0.0",
+   "effective": "0",
+   "source": "sent"
+  },
+  {
+   "name": "typical_p",
+   "tag": "1.0",
+   "effective": "1.0",
+   "source": "model tag"
+  },
+  {
+   "name": "repeat_penalty",
+   "stated": "1",
+   "sent": "1",
+   "tag": "1.0",
+   "effective": "1",
+   "source": "sent"
+  },
+  {
+   "name": "repeat_last_n",
+   "stated": "0",
+   "sent": "0",
+   "tag": "64",
+   "effective": "0",
+   "source": "sent"
+  },
+  {
+   "name": "presence_penalty",
+   "stated": "0.025",
+   "sent": "0.025",
+   "tag": "0.02500000037252903",
+   "effective": "0.025",
+   "source": "sent"
+  },
+  {
+   "name": "frequency_penalty",
+   "tag": "0.0",
+   "effective": "0.0",
+   "source": "model tag"
+  },
+  {
+   "name": "seed",
+   "tag": "4294967295",
+   "effective": "4294967295",
+   "source": "model tag"
+  },
+  {
+   "name": "context_window",
+   "stated": "256000",
+   "sent": "256000",
+   "tag": "262144",
+   "effective": "256000",
+   "source": "sent"
+  },
+  {
+   "name": "thinking",
+   "stated": "effort high",
+   "sent": "high",
+   "effective": "unknown",
+   "source": "server default"
+  }
+ ],
+ "sdk": {
+  "release": "4.100.277",
+  "package_sha256": "7d44f7f4f17c83f843ea9db785be30723e83e703d8de16d803ff12de08c5d2bb",
+  "named": "4.100.277",
+  "version": "4.100.277",
+  "source": "registry",
+  "bundle_sha256": "85c83693485193493359be56ca015f684b359c08d073c7d658dceb59725a3135",
+  "lock_sha256": "56205c47752894f2e19bba569515520ffe1487a5beea071f4ec191d5c4ac7ec5"
+ },
+ "task": {
+  "hash": "1a68453009a95b30cc741d4894997af801a3733910b6f4a722db22cd38196587",
+  "files": {
+   "fixtures/known-bad-weak-jump.html": "28beb5d50683cc1456704a5af2bc5d622e62c400cc4557923ed6a036ba2d71ce",
+   "fixtures/known-good.html": "7c9bf8b9f6e519f66eed3e5477862ee22874ce5c6af51cd59a975aae4c043666",
+   "oracle/build.mjs": "e8e47c70c6df154da5683ac1c837d3589286027cadcc93d1074400d4c0bf45fe",
+   "oracle/run_game.logic.js": "249f1cbfcc2ee8a3bf2d95267c022cddc3e9c85c2bce15e413ae85911fec7fff",
+   "seed/manic_miner.html": "5b6559abbb62c4c476adebd532efc79b07b2fce22d5ada179cfdb13f91939516",
+   "task.toml": "4b56a939d1e5a3172cd0af83eb6c2caa99ab6fc783147bb8db8c816cb50bd30b",
+   "task.toml.v1-firstline-only": "a8da72b5904c27fd429f0c40eb6fb96a8798074a1d9877c651ca70f534934676"
+  },
+  "prompt": "inspect manic_miner.html, it's not working. \nRun `./run_game manic_miner.html`, this is the check to see whether it actually works -- it loads the page, starts the game and pumps animation frames, and prints what went wrong, with no game logic failures.  \nVerification: run_game confirms ok: true and reached_playing: true and game_logic ok_true, no trap.\nAnd this is the regex to check it:\n\"ok\":\\s*true.*\"frames_run\":\\s*[1-9][0-9]*.*\"reached_playing\":\\s*true.*\"game_logic\":\\s*\\{\"ok\":\\s*true"
+ },
+ "inference": {
+  "endpoint": "g4-26b-sft11-8244-f16kv",
+  "kind": "llamacpp",
+  "server_version": "b1794286374-c588c4f47",
+  "host": "blackswan-2",
+  "lane_host": "blackswan-2",
+  "gpu": {
+   "declared": "",
+   "measured": ""
+  },
+  "model": {
+   "tag": "gemma-4-26b-a4b-it-bm889-sft11-sfinal-bf16-eos106",
+   "digest": "",
+   "stated": {
+    "tag": "gemma-4-26b-a4b-it-bm889-sft11-sfinal-bf16-eos106",
+    "family": "Gemma 4",
+    "size": "26B-A4B",
+    "variant": "instruct, 128 experts, unpruned, BF16, end token 106, bm-889 sft11 final (step 2108 of 2108)",
+    "notes": "Google Gemma-4 A4B 26B (the owner's description, 2026-10-25), trained by bm-889 sft11 (sft2 recipe, sft2 corpus + kimi31b), final checkpoint"
+   },
+   "server": {
+    "n_ctx": 262144,
+    "total_slots": 4,
+    "model_path": "/mnt/sdc/bm889-exports/gemma-4-26B-A4B-it-bm889-sft11-sfinal-BF16-eos106.gguf",
+    "chat_template_sha256": "6a1015c47ccfcfa67c3b772385bccee357a4d37c3cda37bd202e9047f391ab82",
+    "chat_template_bytes": 18682,
+    "build_info": "b1794286374-c588c4f47",
+    "chat_template_caps": {
+     "supports_object_arguments": true,
+     "supports_parallel_tool_calls": true,
+     "supports_preserve_reasoning": false,
+     "supports_string_content": true,
+     "supports_system_role": true,
+     "supports_tool_calls": true,
+     "supports_tools": true,
+     "supports_typed_content": false
+    },
+    "model_alias": "gemma-4-26b-a4b-it-bm889-sft11-sfinal-bf16-eos106",
+    "eos_token": "<turn|>"
+   }
+  }
+ }
+}

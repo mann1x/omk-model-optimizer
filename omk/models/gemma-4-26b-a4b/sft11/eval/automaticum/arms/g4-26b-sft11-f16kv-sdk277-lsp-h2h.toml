@@ -1,0 +1,13 @@
+# bm-889 .277 HEAD-TO-HEAD, sft side (owner 2026-11-12 22:41 CET: "a more reliable test with .277 ... both gpu1 and gpu0 of bs2,
+# serving base on one and the sft on the other, same sampling min_p 0 and presence penalty 0.025 with temperature 0.8, head to
+# head, 20 runs"; 22:42 ask_lsp on, browser off, one run at a time per server; 22:43 "use for serving f16 kv cache").
+# = g4-128e-bf16-8244-bm889-sft11-sfinal-gate (owner sampler sent per request, gemma.md template, task gate-owner/manic_miner_plain)
+# with SDK 4.100.277, [agent.lsp] on, endpoint = the f16-KV 8244 server on GPU1. Twin: g4-26b-base-f16kv-sdk277-lsp-h2h.
+extends = "g4-128e-bf16-8244-bm889-sft11-sfinal-gate"
+endpoint = "g4-26b-sft11-8244-f16kv"
+
+[harness]
+sdk_release = "4.100.277"
+
+[agent.lsp]
+enabled = true

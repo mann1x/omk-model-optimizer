@@ -1,0 +1,8 @@
+# bm-889 .277 head-to-head (owner 2026-11-12 22:41): the bm-889 sft11 final BF16 (eos106 GGUF) on GPU1.
+# /srv/ml/start-8244-bm889-sft11-sfinal-bf16-f16kv.sh = the 8244 launcher with f16 KV (was kvarn3), 127.0.0.1:8244; containers
+# reach it through socat 172.17.0.1:8244. Sole alias = gemma-4-26b-a4b-it-bm889-sft11-sfinal-bf16-eos106. The owner may use the
+# same server from solidpc :8240 at the same time.
+kind = "llamacpp"
+base_url = "http://172.17.0.1:8244/v1"
+host = "blackswan-2"
+capacity = 1

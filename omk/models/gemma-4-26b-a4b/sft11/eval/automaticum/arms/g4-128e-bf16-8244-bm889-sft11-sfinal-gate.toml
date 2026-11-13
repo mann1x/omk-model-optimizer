@@ -1,0 +1,19 @@
+# bm-889 sft11-final GATE on the owner's 8244 server, 10 runs (owner 2026-11-12 17:3x CET). Same harness and SDK as every gate
+# (inherited from g4-128e-bf16-c13-shipped). Sampler = the owner's 8244 recipe ("temp 0.8 presence_penalty 0.025 no min_p no
+# repeat_penalty no repeat_last_n"), NOT the gate's temp 1.0, sent per request so it matches the server defaults.
+extends = "g4-128e-bf16-c13-shipped"
+endpoint = "g4-128e-bf16-8244-bm889-sft11-sfinal"
+
+[model]
+model = "gemma-4-26b-a4b-it-bm889-sft11-sfinal-bf16-eos106"
+
+[sampler]
+owner = "arm"
+name = "owner-8244-2026-11-12"
+temperature = 0.8
+top_p = 0.95
+top_k = 64
+min_p = 0.0
+repeat_penalty = 1.0
+repeat_last_n = 0
+presence_penalty = 0.025
