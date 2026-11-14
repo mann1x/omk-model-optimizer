@@ -150,8 +150,15 @@ def segment_ends(messages: list[dict]) -> list[int]:
     return [*ends, len(messages)] if seen_model or not ends else ends
 
 
-def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_ARGS, stats=None):
-    """(text, char roles) of ``messages[:end]``; the assistant turns after its last user message are scored."""
+def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_ARGS, stats=None, extras=None):
+    """(text, char roles) of ``messages[:end]``; the assistant turns after its last user message are scored.
+
+    ``extras`` (a list, sft7 2026-11-07): a turn whose served prompt is not a prefix of the segment render (Gemma-4
+    after an assistant turn with text AND tool calls: the generation prompt closes the model turn with ``<turn|>``,
+    the full render merges the two turns) is not scored in the segment; ``(served prompt + what the model generated,
+    roles)`` is appended to ``extras`` as its own example, so every scored token keeps its served context. Without
+    ``extras`` such a turn refuses the segment (NotPrefixError), as before.
+    """
     kw = {"tools": tools, "tokenize": False, "enable_thinking": True}
     msgs = messages[:end]
     text = tok.apply_chat_template(msgs, **kw)
@@ -159,7 +166,7 @@ def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_AR
     last_user = max((j for j, m in enumerate(msgs) if m["role"] == "user"), default=-1)
     for i in range(last_user + 1, end):
         m = msgs[i]
-        if m["role"] != "assistant":
+        if m["role"] != "assistant" or m.get("score") is False:  # "score": false = context only (sft7, 2026-11-07)
             continue
         p = tok.apply_chat_template(msgs[:i], add_generation_prompt=True, **kw)  # what the server sent
         a = tok.apply_chat_template(msgs[: i + 1], **kw)
@@ -171,9 +178,40 @@ def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_AR
             if stats is not None:
                 stats["thought_closed"] = stats.get("thought_closed", 0) + 1
         if not (text.startswith(p) and text.startswith(a) and len(a) > len(p)):
-            raise NotPrefixError(f"turn {i}: prompt/turn render is not a prefix of the segment render")
+            got = None
+            if extras is not None and a.startswith(p) and len(a) > len(p):
+                got = a[len(p) :]  # the turn as served: its prompt, then the turn rendered as the last message
+            elif extras is not None and text.startswith(a):
+                got = _served_turn(p, a)  # the turn after it: the prompt closed the model turn, the render merged
+            if got is None:
+                raise NotPrefixError(f"turn {i}: prompt/turn render is not a prefix of the segment render")
+            xt = p + got
+            xr = np.zeros(len(xt), np.int8)
+            _label_turn(xt, xr, len(p), len(xt), m, code_args, stats)
+            extras.append((xt, xr))
+            if stats is not None:
+                stats["served_context_turns"] = stats.get("served_context_turns", 0) + 1
+            continue
         _label_turn(text, roles, len(p), len(a), m, code_args, stats)
     return text, roles
+
+
+def _served_turn(p: str, a: str) -> str | None:
+    """What the model generated after the served prompt ``p``, read from the merged render ``a`` of the turn.
+
+    ``p`` and ``a`` agree up to ``k``; ``p[k:]`` is the generation prompt's closure (``<turn|>`` newline, thought
+    opener) and ``a[k:]`` continues the merged turn (thought opener, ...). The longest suffix of ``p[k:]`` that
+    ``a[k:]`` starts with is the shared opener; what follows it in ``a`` was generated. None when there is none.
+    """
+    k = 0
+    while k < min(len(p), len(a)) and p[k] == a[k]:
+        k += 1
+    tail = p[k:]
+    for j in range(len(tail)):
+        if a.startswith(tail[j:], k):
+            g = a[k + len(tail) - j :]
+            return g or None
+    return None
 
 
 def _context_without_reasoning(messages: list[dict]) -> list[dict]:
@@ -453,7 +491,9 @@ def build(tok, rows, seq: int, stride: int, code_args=CODE_ARGS, history: str = 
             items = []
             for end in segment_ends(msgs):
                 try:
-                    items.append(render_segment(tok, msgs, row.get("tools"), end, code_args, stats))
+                    extra: list = []
+                    items.append(render_segment(tok, msgs, row.get("tools"), end, code_args, stats, extra))
+                    items.extend(extra)
                 except NotPrefixError:  # noqa: PERF203 (refuse one segment, keep the others)
                     stats["refused_not_prefix"] += 1
         for k, (text, roles) in enumerate(items):

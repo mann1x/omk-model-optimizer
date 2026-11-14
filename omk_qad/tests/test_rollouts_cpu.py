@@ -401,7 +401,11 @@ def test_max_tokens_cuts_each_segment_and_drops_the_unscored(tok):
 
 
 def test_a_tool_call_preamble_moves_into_the_reasoning(tok):
-    """OpenAI-form preamble beside a tool call: refused as given on Gemma-4, rendered thought -> call when moved."""
+    """OpenAI-form preamble beside a tool call: its own served-prompt example as given, thought -> call when moved.
+
+    On Gemma-4 such a turn is not prefix-stable; since sft7 (2026-11-07) it is kept with its served prompt instead
+    of refusing the segment.
+    """
     from omk_qad.rollouts import preamble_to_reasoning
 
     conv = json.loads(json.dumps(CONV))
@@ -409,7 +413,7 @@ def test_a_tool_call_preamble_moves_into_the_reasoning(tok):
     conv[i]["content"] = "I'll look at the file first."
     rows = [{"id": "p", "messages": conv, "tools": TOOLS}]
     _, st = build(tok, rows, seq=4096, stride=2048)
-    assert st["refused_not_prefix"] > 0
+    assert st["refused_not_prefix"] == 0 and st.get("served_context_turns", 0) > 0
     out, st2 = build(tok, rows, seq=4096, stride=2048, tool_preamble="reasoning")
     assert st2["refused_not_prefix"] == 0 and out
     moved = preamble_to_reasoning(conv)[i]
