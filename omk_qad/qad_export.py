@@ -104,6 +104,42 @@ def _prism_kv(writer, targets: dict, block: int) -> dict:
     return kv
 
 
+def stamp_file_type(conv, gguf, ftype: str) -> int:
+    """Make ``conv`` write ``general.file_type`` = the layout's ftype (e.g. IQ2_M), not ALL_F32 (0).
+
+    The converter runs in ALL_F32 mode (omk_qad supplies every tensor's quantized bytes itself), so it labels
+    the file F32; ollama/xollama show that label as the model's quantization (bm-892 IQ2: "F32"). Stamped when
+    the header is written, after the converter set its own value. Returns the id written.
+    """
+    member = gguf.LlamaFileType.__members__.get(f"MOSTLY_{ftype.upper()}")
+    if member is None:
+        raise SystemExit(f"layout ftype {ftype!r} has no llama.cpp LlamaFileType.MOSTLY_{ftype.upper()}")
+    writer = conv.gguf_writer
+    real = writer.write_header_to_file
+
+    def write_header_to_file(*args, **kwargs):
+        writer.kv_data[0][gguf.Keys.General.FILE_TYPE] = gguf.GGUFValue(int(member), gguf.GGUFValueType.UINT32)
+        return real(*args, **kwargs)
+
+    writer.write_header_to_file = write_header_to_file
+    return int(member)
+
+
+def converter_names(base_cls, model_dir: Path, gguf, no_mtp: bool) -> set[str]:
+    """GGUF tensor names llama.cpp's converter writes for the checkpoint on disk (lazy mode: names, no data)."""
+    import os
+
+    class NamesOnly(base_cls):  # type: ignore[misc, valid-type]
+        model_arch = base_cls.model_arch
+
+    NamesOnly.no_mtp = no_mtp
+    conv = NamesOnly(model_dir, gguf.LlamaFileType.ALL_F32, Path(os.devnull), eager=False)
+    names: set[str] = set()
+    conv.gguf_writer.add_tensor = lambda name, *args, **kwargs: names.add(name)
+    conv.prepare_tensors()
+    return names
+
+
 def export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Path | None = None,
                 device: str | torch.device = "cpu", imatrix: dict | None = None, latents: dict | None = None,
                 imatrix_folded: dict | None = None) -> dict:
@@ -141,9 +177,28 @@ def _export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Pat
     named = dict(model.named_parameters())
     if {n: list(p.shape) for n, p in named.items()} != layout["params"]:
         raise SystemExit("model parameters do not match the layout's (names or shapes)")
-    names = list(named)
+    # Persistent buffers the checkpoint stores are model weights too (Gemma 4's per-layer ``layer_scalar`` ->
+    # blk.<n>.layer_output_scale): the converter writes them from a checkpoint, so the export must as well.
+    # named_parameters() alone dropped them, and llama.cpp loads that tensor as optional: the bm-892 IQ2 GGUF
+    # ran every layer unscaled and generated garbage while every written tensor verified.
+    from .recovery import checkpoint_keys
+
+    ck_keys = checkpoint_keys(model_dir)
+
+    def ck_of(name):
+        for k in (name, name.replace("model.", "model.language_model.", 1)):
+            if k in ck_keys:
+                return k
+        return None
+
+    buffers = {n: b for n, b in model.named_buffers() if n not in named and ck_of(n)}
+    names = list(named) + list(buffers)
+    last_src = [None]  # the source tensor the converter read last (its add_tensor follows in the same step)
 
     def tensor_of(name):
+        last_src[0] = name
+        if name in buffers:
+            return buffers[name].detach().to("cpu", torch.float32)
         if name in folded:  # a ternary latent is stored folded: the converter must see the model's basis
             return folded[name].model_weight().to("cpu", torch.float32)
         return named[name].detach().to("cpu", torch.float32)
@@ -168,15 +223,26 @@ def _export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Pat
                 ModelBase.index_tensors = real
 
     conv = LiveModel(model_dir, gguf.LlamaFileType.ALL_F32, out, eager=True)
+    from . import gguf_eog
+
+    eog_stamped = gguf_eog.install(conv, gguf)  # Gemma 4: eos <turn|> / eot <eos>, not the converter's eos 1
+    file_type = stamp_file_type(conv, gguf, layout["ftype"])  # not the converter's ALL_F32 label
     writer = conv.gguf_writer
     real_add = writer.add_tensor
     targets = layout["targets"]
     report: dict = {"out": str(out), "ftype": layout["ftype"], "tensors": {}}
     expected: dict[str, str] = {}
+    from_buffers: set[str] = set()
 
     def add_tensor(name, tensor, raw_shape=None, raw_dtype=None, tensor_endianess=None):
         data = LazyBase.to_eager(tensor) if isinstance(tensor, LazyBase) else np.asarray(tensor)
         t = targets.get(name)
+        if t is None and last_src[0] in buffers:  # a checkpoint buffer: not trained, not in the plan, kept float
+            real_add(name, data, raw_shape=raw_shape, raw_dtype=raw_dtype, tensor_endianess=tensor_endianess)
+            report["tensors"][name] = {"type": "F32" if data.dtype == np.float32 else str(data.dtype),
+                                       "how": "buffer", "src": last_src[0]}
+            from_buffers.add(name)
+            return
         if t is None:
             raise SystemExit(f"{name}: not in the layout (layout built from a different model/converter?)")
         if list(data.shape) != t["shape"]:
@@ -223,9 +289,22 @@ def _export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Pat
     conv.write()
     log.info("written %s in %.1fs", out, time.time() - t0)
 
+    # the GGUF must hold exactly the tensors a plain conversion of the source checkpoint holds: a source weight
+    # that never reaches the GGUF is invisible to the tensor verify below (it checks what was written)
+    plain = converter_names(base_cls, model_dir, gguf, LiveModel.no_mtp)
+    written = set(report["tensors"])
+    not_exported, not_in_source = sorted(plain - written), sorted(written - plain)
+    eog = gguf_eog.check(out, gguf)
+    if eog_stamped is not None:
+        eog["converter"] = eog_stamped.get("converter")
+
     reader = gguf.GGUFReader(out)
+    ft = reader.fields.get(gguf.Keys.General.FILE_TYPE)
+    file_type_read = None if ft is None else int(ft.parts[ft.data[0]][0])
     bad, wrong_type, checked = [], [], 0
     for t in reader.tensors:
+        if t.name in from_buffers:
+            continue
         planned = targets[t.name]["type"]
         if t.tensor_type.name != planned:
             wrong_type.append(f"{t.name}: {t.tensor_type.name} != plan {planned}")
@@ -265,7 +344,17 @@ def _export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Pat
         side.rmdir()
         report["imatrix"] = str(out.with_suffix(".imatrix.gguf"))
     report["with_imatrix"] = sum(1 for v in report["tensors"].values() if v.get("imatrix"))
+    report.update(buffers=sorted(from_buffers), source_not_exported=not_exported, not_in_source=not_in_source,
+                  eog=eog, file_type={"want": file_type, "read": file_type_read})
     out.with_suffix(".export.json").write_text(json.dumps(report, indent=1))
+    if file_type_read != file_type:
+        raise SystemExit(f"EXPORT VERIFY FAILED: general.file_type {file_type_read} != layout {layout['ftype']} "
+                         f"({file_type})")
     if bad or wrong_type:
         raise SystemExit(f"EXPORT VERIFY FAILED: {len(bad)} decode mismatches, {len(wrong_type)} type mismatches")
+    if not_exported or not_in_source:
+        raise SystemExit(f"EXPORT VERIFY FAILED: tensor set differs from a plain conversion of the source: missing "
+                         f"{len(not_exported)} {not_exported[:5]}, extra {len(not_in_source)} {not_in_source[:5]}")
+    if not eog["ok"]:
+        raise SystemExit(f"EXPORT VERIFY FAILED: end-of-generation metadata: {eog['problems']}")
     return report

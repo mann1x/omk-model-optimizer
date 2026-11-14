@@ -252,6 +252,9 @@ def _export(src: Path, out: Path, llama_cpp: Path, embed_type: str = "q8_0", dec
                 )
 
     model = OmkPackedModel(src, gguf.LlamaFileType.ALL_F32, out, eager=False)
+    from . import gguf_eog
+
+    eog_stamped = gguf_eog.install(model, gguf)  # Gemma 4: eos <turn|> / eot <eos>, not the converter's eos 1
     writer = model.gguf_writer
     real_add = writer.add_tensor
 
@@ -319,9 +322,15 @@ def _export(src: Path, out: Path, llama_cpp: Path, embed_type: str = "q8_0", dec
     report["type_counts"] = counts
     report["unmatched_float"] = [n for n, v in report["tensors"].items() if v.get("how") == "unmatched-float"]
     report["seconds"] = round(time.time() - t0, 1)
+    eog = gguf_eog.check(out, gguf)
+    if eog_stamped is not None:
+        eog["converter"] = eog_stamped.get("converter")
+    report["eog"] = eog
     out.with_suffix(".export.json").write_text(json.dumps(report, indent=1))
     if bad:
         raise SystemExit(f"VERIFY FAILED on {len(bad)} tensors: {bad[:5]}")
+    if not eog["ok"]:
+        raise SystemExit(f"VERIFY FAILED: end-of-generation metadata: {eog['problems']}")
     return report
 
 
