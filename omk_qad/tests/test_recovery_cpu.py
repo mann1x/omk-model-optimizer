@@ -480,3 +480,30 @@ def test_sft_trains_on_role_windows_with_no_teacher_targets(g4, roles_cache):
                        ((*sft, "--steps", str(n)), f"--sft-data holds {n} rows")):
         bad = _run(*base, *extra, "--out", str(WORK / "run_sft_refused"), check=False)
         assert bad.returncode != 0 and why in bad.stdout + bad.stderr, (extra, (bad.stdout + bad.stderr)[-800:])
+
+
+def test_sft_needs_no_cache_eval_pt(g4, roles_cache):
+    """An SFT run reads only the cache's metadata; a KD run still needs eval.pt (bm-893: lost in an archive)."""
+    rfile = WORK / "conv.roles.jsonl"
+    efile = WORK / "conv_eval.roles.jsonl"
+    efile.write_bytes(rfile.read_bytes())
+    efile.with_suffix(".stats.json").write_bytes(rfile.with_suffix(".stats.json").read_bytes())
+    meta_only = WORK / "cache_meta_only"
+    shutil.rmtree(meta_only, ignore_errors=True)
+    meta_only.mkdir()
+    for f in roles_cache.iterdir():
+        if f.is_file() and f.suffix != ".pt":
+            shutil.copy2(f, meta_only / f.name)
+    assert not (meta_only / "eval.pt").exists() and (meta_only / "cache.json").exists()
+    base = ("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(meta_only), "--steps", "1")
+    out = WORK / "run_sft_meta_only"
+    shutil.rmtree(out, ignore_errors=True)
+    sft = ("--loss", "ce", "--sft-data", str(rfile), "--mtp", "freeze", "--sft-eval", str(efile))
+    proc = _run(*base, *sft, "--out", str(out), "--eval-every", "1", check=False)
+    log = proc.stdout + proc.stderr
+    assert proc.returncode == 0, log[-3000:]
+    text = (out / "stage1" / "log.txt").read_text()
+    evals = [json.loads(ln.split("EVAL ", 1)[1]) for ln in text.splitlines() if ln.startswith("EVAL ")]
+    assert [e["tag"] for e in evals] == ["init", "step1"] and all(0 < e["nll"] < 50 for e in evals), evals
+    kd = _run(*base, "--out", str(WORK / "run_kd_meta_only"), check=False)
+    assert kd.returncode != 0 and "eval.pt" in kd.stdout + kd.stderr, (kd.stdout + kd.stderr)[-800:]

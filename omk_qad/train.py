@@ -1637,8 +1637,11 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     final = run / "final.pt"
     if final.exists():
         raise SystemExit(f"{final} exists: this stage/branch is finished and immutable (use a new --branch)")
-    ev = torch.load(os.path.join(a.cache, "eval.pt"))
-    if getattr(a, "anchor_as_teacher", False) and ev.get("role") is not None:
+    # an SFT run evaluates on its own --sft-eval rows (run_eval -> sft_evaluate) and never reads the cache's KD eval.pt:
+    # it needs only the cache's metadata, so it can be reproduced without the teacher pass that made eval.pt
+    ev_p = Path(a.cache) / "eval.pt"
+    ev = torch.load(ev_p) if ev_p.exists() or not sft else None
+    if ev is not None and getattr(a, "anchor_as_teacher", False) and ev.get("role") is not None:
         ev["role"] = anchor_as_teacher(ev["role"])
     sets = {}
     for nm in (q for q in a.eval_set.split(",") if q):  # role eval sets (--phase evalset) of this very cache
@@ -1707,6 +1710,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             # (bm-889: the 31B GGUF cache carries the 26B student's dir there and would have failed the gate)
             teacher = meta["args"].get("teacher_gguf") or meta["args"]["model"]
             say(f"LOSSLESS_GATE skipped: cache teacher {teacher} is not the student {a.model}")
+        elif ev is None:  # an SFT run without the cache's eval.pt: there is no teacher reference to gate against
+            say("LOSSLESS_GATE skipped: SFT run, the cache has no eval.pt")
         else:  # lossless gate: with the quantizer bypassed the student must BE the teacher
             ctl.bypass = True
             g = evaluate(student, head, ev, a, "lossless")
