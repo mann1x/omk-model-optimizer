@@ -206,6 +206,12 @@ CUDA_VISIBLE_DEVICES= $ENV -m omk_qad.train --phase export --mode bf16 --model m
 
 The run's own launcher (memory guard, early snapshot links, W&B) is [`sft11/train/sft11_train.sh`](sft11/train/sft11_train.sh).
 
+**From the current `omk-main`, without the overlay** (since `6080de873`): the same command on a plain checkout with
+`--bf16-latent bf16` added (the overlay stored the trained weights as bf16; HEAD defaults to fp16). On CPU, HEAD with
+that flag and the overlay give bit-identical weights after the same steps. Since `247be006a` an SFT run reads only the
+cache's `cache.json`, so a metadata-only cache works; `eval.pt` and `--eval-set heldout` are needed only for the
+31B-teacher KL column.
+
 ## GGUF
 
 [`sft11/publish/`](sft11/publish/): `agentic_bs2.sh` (export → HF upload → imatrix), `agentic_quants_bs2.sh` (quants
@@ -226,4 +232,7 @@ The run's own launcher (memory guard, early snapshot links, W&B) is [`sft11/trai
   refill turns predate per-attempt sampler tags (client sampler identical).
 - The kimi generation command line was not logged (samples 4, workers 4; the server slot is 12,288 tokens).
 - `replay_normalize.py` (imported by the sft2 scripts) is copied here from the private an-finetune repo at `5fcbdbb`.
-- Older work on this model (sft4, sft5) is in [`sft4/`](sft4/) and [`sft5/`](sft5/).
+- Older work on this model (sft4, sft5) is in [`sft4/`](sft4/) and [`sft5/`](sft5/); the unpublished sft7–sft10
+  experiments in [`sft7_sft10/`](sft7_sft10/).
+- [`v9a_sft11_mlk8_98e/`](v9a_sft11_mlk8_98e/): the sft11 recipe rerun on the 98-expert v9-agentic ml_k8 prune of
+  this model (2026-11-14, in progress).
