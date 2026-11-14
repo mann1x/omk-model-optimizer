@@ -55,6 +55,41 @@ def tok():
     return AutoTokenizer.from_pretrained(d)
 
 
+def test_score_reasoning_cap_keeps_the_first_n_thought_tokens(tok):
+    """sft7c --score-reasoning-cap N: only a thought's first N tokens stay scored; the rest is unscored context."""
+    from omk_qad import rollouts
+
+    conv = json.loads(json.dumps(CONV))
+    long_thought = " ".join(f"step{k} checks the file." for k in range(40))
+    conv[-1]["reasoning_content"] = long_thought
+    rows = [{"id": "c", "messages": conv, "tools": TOOLS}]
+    full, st0 = build(tok, rows, seq=4096, stride=2048)
+    try:
+        rollouts.REASONING_CAP.update(n=8, tok=tok)
+        cut, st = build(tok, rows, seq=4096, stride=2048)
+    finally:
+        rollouts.REASONING_CAP.update(n=0, tok=None)
+    assert "reasoning_capped_turns" not in st0 and st["reasoning_capped_turns"] >= 1
+    assert st["reasoning_capped_tokens"] > 0
+    assert [w["ids"] for w in cut] == [w["ids"] for w in full]  # the text is unchanged, only roles move
+    n_full = sum(r != IGNORE for w in full for r in w["role"])
+    n_cut = sum(r != IGNORE for w in cut for r in w["role"])
+    assert n_full - n_cut >= st["reasoning_capped_tokens"] - 2, (n_full, n_cut, st)
+    text = tok.decode([t for w in cut for t, r in zip(w["ids"], w["role"], strict=True) if r != IGNORE])
+    assert "step0 checks" in text and "step39 checks" not in text and "Sure." in text  # the answer stays scored
+
+
+def test_merged_turn_without_reasoning_after_a_tool_response_is_scored(tok):
+    """sft7b: a no-reasoning turn after a tool response, merged by the render, is scored in the segment render."""
+    conv = json.loads(json.dumps(CONV))
+    conv[2]["content"] = "Writing it."  # text AND a tool call: the served prompt closes the model turn
+    conv[4] = {"role": "assistant", "content": "Fixed it."}  # after the tool response, no reasoning_content
+    out, st = build(tok, [{"id": "m", "messages": conv, "tools": TOOLS}], seq=4096, stride=2048)
+    assert st["refused_not_prefix"] == 0 and st.get("merged_no_reasoning") == 1 and out, st
+    text = tok.decode([t for w in out for t, r in zip(w["ids"], w["role"], strict=True) if r != IGNORE])
+    assert "Fixed it." in text
+
+
 def _spans(tok, text, roles):
     ids, r = token_roles(tok, text, roles)
     out, cur, buf = [], None, []

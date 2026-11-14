@@ -1093,8 +1093,9 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                 ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * w
                 if a.loss == "ce":  # SFT: every scored position is plain next-token CE (no teacher targets)
                     loss = ce.sum() / n_tok
-                    loss.backward()
-                    tot += loss.item()
+                    sc = (getattr(a, "_row_scale", None) or [1.0] * x.shape[0])[i]  # --sft-weights (sft7)
+                    (loss * sc).backward() if sc != 1.0 else loss.backward()
+                    tot += loss.item()  # the logged loss and the guard stay unweighted
                     rsum[i] += loss.item() * n_tok
                     continue
                 per = role_loss(lg, x[i, c0 + 1 : c1 + 1], r, idx[i, c0:c1], val[i, c0:c1],
@@ -1275,6 +1276,27 @@ def sft_files(a) -> list[str]:
     if files and a.mtp == "train":
         raise SystemExit("--loss ce has no teacher targets for an MTP head: pass --mtp freeze")
     return files
+
+
+def sft_weights(a, files: list[str]) -> dict:
+    """--sft-weights name=w,... (sft7, bm-889 2026-11-07): loss weight of each training source (default 1).
+
+    Names are the W&B source names (source_names); an unknown name is refused. The weight scales that row's CE
+    for the gradient only: train/loss, train/src* and the divergence guard see the unweighted loss.
+    """
+    spec = getattr(a, "sft_weights", "") or ""
+    if not spec:
+        return {}
+    names, out = source_names(files), {}
+    for item in spec.split(","):
+        k, _, v = item.partition("=")
+        if k not in names:
+            raise SystemExit(f"--sft-weights: {k!r} is not a --sft-data source ({names})")
+        out[k] = float(v)
+        if not out[k] > 0:
+            raise SystemExit(f"--sft-weights: {k}={v} must be > 0")
+    say(f"SFT_WEIGHTS {json.dumps(out)} (others 1.0)")
+    return out
 
 
 def sft_eval_files(a, train: list[str]) -> list[str]:
@@ -1532,8 +1554,12 @@ class SftRows:
     against its ``.stats.json`` window count (``_role_rows``).
     """
 
-    def __init__(self, files: list[str], seq: int, order: str, seed: int):
-        """Read every row of ``files`` (``seq`` tokens each) and fix their order."""
+    def __init__(self, files: list[str], seq: int, order: str, seed: int, epochs: int = 1):
+        """Read every row of ``files`` (``seq`` tokens each) and fix their order.
+
+        ``epochs`` > 1 (bm-889 sft10, --sft-epochs): the order is ``epochs`` passes over every row, one after the
+        other, each its own permutation (pass e seeded ``seed + e``; pass 0 is exactly the single-pass order).
+        """
         xs, rs, self.source = [], [], []
         for f, name in zip(files, source_names(files), strict=True):
             done: list = []
@@ -1546,9 +1572,12 @@ class SftRows:
         if not xs:
             raise SystemExit("--sft-data: no rows")
         self.x, self.role = torch.stack(xs), torch.stack(rs)
-        self.rows = list(range(len(xs)))
-        if order == "shuffle":
-            random.Random(seed).shuffle(self.rows)
+        self.rows = []
+        for e in range(max(1, epochs)):
+            p = list(range(len(xs)))
+            if order == "shuffle":
+                random.Random(seed + e).shuffle(p)
+            self.rows += p
 
     def __len__(self) -> int:
         """Number of rows."""
@@ -1617,14 +1646,15 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     sh = meta["shard"]
     last = a.stop_at or a.steps
     sft = sft_files(a)
-    sft_ev = None
+    sft_ev, src_w = None, {}
     # bm-889 sft4: --loss ce takes no targets from the cache, so its windows are as long as the corpus made them (every
     # row is checked against it); the cache's own eval rows and eval sets keep their length. Distillation keeps the
     # cache's seq. (Sizing by --seq instead broke callers that render short windows without passing --seq.)
     sft_seq = _sft_window(sft[0]) if (sft and a.loss == "ce") else meta["seq"]
     if sft:
         say(f"SFT_SEQ {sft_seq} (from {sft[0]})" if a.loss == "ce" else f"SFT_SEQ {sft_seq} (the cache's)")
-        rows = SftRows(sft, sft_seq, a.data_order, a.seed)
+        rows = SftRows(sft, sft_seq, a.data_order, a.seed, a.sft_epochs)
+        src_w = sft_weights(a, sft)
         if len(rows) < last * a.bs * a.accum:
             raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs * a.accum}")
         sft_ev = SftRows(sft_eval_files(a, sft), sft_seq, "cache", a.seed)
@@ -1773,6 +1803,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             s0 = ((step - 1) * a.accum + k) * a.bs
             ids += rows.rows[s0 : s0 + a.bs]
             b = rows.batch(s0, a.bs)
+            if src_w:
+                a._row_scale = [src_w.get(rows.source[j], 1.0) for j in rows.rows[s0 : s0 + a.bs]]
             x = b["x"].long().to(a.device)
             idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
             roles = {r: None if b[r] is None else b[r].to(a.device) for r in ("role", "aidx", "aval")}
@@ -2005,6 +2037,12 @@ def main(argv=None) -> None:
     ap.add_argument("--branch", default="", help="stage-2 branch name (each variant of stage 2 is its own branch)")
     ap.add_argument("--init-from", default="", help="stage 2: stage-1 final.pt (default <out>/stage1/final.pt)")
     ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--sft-epochs", type=int, default=1,
+                    help="--loss ce: passes over --sft-data in ONE run, one after the other, each its own seeded "
+                    "permutation (pass 0 = the single-pass order); the run may then take up to epochs x rows steps "
+                    "(bm-889 sft10)")
+    ap.add_argument("--sft-weights", default="", help="--loss ce: name=weight,... per training source (names as "
+                    "train/src/<name>); scales each row's CE for the gradient only (logged loss and guard unweighted)")
     ap.add_argument("--source-window", type=int, default=32,
                     help="per-source loss telemetry (train/src*, train/loss_fixmix): rows per source in the running "
                     "mean; 0 turns it off")

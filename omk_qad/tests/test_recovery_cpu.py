@@ -507,3 +507,40 @@ def test_sft_needs_no_cache_eval_pt(g4, roles_cache):
     assert [e["tag"] for e in evals] == ["init", "step1"] and all(0 < e["nll"] < 50 for e in evals), evals
     kd = _run(*base, "--out", str(WORK / "run_kd_meta_only"), check=False)
     assert kd.returncode != 0 and "eval.pt" in kd.stdout + kd.stderr, (kd.stdout + kd.stderr)[-800:]
+
+
+def test_sft_epochs_append_seeded_passes(roles_cache):
+    """--sft-epochs E (sft10): E passes back to back, pass 0 = the single-pass order, pass e seeded seed + e."""
+    from omk_qad.train import SftRows
+
+    rfile = str(WORK / "conv.roles.jsonl")
+    seq = len(json.loads(open(rfile).readline())["ids"])
+    one = SftRows([rfile], seq, "shuffle", 7)
+    two = SftRows([rfile], seq, "shuffle", 7, epochs=2)
+    n = len(one)
+    assert len(two) == 2 * n and two.rows[:n] == one.rows
+    assert sorted(two.rows[n:]) == sorted(one.rows) and two.rows[n:] == SftRows([rfile], seq, "shuffle", 8).rows
+    assert SftRows([rfile], seq, "cache", 7, epochs=2).rows == list(range(n)) * 2
+
+
+def test_sft_weights_scale_the_gradient_not_the_logged_loss(g4, roles_cache):
+    """--sft-weights name=w (sft7): the row's CE is scaled for the gradient only; an unknown source is refused."""
+    rfile = WORK / "conv.roles.jsonl"
+    efile = WORK / "conv_eval.roles.jsonl"
+    efile.write_bytes(rfile.read_bytes())
+    efile.with_suffix(".stats.json").write_bytes(rfile.with_suffix(".stats.json").read_bytes())
+    base = ("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(roles_cache), "--steps", "1",
+            "--loss", "ce", "--sft-data", str(rfile), "--mtp", "freeze", "--sft-eval", str(efile), "--eval-every", "1")
+    runs = {}
+    for name, extra in (("w1", ()), ("w3", ("--sft-weights", "conv=3"))):
+        out = WORK / f"run_sft_weights_{name}"
+        shutil.rmtree(out, ignore_errors=True)
+        _run(*base, *extra, "--out", str(out))
+        text = (out / "stage1" / "log.txt").read_text()
+        runs[name] = ([ln.split("loss=")[1].split()[0] for ln in text.splitlines() if ln.startswith("step ")],
+                      _ckpt(out)["latents"], text)
+    assert 'SFT_WEIGHTS {"conv": 3.0}' in runs["w3"][2]
+    assert runs["w1"][0] == runs["w3"][0]  # the logged loss is unweighted
+    assert any(not torch.equal(runs["w1"][1][k], runs["w3"][1][k]) for k in runs["w1"][1])  # the update is not
+    bad = _run(*base, "--sft-weights", "nosuch=2", "--out", str(WORK / "run_sft_weights_bad"), check=False)
+    assert bad.returncode != 0 and "is not a --sft-data source" in bad.stdout + bad.stderr

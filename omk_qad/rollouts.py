@@ -183,6 +183,19 @@ def render_segment(tok, messages: list[dict], tools, end: int, code_args=CODE_AR
                 got = a[len(p) :]  # the turn as served: its prompt, then the turn rendered as the last message
             elif extras is not None and text.startswith(a):
                 got = _served_turn(p, a)  # the turn after it: the prompt closed the model turn, the render merged
+            if (got is None and extras is not None and not m.get("reasoning_content") and p.endswith(THOUGHT_OPEN)
+                    and text.startswith(a)):
+                # sft7b (bm-889 2026-11-08, owner "train all"): a turn without reasoning after a tool response whose
+                # served prompt closed the model turn (the render merged it). Scored in the segment render, as the
+                # thought_closed case above: what the turn generated, a[k:], with no empty thought.
+                k = 0
+                while k < min(len(p), len(a)) and p[k] == a[k]:
+                    k += 1
+                if len(a) > k:
+                    _label_turn(text, roles, k, len(a), m, code_args, stats)
+                    if stats is not None:
+                        stats["merged_no_reasoning"] = stats.get("merged_no_reasoning", 0) + 1
+                    continue
             if got is None:
                 raise NotPrefixError(f"turn {i}: prompt/turn render is not a prefix of the segment render")
             xt = p + got
@@ -302,6 +315,39 @@ def _prompt_and_generated(tok, ctx: list[dict], m: dict, kw: dict, i: int) -> tu
     raise NotPrefixError(f"turn {i}: the turn render does not continue the prompt render")
 
 
+REASONING_CAP = {"n": 0, "tok": None}  # sft7c (bm-889 2026-11-08): set by --score-reasoning-cap
+
+
+def _cap_reasoning(text: str, roles: np.ndarray, g0: int, g1: int, stats) -> None:
+    """Keep only the first N tokens of a generated turn's thought scored; the rest becomes context (IGNORE).
+
+    The thought is text[r0:r1]: after THOUGHT_OPEN (inside the turn, or ending the served prompt after a tool
+    response) up to THOUGHT_CLOSE. THOUGHT_CLOSE itself, tool calls and the answer keep their roles.
+    """
+    n, tok = REASONING_CAP["n"], REASONING_CAP["tok"]
+    if n <= 0 or tok is None:
+        return
+    at = text.find(THOUGHT_OPEN, g0, g1)
+    if at >= 0:
+        r0 = at + len(THOUGHT_OPEN)
+    elif text.endswith(THOUGHT_OPEN, 0, g0):
+        r0 = g0
+    else:
+        return
+    r1 = text.find(THOUGHT_CLOSE, r0, g1)
+    r1 = g1 if r1 < 0 else r1
+    if r1 <= r0:
+        return
+    off = tok(text[r0:r1], add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
+    if len(off) <= n:
+        return
+    cut = r0 + off[n][0]
+    roles[cut:r1] = IGNORE
+    if stats is not None:
+        stats["reasoning_capped_turns"] = stats.get("reasoning_capped_turns", 0) + 1
+        stats["reasoning_capped_tokens"] = stats.get("reasoning_capped_tokens", 0) + len(off) - n
+
+
 def _label_turn(text: str, roles: np.ndarray, g0: int, g1: int, m: dict, code_args, stats) -> None:
     """Roles of one generated assistant turn ``text[g0:g1]`` (teacher, code -> anchor, loop spans -> loop)."""
     while g1 > g0 and text[g1 - 1] in "\n " and not text[:g1].endswith("|>"):  # template whitespace after
@@ -346,6 +392,7 @@ def _label_turn(text: str, roles: np.ndarray, g0: int, g1: int, m: dict, code_ar
         roles[max(g0, s0 - lead) : s0] = LEAD
     for s0, s1, _ in found:
         roles[s0:s1] = LOOP
+    _cap_reasoning(text, roles, g0, g1, stats)
 
 
 def _nth_call(span: str, k: int) -> int | None:
@@ -761,6 +808,8 @@ def main() -> None:
     src.add_argument("--capture", help="SDK request-capture dir (<session>/<stem>.json + .response.json)")
     ap.add_argument("--out", required=True, help="output .roles.jsonl")
     ap.add_argument("--seq", type=int, default=16384)
+    ap.add_argument("--score-reasoning-cap", type=int, default=0, help="score only the first N tokens of each "
+                    "generated turn's thought; the rest stays in the text as unscored context (0 = off)")
     ap.add_argument("--stride", type=int, default=0, help="window step (default seq // 2)")
     ap.add_argument("--code-args", default=",".join(CODE_ARGS))
     ap.add_argument("--history-reasoning", choices=["keep", *HISTORY_CONTEXT],
@@ -797,6 +846,7 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(a.model)
+    REASONING_CAP.update(n=a.score_reasoning_cap, tok=tok)
     code_args, stride = tuple(a.code_args.split(",")), a.stride or a.seq // 2
     if a.capture:
         if not a.allow_live_capture:
