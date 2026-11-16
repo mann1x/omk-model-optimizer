@@ -235,7 +235,8 @@ numbers in the commit message and in the card's table. Scripts as run: [`kfac/`]
 
 - **cache** — the bm-892 r16k QAD cache ([`qad_iq2/recipe_iq2_r16k.yaml`](qad_iq2/recipe_iq2_r16k.yaml)): the 11 sft11
   role families, 4,217 windows × 16,384 tokens, top-64, assistant positions only; its imatrix (`cache/imatrix.gguf`,
-  the first 256 windows, per expert, sha256 `80e56b9b…`, published as `imatrix.gguf`) is the one every K-FAC tier,
+  258 chunks of 16,384 tokens from the training windows, per expert, sha256 `80e56b9b…`, published as `imatrix.gguf`)
+  is the one every K-FAC tier,
   the arm-E reference, the seed and the QAD export share. Eval reference: `cache/eval.pt`, 44 rows, 614,086 scored
   positions, the bf16 teacher's own top-64.
 - **factors** — [`kfac/kfac_collect_r.sh 0 g10`](kfac/kfac_collect_r.sh): `omk_qad.kfac --windows 512 --seq 2048

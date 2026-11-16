@@ -77,8 +77,8 @@ llama-quantize --imatrix IMATRIX --tensor-type "blk\.\d+\.attn_(q|k|v|output)\.w
 The imatrix is **required** at every tier, K-FAC or not: it is the PTQ reference's input, the rounder's per-column
 importance (see below) and the GGUF's `quantize.imatrix.*` provenance. Which imatrix: the 20B ladder uses the
 AtomicChat corpus imatrix of the published model (`imatrix.dat`, 9,590 chunks, `--parse-special`); the 26B ladder
-uses the QAD cache's own corpus imatrix (`cache/imatrix.gguf`, the first 256 training windows of 16,384 tokens, per
-expert), the same file its IQ2_XXS QAD trains and exports with.
+uses the QAD cache's own corpus imatrix (`cache/imatrix.gguf`, 258 chunks of 16,384 tokens from the training windows,
+per expert), the same file its IQ2_XXS QAD trains and exports with.
 
 ### 3. Rounding
 
