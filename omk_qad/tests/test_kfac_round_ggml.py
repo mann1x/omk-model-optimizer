@@ -19,7 +19,7 @@ def test_iq2_without_llama_cpp_is_refused(monkeypatch):
     with pytest.raises(ValueError, match="--llama-cpp"):
         kfac_round.native("IQ2_XXS")
     with pytest.raises(ValueError, match="not a supported type"):
-        kfac_round.native("Q4_K")
+        kfac_round.native("BF16")
 
 
 @needs_lib
@@ -83,3 +83,64 @@ def test_iq2_gptq_fp16_latent_reencodes_to_its_own_payload():
         assert not torch.equal(lat32, lat32.half().float())  # the fp32 path is what the old files were encoded from
     finally:
         kfac_round._GGML["mod"] = None
+
+
+@needs_lib
+@pytest.mark.parametrize("qtype", ["Q4_K", "Q6_K", "Q3_K", "Q5_0", "IQ4_NL", "Q8_0"])
+def test_kquant_types_round_through_libggml(qtype):
+    """The ladder's K-quant and block-32 types go through the same libggml contract; GPTQ never worse than RTN.
+
+    IQ4_NL and Q8_0 blocks are row-independent (a 64-column slice encodes to the row's bytes); Q4_0/Q5_0 weight
+    each block with the ROW's sigma2 in libggml, so a GPTQ group of them carries the group-local sigma2 instead.
+    """
+    kfac_round._GGML["mod"] = kfac_round.GgmlNative(LLAMA)
+    try:
+        g = torch.Generator().manual_seed(3)
+        w0 = torch.randn(16, 512, generator=g) * 0.05
+        mix = torch.eye(512) + 0.3 * torch.randn(512, 512, generator=g) / 512 ** 0.5
+        xs = torch.randn(4096, 512, generator=g) @ mix
+        a = xs.T @ xs / 4096
+        imp = a.diagonal().clone()
+        p, q, _ = kfac_round.rtn_expert(w0, imp, qtype)
+        assert p.shape[:2] == (16, 2 if qtype.endswith("_K") else 16) and q.shape == w0.shape  # 256- / 32-blocks
+        # a block-32 type encodes a 64-column slice to the same bytes as the full row (independent blocks)
+        if qtype in ("IQ4_NL", "Q8_0"):
+            sl = torch.cat([kfac_round.encode_decode(qtype, w0[:, s:s + 64], imp[s:s + 64])[0]
+                            for s in range(0, 512, 64)], 1)
+            assert torch.equal(sl, p)
+        group = kfac_round.group_of(w0.shape[1])
+        corr = torch.corrcoef(torch.stack([w0.flatten(), q.flatten()]))[0, 1]
+        assert corr > 0.95, float(corr)
+        pg, qg, latent, _ = kfac_round.gptq_expert(w0, a, imp, qtype, 0.01, torch.float16, group)
+        gm = torch.eye(16)
+        assert kfac_round.loss_terms(qg - w0, a, gm)[0] <= kfac_round.loss_terms(q - w0, a, gm)[0] * 1.02
+        assert torch.equal(latent, latent.half().float())
+    finally:
+        kfac_round._GGML["mod"] = None
+
+
+def test_layer_qtypes_auto_needs_ref_and_known_types():
+    """--qtype auto follows the --ref tensor types and refuses unknown ones."""
+    with pytest.raises(SystemExit, match="needs --ref"):
+        kfac_round.layer_qtypes("auto", None, [0])
+
+    class T:
+        def __init__(self, n):
+            self.tensor_type = type("TT", (), {"name": n})()
+
+    class Ref:
+        t = {"blk.0.ffn_gate_up_exps.weight": T("Q4_K"), "blk.1.ffn_gate_up_exps.weight": T("IQ2_XXS")}
+
+    gu = "ffn_gate_up_exps"
+    assert kfac_round.layer_qtypes("auto", Ref(), [0, 1]) == {(0, gu): "Q4_K", (1, gu): "IQ2_XXS"}
+    assert kfac_round.layer_qtypes("IQ4_XS", None, [0, 1]) == {(0, gu): "IQ4_XS", (1, gu): "IQ4_XS"}
+    with pytest.raises(SystemExit, match="needs --qtype auto"):
+        kfac_round.layer_qtypes("IQ4_XS", None, [0], ["ffn_gate_up_exps", "ffn_down_exps"])
+    Ref.t["blk.0.ffn_down_exps.weight"] = T("IQ4_NL")
+    Ref.t["blk.1.ffn_down_exps.weight"] = T("Q8_0")
+    assert kfac_round.layer_qtypes("auto", Ref(), [0, 1], kfac_round.STEM_SETS["routed"]) == {
+        (0, gu): "Q4_K", (1, gu): "IQ2_XXS", (0, "ffn_down_exps"): "IQ4_NL", (1, "ffn_down_exps"): "Q8_0"}
+    assert kfac_round.group_of(2816) == 256 and kfac_round.group_of(704) == 64 and kfac_round.group_of(2112) == 64
+    Ref.t["blk.1.ffn_gate_up_exps.weight"] = T("BF16")
+    with pytest.raises(SystemExit, match="not a type this rounder encodes"):
+        kfac_round.layer_qtypes("auto", Ref(), [0, 1])
