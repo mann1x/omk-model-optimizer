@@ -144,6 +144,20 @@ def test_codec_cpu_path_is_the_reference(lib):
         assert np.array_equal(codec.to_bytes(qtype, got, x.shape[0]).reshape(-1), want), qtype
 
 
+def test_codec_decodes_a_libggml_payload_of_a_native_type(lib):
+    """A checkpoint written while IQ2 went through --ggml-encode holds numpy payloads: the resume must serve them."""
+    from omk_qad.fakequant import Codec
+
+    codec = Codec(LLAMA_CPP)
+    x, imats = _inputs(3, rows=8)
+    for qtype in QTYPES:
+        q = lib.quantize(int(_gguf().GGMLQuantizationType[qtype]), x, imats[1])  # numpy [rows, row bytes]
+        want = codec.decode(qtype, codec.encode(qtype, torch.from_numpy(x), torch.from_numpy(imats[1])), *x.shape,
+                            "cpu")
+        got = codec.decode(qtype, q, *x.shape, "cpu")
+        assert torch.equal(got, want), qtype
+
+
 def test_force_ggml_takes_a_native_type_off_the_gpu(monkeypatch):
     from omk_qad import fakequant as F
 

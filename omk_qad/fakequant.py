@@ -155,6 +155,9 @@ class Codec:
             out = GGML_FORMAT_REGISTRY[qtype.lower()].dequantize(packed, shape, dtype=dtype)
             return out.reshape(rows, cols).to(device=device)
         if qtype in NATIVE_TYPES:
+            if isinstance(packed, np.ndarray):  # libggml's bytes of this type (a checkpoint written while the type
+                # went through --ggml-encode, e.g. IQ2 before bm-896): the same blocks, in the kernel's torch layout
+                packed = torch.from_numpy(np.ascontiguousarray(packed)).to(device)
             return _native(qtype).decode(qtype, packed, rows, cols, dtype).to(device=device)
         out = self.ggml.dequantize(int(self.qtype(qtype)), packed, cols)
         return torch.from_numpy(out).to(device=device, dtype=dtype)
