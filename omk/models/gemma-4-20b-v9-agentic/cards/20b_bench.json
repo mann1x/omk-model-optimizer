@@ -1,0 +1,19 @@
+{
+ "title": "Canonical 9-bench suite on the K-FAC Q6_K (sft12) — running",
+ "basis": "llama.cpp b12386 (+ the PEG-degrade patch), two RTX 3090, `--parallel 2`, greedy decoding with `presence_penalty 0.025` and no repetition penalty (the model's deployment profile `gemma-4-v9-agentic-sft11`, sampler `greedy_pres`), thinking on with the templates' budgets, scores read from each bench's `summary.json`. The *previous build* column is the 2026-10-17 model's published Q6_K run (plain `llama-quantize`, greedy with `repeat_penalty 1.06 / repeat_last_n 96 / presence 0.025`, llama.cpp b9700): a different model and sampler, shown for reference only.",
+ "columns": ["previous build (2026-10) Q6_K", "sft12 · K-FAC Q6_K"],
+ "rows": [
+  {"name": "GPQA-diamond (198q)", "values": [55.56, null]},
+  {"name": "AIME (30q)", "values": [86.67, null]},
+  {"name": "MATH500 (100q)", "values": [81.00, null]},
+  {"name": "GSM8K (100q, qwen stops)", "values": [97.00, null]},
+  {"name": "ARC-Challenge (full)", "values": [86.77, null]},
+  {"name": "IFEval (100q, strict)", "values": [96.00, null]},
+  {"name": "HumanEval (164)", "values": [98.17, 98.17]},
+  {"name": "HumanEval+ (164)", "values": [90.24, 90.85]},
+  {"name": "LCB-medium-55 v4", "values": [98.18, null]},
+  {"name": "LCB-medium-100 v4", "values": [97.00, null]},
+  {"name": "MultiPL-E (100 × 3, native)", "values": [90.00, null]}
+ ],
+ "notes": "Metrics: GPQA & GSM8K = `exact_match` flexible-extract · MATH500 = `math_verify` · ARC & AIME = `exact_match` · IFEval = `prompt_level_strict_acc` · HumanEval/+ = `pass@1` chat-extract · LCB & MultiPL-E = `pass@1`. Empty cells are still running; the table is refreshed as each bench finishes."
+}

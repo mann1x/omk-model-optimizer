@@ -81,14 +81,14 @@ def sha256_of(p: Path) -> str:
     return h.hexdigest()
 
 
-def local_sha(d: Path) -> str:
-    side = d / "kfac.gguf.sha256"
+def local_sha(d: Path, method: str = "kfac") -> str:
+    side = d / f"{method}.gguf.sha256"
     if side.exists():
         s = side.read_text().split()[0]
         if len(s) == 64:
             return s
-    s = sha256_of(d / "kfac.gguf")
-    side.write_text(f"{s}  kfac.gguf\n")
+    s = sha256_of(d / f"{method}.gguf")
+    side.write_text(f"{s}  {method}.gguf\n")
     return s
 
 
@@ -98,7 +98,7 @@ def hub_files(api: HfApi, repo: str) -> dict:
         try:
             info = api.model_info(repo, files_metadata=True)
             out = {}
-            for s in info.siblings:
+            for s in info.siblings or []:
                 lfs = getattr(s, "lfs", None)
                 sha = None
                 if lfs:
@@ -139,10 +139,11 @@ def upload(api: HfApi, repo: str, src: Path, name: str, msg: str) -> bool:
     return False
 
 
-def twin(d: Path) -> str:
+def twin(d: Path, method: str = "kfac") -> str:
     try:
-        p, k = json.load(open(d / "ptq.eval.json")), json.load(open(d / "kfac.eval.json"))
-        return (f"K-FAC {k['klk']:.5f}/{k['top1']:.4f} vs llama.cpp+imatrix {p['klk']:.5f}/{p['top1']:.4f} "
+        p, k = json.load(open(d / "ptq.eval.json")), json.load(open(d / f"{method}.eval.json"))
+        lab = "K-FAC" if method == "kfac" else "seeded QAD"
+        return (f"{lab} {k['klk']:.5f}/{k['top1']:.4f} vs llama.cpp+imatrix {p['klk']:.5f}/{p['top1']:.4f} "
                 f"({100 * (k['klk'] - p['klk']) / p['klk']:+.1f}% KL, 44-row top-256 KL vs F16)")
     except Exception as e:  # noqa: BLE001
         return f"twin numbers unavailable ({type(e).__name__})"
@@ -171,13 +172,27 @@ def publish_once(api: HfApi, which: str, cfg: dict, src: Path, name: str, tag: s
     say(f"KP_{tag.upper()}", which, name, "sha", s[:12], f"{src.stat().st_size / 2**30:.2f} GiB")
 
 
-def publish_tier(api: HfApi, which: str, cfg: dict, d: Path) -> None:
+def method_of(d: Path) -> str | None:
+    """'qad' for a seeded-QAD export dir (qad.gguf + qad.done + both scores), 'kfac' for a finished rounding, else None."""
+    if (d / "qad.gguf").exists() and (d / "qad.done").exists() and (d / "qad.eval.json").exists() and (d / "ptq.eval.json").exists():
+        return "qad"
+    if (d / "kfac.gguf").exists() and (d / "kfac.eval.json").exists() and (d / "ptq.eval.json").exists():
+        klog = d / "kfac.log"
+        if klog.exists() and "KFACR_DONE" in klog.read_text(errors="ignore"):
+            return "kfac"
+        say("skip", d.parent.parent.name, d.name, "kfac.log has no KFACR_DONE (partial rounding, bug-949)")
+    return None
+
+
+def publish_tier(api: HfApi, which: str, cfg: dict, d: Path, method: str = "kfac") -> None:
     tier = d.name
     name = f"{cfg['prefix']}-{tier}.gguf"
-    g = d / "kfac.gguf"
-    s = local_sha(d)
+    g = d / f"{method}.gguf"
+    s = local_sha(d, method)
+    what = ("K-FAC rounded (omk_qad.kfac_round, all MLP tensors)" if method == "kfac"
+            else "seeded QAD export (omk_qad: K-FAC-seeded quantization-aware distillation, 600 steps)")
     if hub_sha(api, cfg["repo"], name) != s:
-        if not upload(api, cfg["repo"], g, name, f"{tier}: K-FAC rounded (omk_qad.kfac_round, all MLP tensors) -- {twin(d)}"):
+        if not upload(api, cfg["repo"], g, name, f"{tier}: {what} -- {twin(d, method)}"):
             say("KP_FAIL", which, tier, "upload")
             return
         hs = hub_sha(api, cfg["repo"], name)
@@ -187,9 +202,9 @@ def publish_tier(api: HfApi, which: str, cfg: dict, d: Path) -> None:
     side = d / f"{name}.sha256"
     side.write_text(f"{s}  {name}\n")
     upload(api, cfg["repo"], side, f"{name}.sha256", f"{tier}: sha256 sidecar")
-    (d / ".published_hf").write_text(f"{s}  {cfg['repo']}/{name}\n")
-    say("KP_TIER", which, tier, "->", f"{cfg['repo']}/{name}", f"{g.stat().st_size / 2**30:.2f} GiB sha {s[:12]};", twin(d))
-    if (d / ".archived_solidpc").exists():
+    (d / ".published_hf").write_text(f"{s}  {cfg['repo']}/{name}  {method}\n")
+    say("KP_TIER", which, tier, method, "->", f"{cfg['repo']}/{name}", f"{g.stat().st_size / 2**30:.2f} GiB sha {s[:12]};", twin(d, method))
+    if method == "kfac" and (d / ".archived_solidpc").exists():
         real = g.resolve()
         say("KP_RM", which, tier, f"bs2 copy removed ({real}); verified copies: hub + solidpc")
         real.unlink(missing_ok=True)
@@ -224,12 +239,14 @@ def manifest(api: HfApi, which: str, cfg: dict, files: dict) -> dict:
             continue
         tier = d.name
         name = f"{cfg['prefix']}-{tier}.gguf"
-        sha = m.read_text().split()[0]
+        parts = m.read_text().split()
+        sha = parts[0]
+        method = parts[2] if len(parts) > 2 else "kfac"
         size, hsha = files.get(name, (None, None))
         row = {"tier": tier, "name": name, "sha256": sha, "bytes": size, "hub_sha_ok": hsha == sha,
-               "attention": "Q8_0" if tier in ATTN_Q8 else "Q6_K",
+               "method": method, "attention": "Q8_0" if tier in ATTN_Q8 else "Q6_K",
                "published_utc": time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(m.stat().st_mtime))}
-        for arm, key in (("ptq", "ptq"), ("kfac", "kfac")):
+        for arm, key in (("ptq", "ptq"), ("kfac", method)):
             try:
                 e = json.load(open(d / f"{key}.eval.json"))
                 row[arm] = {"klk": e["klk"], "top1": e["top1"]}
@@ -250,8 +267,8 @@ def fmt_gb(b) -> str:
 def render_tiers(man: dict) -> str:
     rows = man["tiers"]
     n = man.get("elements")
-    hdr = ("| Tier | attention | size | bpw | sha256 | llama-quantize + imatrix<br>KL / top-1 | **K-FAC**<br>KL / top-1 | ΔKL |\n"
-           "|---|---|---:|---:|---|---:|---:|---:|\n")
+    hdr = ("| Tier | method | attention | size | bpw | sha256 | llama-quantize + imatrix<br>KL / top-1 | **this file**<br>KL / top-1 | ΔKL |\n"
+           "|---|---|---|---:|---:|---|---:|---:|---:|\n")
     lines = []
     for t in ORDER:
         r = rows.get(t)
@@ -262,7 +279,8 @@ def render_tiers(man: dict) -> str:
         pt = f"{p['klk']:.5f} / {p['top1']:.4f}" if p else "—"
         kt = f"**{k['klk']:.5f} / {k['top1']:.4f}**" if k else "—"
         dk = f"{100 * (k['klk'] - p['klk']) / p['klk']:+.1f} %" if (p and k) else "—"
-        lines.append(f"| **{t}** | {r['attention']} | {fmt_gb(r['bytes'])} | {bpw} | `{r['sha256'][:12]}…` | {pt} | {kt} | {dk} |")
+        meth = "K-FAC" if r.get("method", "kfac") == "kfac" else "QAD, K-FAC-seeded"
+        lines.append(f"| **{t}** | {meth} | {r['attention']} | {fmt_gb(r['bytes'])} | {bpw} | `{r['sha256'][:12]}…` | {pt} | {kt} | {dk} |")
     pending = [t for t in ORDER if t not in rows and t != "IQ2_XXS"]
     txt = hdr + "\n".join(lines) if lines else "_No K-FAC tier published yet._"
     txt += ("\n\n_IQ2_XXS: the seeded QAD export (see below), published when its run ends._"
@@ -360,16 +378,12 @@ def main() -> None:
                 for name, src in cfg["extra"].items():
                     publish_once(api, which, cfg, src, name, "extra", f"{name}: this build's unquantised GGUF (llama.cpp b12386)")
                 for d in sorted(p for p in cfg["ladder"].iterdir() if p.is_dir()):
-                    if d.name in SKIP_TIERS or (d / ".published_hf").exists():
+                    if (d / ".published_hf").exists():
                         continue
-                    g = d / "kfac.gguf"
-                    if not (g.exists() and (d / "kfac.eval.json").exists() and (d / "ptq.eval.json").exists()):
-                        continue
-                    klog = d / "kfac.log"
-                    if not klog.exists() or "KFACR_DONE" not in klog.read_text(errors="ignore"):
-                        say("skip", which, d.name, "kfac.log has no KFACR_DONE (partial rounding, bug-949)")
-                        continue
-                    publish_tier(api, which, cfg, d)
+                    method = method_of(d)
+                    if method is None or (d.name in SKIP_TIERS and method != "qad"):
+                        continue  # IQ2_XXS ships only as the seeded QAD export, never as a rounding
+                    publish_tier(api, which, cfg, d, method)
             except Exception as e:  # noqa: BLE001
                 say("KP_FAIL", which, "loop error", type(e).__name__, str(e)[:200])
         try:
