@@ -54,6 +54,58 @@ REST_ALIASES = {"bolt": "Q8_0"}
 # drafts poorly); "rest" lets llama.cpp's own rules decide.
 DEFAULT_MTP_TYPE = "Q4_K"
 DEFAULT_FIXED = {"routed_experts": "iq2_xxs", "shared_experts": "iq2_xxs", "dense_mlp": "iq2_xxs"}
+# Per-family floors: classes a family cannot carry at 2-3 bits. The floor type is planned for every tensor of the
+# class that no --fixed / --override / --override-regex names (it beats the ``rest`` rules only), and the final plan
+# is refused, at planning AND at export, if such a class is still under 4 bits, unless explicitly allowed.
+# bm-892, 2026-11-16: on Gemma-4 A4B (26B-A4B 128e and the 98e prunes) the IQ2_M rules put the 115 attention
+# projections at IQ2_S/IQ3_S/Q4_K; untrained PTQ with attention at Q8_0 (klk 0.0675) beat a 1,500-step QAD trained
+# on that layout (0.0831), and the served model ruminated 11-14k tokens per agentic turn. Lifting them costs
+# +710 MiB at Q8_0, +454 at Q6_K, +181 at Q4_K on the 26B-A4B. The PTQ sweep at 2-bit experts then measured
+# Q6_K 0.0691 (+2.4 %), Q5_K 0.0707, Q4_K 0.0783 (+16 %) against Q8_0 0.0675.
+# Owner's rule (2026-11-16): tiers BELOW Q4_K_M carry all attention at Q6_K, Q4_K_M and above at Q8_0. The floor
+# of a class is therefore a function of the layout's ``rest`` tier (the same rule lives in omnimergekit
+# scripts/quantize_gguf.py as GEMMA4_ATTN_HIGH_TIERS / gemma4_attention_type).
+ATTENTION_HIGH_TIERS = {"Q4_K_M", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q5_0", "Q5_1", "Q6_K", "Q6_K_L", "Q8_0"}
+FAMILY_FLOORS = {"gemma4": {"attention": {"below_Q4_K_M": "Q6_K", "Q4_K_M_and_above": "Q8_0"}}}
+_LOW_BIT = re.compile(r"^(IQ[123]_|Q[23]_K|TQ[12]_)")  # every llama.cpp type under 4 bits per weight
+
+
+def floor_type(family: str, cls: str, rest_ftype: str) -> str | None:
+    """The type a floored class defaults to under ``rest_ftype`` (None: the family does not floor that class)."""
+    rule = FAMILY_FLOORS.get(family, {}).get(cls)
+    if rule is None:
+        return None
+    if isinstance(rule, str):
+        return rule
+    return rule["Q4_K_M_and_above"] if rest_ftype.upper() in ATTENTION_HIGH_TIERS else rule["below_Q4_K_M"]
+
+
+def family_of(model_type: str | None) -> str:
+    """FAMILY_FLOORS key of a config ``model_type`` (``gemma4_text`` and ``gemma4`` are one family)."""
+    return re.sub(r"_text$", "", (model_type or "").lower())
+
+
+def low_bit_violations(layout: dict, allow: bool = False) -> list[str]:
+    """Tensors of a floored class (per the layout's family) planned under 4 bits; refuses them unless ``allow``.
+
+    Works on layouts built before ``model_type`` was recorded: the family then comes from the model's config.json.
+    """
+    family = family_of(layout.get("model_type"))
+    if not family and layout.get("model_dir"):
+        cfg = Path(layout["model_dir"]) / "config.json"
+        if cfg.is_file():
+            family = family_of(json.loads(cfg.read_text()).get("model_type"))
+    floors = FAMILY_FLOORS.get(family, {})
+    bad = [f"{g}={t['type']}" for g, t in layout["targets"].items()
+           if t.get("cls") in floors and _LOW_BIT.match(str(t["type"]))]
+    if bad and not allow:
+        raise SystemExit(
+            f"{family}: {len(bad)} {sorted(floors)} tensors planned under 4 bits (family floor {floors}), e.g. "
+            f"{bad[:4]} — a Gemma-4 A4B model cannot carry attention at 2-3 bits (bm-892, 2026-11-16). "
+            "Lift them (the default) or pass --allow-low-attention to plan it anyway.")
+    return bad
+
+
 _PLAN_LINE = re.compile(
     r"^\[\s*\d+/\s*\d+\]\s+(\S+)\s+- \[([^\]]*)\], type =\s*(\S+), size =.*?(?:->\s*[\d.]+ MiB \((\S+)\))?\s*$"
 )
@@ -220,7 +272,8 @@ def probe_model(model_dir: Path, llama_cpp: Path, work: Path, mtp: bool = True) 
     t0 = time.time()
     model_dir, work = Path(model_dir), Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    model, _ = meta_text_model(model_dir, mtp)
+    model, config = meta_text_model(model_dir, mtp)
+    model_type = str(getattr(config, "model_type", "") or "")
     params = {n: tuple(p.shape) for n, p in model.named_parameters()}
     classes = param_classes(model)
     names = list(params)
@@ -287,7 +340,7 @@ def probe_model(model_dir: Path, llama_cpp: Path, work: Path, mtp: bool = True) 
     source = {g: names[int(src[g][0])] for g in cols_of}
     return {"model_dir": str(model_dir), "llama_cpp": str(llama_cpp), "params": params, "classes": classes,
             "shapes": shapes, "source": source, "rows": rows_of, "cols": cols_of, "bad": bad, "sparse": sparse,
-            "work": work, "has_mtp": has_mtp, "seconds": round(time.time() - t0, 1)}
+            "work": work, "has_mtp": has_mtp, "model_type": model_type, "seconds": round(time.time() - t0, 1)}
 
 
 def _check_type(t: str, llama_cpp: Path) -> str:
@@ -344,12 +397,13 @@ def retype(layout: dict, cls_types: dict[str, str]) -> dict:
 
 def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None = None,
                 overrides: dict[str, str] | None = None, regex: dict[str, str] | None = None,
-                mtp_type: str = DEFAULT_MTP_TYPE) -> dict:
+                mtp_type: str = DEFAULT_MTP_TYPE, allow_low: bool = False) -> dict:
     """The layout for one preset: ``fixed`` classes at their trained format, everything else per llama.cpp.
 
     ``rest`` is the llama.cpp ftype whose rules plan the non-fixed tensors (or ``bolt`` = Q8_0 rest);
     ``overrides`` force a type per census class, ``regex`` per GGUF-name pattern. Precedence (llama.cpp applies
-    the first matching pattern): fixed > class overrides > regex overrides > ``rest`` rules.
+    the first matching pattern): fixed > class overrides > regex overrides > family floor (FAMILY_FLOORS) >
+    ``rest`` rules. A plan that leaves a floored class under 4 bits is refused unless ``allow_low``.
     """
     t0 = time.time()
     fixed = DEFAULT_FIXED if fixed is None else fixed
@@ -379,6 +433,14 @@ def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None =
     # llama-quantize does not know the ternary types: plan them as an IQ2_XXS placeholder, then put them back
     patterns = [(f"^{re.escape(g)}$", "IQ2_XXS" if t in TERNARY_TYPES else t) for g, t in exact.items()]
     patterns += list(regex.items())
+    family = family_of(probe.get("model_type"))
+    for cls in FAMILY_FLOORS.get(family, {}):  # after the caller's patterns: first match wins
+        floor_t = _check_type(floor_type(family, cls, rest_ftype), lc)
+        floored = [g for g in shapes if g not in exact and len(shapes[g]) >= 2
+                   and source.get(g) is not None and classes.get(source[g]) == cls]
+        patterns += [(f"^{re.escape(g)}$", floor_t) for g in floored]
+        log.info("family floor %s at rest %s: %d %s tensors default to %s (an --override/--override-regex of yours "
+                 "wins; --allow-low-attention to go under 4 bits)", family, rest_ftype, len(floored), cls, floor_t)
     plan, sizes = _dry_run(Path(probe["llama_cpp"]), probe["sparse"], rest_ftype, patterns, Path(probe["work"]))
     plan.update(tern)
     block = _check_ternary(tern, shapes, sizes)
@@ -402,8 +464,9 @@ def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None =
     for g, t in targets.items():
         if t["src"] is not None:
             by_param[t["src"]].append(g)
-    return {
+    layout = {
         "model_dir": probe["model_dir"],
+        "model_type": probe.get("model_type", ""),
         "ftype": rest_ftype,
         "rest": rest,
         "fixed": fixed,
@@ -418,8 +481,14 @@ def plan_layout(probe: dict, rest: str = "IQ2_M", fixed: dict[str, str] | None =
         "by_param": dict(by_param),
         "sizes_mib": sizes,
         "hadamard_block": block,
+        "allow_low_bits": bool(allow_low),
         "seconds": round(probe["seconds"] + time.time() - t0, 1),
     }
+    low = low_bit_violations(layout, allow_low)
+    if low:
+        log.warning("%d floored-class tensors under 4 bits kept on request (--allow-low-attention): %s ...",
+                    len(low), low[:3])
+    return layout
 
 
 def build_layout(model_dir: Path, llama_cpp: Path, rest: str = "IQ2_M", fixed: dict[str, str] | None = None,
@@ -480,6 +549,8 @@ def main() -> None:
     ap.add_argument("--no-mtp", action="store_true", help="leave the MTP (nextn) head out even if declared")
     ap.add_argument("--mtp-type", default=DEFAULT_MTP_TYPE, help="type of the MTP head tensors, or 'rest'")
     ap.add_argument("--compare", default="", help="comma list of rest presets: print a size table, save --rest only")
+    ap.add_argument("--allow-low-attention", action="store_true",
+                    help="plan a FAMILY_FLOORS class under 4 bits anyway (Gemma-4 attention; refused otherwise)")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     fixed, overrides = _pairs(a.fixed), _pairs(a.override)
@@ -490,12 +561,12 @@ def main() -> None:
         if a.compare:
             rows = []
             for rest in a.compare.split(","):
-                lay = plan_layout(probe, rest, fixed, overrides, regex, a.mtp_type)
+                lay = plan_layout(probe, rest, fixed, overrides, regex, a.mtp_type, a.allow_low_attention)
                 gb = lay["sizes_mib"].get("quant", float("nan")) * 2**20 / 1e9
                 types = Counter(t["type"] for t in lay["targets"].values() if t["cls"] not in fixed)
                 rows.append(f"{rest:8s} {gb:7.2f} GB   rest types: {dict(types.most_common())}")
             print("\n".join(rows))
-        layout = plan_layout(probe, a.rest, fixed, overrides, regex, a.mtp_type)
+        layout = plan_layout(probe, a.rest, fixed, overrides, regex, a.mtp_type, a.allow_low_attention)
     finally:
         probe["sparse"].unlink(missing_ok=True)
     if a.out.exists():  # a layout may be in use by a run (its identity names this file): never replaced by another

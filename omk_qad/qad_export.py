@@ -172,6 +172,11 @@ def _export_gguf(model: torch.nn.Module, layout: dict, out: Path, llama_cpp: Pat
         register_gguf_types(gguf)
     folded = {n: lat for n, lat in (latents or {}).items() if lat.basis is not None}
     model_dir = Path(layout["model_dir"])
+    # The family floor is enforced at export too, so a layout built before the rule (or by hand) cannot ship
+    # Gemma-4 attention at 2-3 bits; a plan made with --allow-low-attention carries its permission.
+    from .layout import low_bit_violations
+
+    low_bit_violations(layout, allow=bool(layout.get("allow_low_bits")))
     hparams = json.loads((model_dir / "config.json").read_text())
     base_cls = get_model_class(get_model_architecture(hparams, text_type))
     named = dict(model.named_parameters())

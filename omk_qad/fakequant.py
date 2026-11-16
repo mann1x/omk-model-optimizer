@@ -43,6 +43,40 @@ TERNARY_TYPES = {"PQ2_0", "PTQ1_0"}  # PrismML Bonsai 2 (omk_qad.ternary); the l
 CHUNK_ELEMS = 64 * 2**20  # rows are encoded / updated in chunks of about this many values
 
 
+LLAMA_WEIGHT_TYPES: set[str] = set()  # ModelOpt types encoded with llama.cpp's per-value weights (--iq2-llama-weights)
+
+
+def use_llama_weights(types) -> set[str]:
+    """Encode ModelOpt ``types`` with llama.cpp's per-value weights.
+
+    The search weights value i by ``imatrix[i] * sqrt(sigma2 + x_i^2)`` (llama.cpp's IQ2_XXS weight) instead
+    of the imatrix alone. Only IQ2_XXS implements it. Mutated in place, like :func:`force_ggml`.
+    """
+    want = {t.upper() for t in types if t}
+    bad = want - {"IQ2_XXS"}
+    if bad:
+        raise ValueError(f"--iq2-llama-weights: only IQ2_XXS implements llama.cpp weights, not {sorted(bad)}")
+    LLAMA_WEIGHT_TYPES.update(want)
+    return set(LLAMA_WEIGHT_TYPES)
+
+
+def force_ggml(types) -> set[str]:
+    """Encode ``types`` (ModelOpt types) with libggml -- llama-quantize's own search -- in training and export.
+
+    ModelOpt's IQ1/IQ2 encoders predict the block scale and weight the error by the imatrix alone; llama.cpp
+    searches the scale and weights it by ``imatrix * sqrt(sigma2 + x^2)``. On gemma-4-26B the ModelOpt dense
+    ffn_up/ffn_gate cost KL 0.258 -> 0.326 against llama-quantize (bm-892). The sets are mutated in place so
+    every importer (imatrix.importance_for, the refresh split) sees the change. Returns the forced set.
+    """
+    forced = {t.upper() for t in types if t}
+    bad = forced - MODELOPT_TYPES
+    if bad:
+        raise ValueError(f"--ggml-encode: {sorted(bad)} are not ModelOpt types {sorted(MODELOPT_TYPES)}")
+    MODELOPT_TYPES.difference_update(forced)
+    GPU_TYPES.difference_update(forced)
+    return forced
+
+
 def _native(qtype: str):
     """The omk_qad module (iq4 / iq3) that encodes and decodes a native type."""
     import importlib
@@ -92,6 +126,8 @@ class Codec:
             from modelopt.torch.quantization.ggml import GGML_FORMAT_REGISTRY
 
             kw = {} if importance is None else {"importance": importance.to(x.device)}
+            if importance is not None and qtype in LLAMA_WEIGHT_TYPES:
+                kw["llama_weights"] = True  # importance * sqrt(sigma2 + x^2), as llama-quantize (bm-892)
             packed, _ = GGML_FORMAT_REGISTRY[qtype.lower()].quantize(x.float().contiguous(), **kw)
             return packed
         if qtype in NATIVE_TYPES:  # CUDA kernel on a CUDA device (raises rather than fall back), torch on CPU

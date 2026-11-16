@@ -158,6 +158,18 @@ def mean_sq(entry: dict) -> torch.Tensor:
     return m
 
 
+CONVENTIONS = ("modelopt", "msq")
+_convention = "modelopt"
+
+
+def set_convention(name: str) -> None:
+    """``--imatrix-convention``: what the ModelOpt encoders get (modelopt = floored sqrt, msq = E[x^2])."""
+    global _convention
+    if name not in CONVENTIONS:
+        raise ValueError(f"imatrix convention {name!r} not in {CONVENTIONS}")
+    _convention = name
+
+
 def importance_for(qtype: str, msq: torch.Tensor | None) -> torch.Tensor | None:
     """Importance vector an encoder of ``qtype`` takes from E[x^2] ``msq`` [C] (see module doc)."""
     if msq is None:
@@ -170,6 +182,8 @@ def importance_for(qtype: str, msq: torch.Tensor | None) -> torch.Tensor | None:
 
         if not GGML_FORMAT_REGISTRY[qtype.lower()].weighted:
             return None
+        if _convention == "msq":
+            return msq.float()
         floored = floored_second_moments(msq)
         return None if floored is None else floored.sqrt()
     return msq.float()

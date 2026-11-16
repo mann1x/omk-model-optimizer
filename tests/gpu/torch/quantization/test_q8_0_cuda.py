@@ -47,6 +47,60 @@ def test_q8_0_cuda_pack_matches_pytorch_encoder_and_is_decodable(monkeypatch):
     assert normalized_mse < 1e-4
 
 
+def test_q8_0_cuda_scale_keeps_its_low_byte(monkeypatch):
+    """The fp16 block scale must be stored whole (bm-892 / bug-945).
+
+    ptxas 12.6 and 12.8 compile a byte store of half bits (``payload[0] = (uint8_t)bits``) to F2I.U8.F16, the
+    half's value truncated to an integer: every scale below 1 lost its low byte and the dequantised weights shrank
+    by 0-20 %. With random scales the low byte is zero in about 1 block of 256, so a run of all-zero low bytes
+    over 1024 blocks is the miscompile, not chance.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(99)
+    weight = torch.randn((64, 512), generator=generator, device="cuda", dtype=torch.bfloat16) * 0.02
+    packed = _extension().q8_0_pack(weight).reshape(-1, 34)
+    low = packed[:, 0]
+    assert (low != 0).float().mean() > 0.9, "Q8_0 scale low byte lost (ptxas F2I.U8.F16 byte-store miscompile)"
+    # The scale bytes must agree with the PyTorch encoder block for block (the quants may differ in rare
+    # rounding ties between the two float paths; the byte-exact reference is libggml, checked below when present).
+    monkeypatch.setattr(q8_0_module, "get_cuda_ext_ggml", lambda: None)
+    reference, _ = quantize_q8_0(weight)
+    assert torch.equal(packed[:, :2], reference.reshape(-1, 34)[:, :2])
+    try:
+        from pathlib import Path
+
+        from omk_qad.ggml_lib import GGMLLib
+    except ImportError:
+        return
+    import os
+
+    llama = next((p for p in (os.environ.get("OMK_LLAMA_CPP"), "/opt/llama.cpp", "/mnt/sdc/ml/llama.cpp-b12386")
+                  if p and (Path(p) / "build/bin/libggml-base.so").is_file()), None)
+    if llama is None:
+        return
+    ref = GGMLLib(Path(llama)).quantize(8, weight.float().cpu().numpy())  # GGML_TYPE_Q8_0 = 8
+    assert torch.equal(packed.cpu(), torch.from_numpy(ref).reshape(-1, 34)), "CUDA Q8_0 pack != llama-quantize bytes"
+
+
+def test_q8_0_cuda_extension_has_no_f2i_u8_f16():
+    """SASS gate: the built extension must not contain the miscompiled byte store (needs cuobjdump; else skipped)."""
+    import os
+    import shutil
+    import subprocess
+
+    extension = _extension()
+    so = getattr(extension, "__file__", None)
+    if not so or not os.path.isfile(so):
+        pytest.skip("extension module has no .so path")
+    cuobjdump = shutil.which("cuobjdump") or os.path.join(
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "cuobjdump"
+    )
+    if not os.path.isfile(cuobjdump):
+        pytest.skip("cuobjdump not available")
+    sass = subprocess.run([cuobjdump, "-sass", so], capture_output=True, text=True, check=False).stdout
+    assert sass, "cuobjdump produced no SASS"
+    assert "F2I.U8.F16" not in sass, "fp16 byte store miscompiled to F2I.U8.F16 in the GGML CUDA extension"
+
+
 def test_q8_0_cuda_zero_and_nonfinite_encoding_match_reference(monkeypatch):
     weight = torch.zeros((2, 32), device="cuda", dtype=torch.bfloat16)
     weight[1, :3] = torch.tensor([torch.nan, torch.inf, -torch.inf], device="cuda")

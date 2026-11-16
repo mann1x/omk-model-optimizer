@@ -777,7 +777,10 @@ def build_student(a, layout: dict):
                   ggml_refresh=a.ggml_refresh, refresh=getattr(a, "refresh", 1),
                   dummy=torch.zeros((), requires_grad=True, device=a.device),
                   hadamard_block=layout.get("hadamard_block"))
-    codec = Codec(Path(layout["llama_cpp"]), ternary_method=getattr(a, "ternary_method", "top:86"))
+    lc = Path(getattr(a, "llama_cpp", None) or layout["llama_cpp"])  # the CLI wins over the layout's record
+    if str(lc) != str(layout["llama_cpp"]):
+        print(f"codec llama.cpp: {lc} (layout recorded {layout['llama_cpp']})", flush=True)
+    codec = Codec(lc, ternary_method=getattr(a, "ternary_method", "top:86"))
     latent_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[a.latent_dtype]
     export_only = set(a.export_only.split(",")) if a.export_only else set()
     head_param = student.get_output_embeddings().weight
@@ -1194,6 +1197,47 @@ def save_state(path: Path, step: int, latents, student, opt, a, ctl=None, result
                  "branch": getattr(a, "branch", ""),
                  **{k: v for k, v in (extra or {}).items() if isinstance(v, str | int)}})
     del sd
+
+
+def seed_latents(src: str, latents, say) -> str:
+    """Start the routed gate_up latents from a K-FAC rounding instead of W0 (bm-892).
+
+    ``src`` holds ``omk_qad.kfac_round --save-latents`` files: ``layer_NN.pt`` with ``latent`` = W_adj [E, R, C] fp16
+    in GGUF order, which for Gemma-4 experts is the HF order (kfac_validate.identity_check). Every routed layer of the
+    student must have a file and every file a latent -- a partial seed would be a silent mix of two roundings.
+    """
+    import re
+
+    files = sorted(Path(src).glob("layer_*.pt"))
+    by_layer = {}
+    for n in latents:
+        m = re.search(r"\.layers\.(\d+)\.[^.]*experts[^.]*\.gate_up_proj$", n)
+        if m:
+            by_layer[int(m.group(1))] = n
+    if not files:
+        raise SystemExit(f"SEED_FAIL {src}: no layer_NN.pt")
+    seen, mx, qt = set(), 0.0, set()
+    for f in files:
+        ck = torch.load(f, map_location="cpu", weights_only=False)
+        j, w = int(ck["layer"]), ck["latent"]
+        n = by_layer.get(j)
+        if n is None or ck.get("stem", "ffn_gate_up_exps") != "ffn_gate_up_exps":
+            raise SystemExit(f"SEED_FAIL {f.name}: layer {j} stem {ck.get('stem')} has no gate_up latent here")
+        lat = latents[n]
+        if tuple(w.shape) != lat.shape or lat.basis is not None:
+            raise SystemExit(f"SEED_FAIL {f.name}: {tuple(w.shape)} vs latent {lat.shape} "
+                             f"(folded: {lat.basis is not None})")
+        mx = max(mx, (w.float() - lat.param.data.float().cpu()).abs().max().item())
+        lat.set_model_weight(w)
+        seen.add(j)
+        qt.add(f"{ck.get('qtype')}/{ck.get('method')}")
+        del w, ck
+    missing = sorted(set(by_layer) - seen)
+    if missing:
+        raise SystemExit(f"SEED_FAIL {src}: routed layers without a seed file: {missing}")
+    what = f"{src}: {len(seen)} gate_up latents <- K-FAC {','.join(sorted(qt))} W_adj (max|W_adj-W0| {mx:.4g})"
+    say(f"SEED_LATENTS {what}")
+    return what
 
 
 def load_state(path: str, latents, student, opt, ctl=None, weights_only: bool = False) -> dict:
@@ -1735,6 +1779,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 raise SystemExit(f"stage 2 needs a finished stage 1: {src} not found")
             load_state(src, latents, student, None, weights_only=True)
             origin["init_from"] = src
+        elif a.init_latents:  # a QAD that starts at a K-FAC rounding, not at W0 (the export gate must reproduce it)
+            origin["init_from"] = seed_latents(a.init_latents, latents, say)
         elif bf16 and (meta["args"].get("teacher_gguf") or not same_model(meta["args"]["model"], a.model)):
             # another teacher: KL is the gap, not ~0. With --teacher-gguf the cache's --model only gave the tokenizer
             # (bm-889: the 31B GGUF cache carries the 26B student's dir there and would have failed the gate)
@@ -1910,13 +1956,15 @@ def phase_export(a) -> None:
     student, latents, fp_params, _, _ = build_student(a, layout)
     if a.load:
         load_state(a.load, latents, student, None, weights_only=True)
+    elif a.init_latents:  # the untrained seed itself: the gate that a seeded run starts where the rounding ended
+        seed_latents(a.init_latents, latents, say)
     from .imatrix import load as load_imatrix
 
     imatrix = load_imatrix(Path(a.imatrix)) if a.imatrix != "none" else None
     fpath = Path(a.imatrix).with_name("imatrix.folded.pt") if imatrix else None
     imatrix_folded = load_imatrix(fpath) if fpath is not None and fpath.exists() else None
-    report = export_gguf(student, layout, Path(a.gguf), device=a.device, imatrix=imatrix, latents=latents,
-                         imatrix_folded=imatrix_folded)
+    report = export_gguf(student, layout, Path(a.gguf), llama_cpp=Path(a.llama_cpp), device=a.device,
+                         imatrix=imatrix, latents=latents, imatrix_folded=imatrix_folded)
     if imatrix_folded is not None and report.get("prism_hadamard"):  # provenance of the ternary encodings
         import shutil
 
@@ -1984,7 +2032,19 @@ def main(argv=None) -> None:
                     "collected on (0 = none); saved as <cache>/imatrix.pt (+ imatrix.gguf with --layout)")
     ap.add_argument("--imatrix", default="auto", help="train: imatrix.pt weighting the encoders (auto = "
                     "<cache>/imatrix.pt if present; none = off); export: auto = the one the run trained with")
-    ap.add_argument("--llama-cpp", default="/opt/llama.cpp")
+    ap.add_argument("--imatrix-convention", choices=["modelopt", "msq"], default="modelopt",
+                    help="importance the ModelOpt IQ1/IQ2/Q8_0 encoders take from E[x^2]: modelopt = sqrt floored at "
+                         "1e-4 of its mean (ModelOpt's choice); msq = E[x^2] itself, llama-quantize's convention "
+                         "(bm-892: tested at model level on Gemma-4 26B-A4B)")
+    ap.add_argument("--ggml-encode", default="",
+                    help="comma list of ModelOpt types (e.g. IQ2_XXS,IQ2_S) to encode with libggml -- llama-quantize's "
+                         "search, from --llama-cpp -- in training and export instead of ModelOpt (bm-892)")
+    ap.add_argument("--iq2-llama-weights", action="store_true",
+                    help="ModelOpt IQ2_XXS weights value i by imatrix[i] * sqrt(sigma2 + x_i^2), llama.cpp's weight, "
+                         "instead of the imatrix alone (needs --imatrix-convention msq; bm-892)")
+    ap.add_argument("--llama-cpp", default="/opt/llama.cpp",
+                    help="llama.cpp checkout: libggml + gguf-py for the encoders and the export (overrides the "
+                         "path the layout recorded)")
     # train
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--stop-at", type=int, default=0, help="end after this step, schedule unchanged")
@@ -2036,6 +2096,9 @@ def main(argv=None) -> None:
     ap.add_argument("--stage", type=int, choices=[1, 2], default=1)
     ap.add_argument("--branch", default="", help="stage-2 branch name (each variant of stage 2 is its own branch)")
     ap.add_argument("--init-from", default="", help="stage 2: stage-1 final.pt (default <out>/stage1/final.pt)")
+    ap.add_argument("--init-latents", default="", help="train (fresh run) / export (no --load): directory of "
+                    "omk_qad.kfac_round --save-latents files; the routed gate_up latents start from that rounding's "
+                    "W_adj instead of W0 (bm-892 seeded QAD)")
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--sft-epochs", type=int, default=1,
                     help="--loss ce: passes over --sft-data in ONE run, one after the other, each its own seeded "
@@ -2056,6 +2119,21 @@ def main(argv=None) -> None:
     ap.add_argument("--load", default="", help="train: resume from this full checkpoint (default: <run>/last.pt "
                     "if present); export: checkpoint whose weights to export")
     a = ap.parse_args(argv)
+    from .imatrix import set_convention
+
+    set_convention(a.imatrix_convention)
+    if a.ggml_encode:
+        from .fakequant import force_ggml
+
+        print(f"encoders: libggml ({a.llama_cpp}) for {sorted(force_ggml(a.ggml_encode.split(',')))}", flush=True)
+    if a.iq2_llama_weights:
+        from .fakequant import MODELOPT_TYPES, use_llama_weights
+
+        if a.imatrix_convention != "msq":
+            raise SystemExit("--iq2-llama-weights needs --imatrix-convention msq (llama.cpp's qw is E[x^2] itself)")
+        if "IQ2_XXS" not in MODELOPT_TYPES:
+            raise SystemExit("--iq2-llama-weights: IQ2_XXS is in --ggml-encode (libggml already weights it so)")
+        print(f"encoders: ModelOpt with llama.cpp weights for {sorted(use_llama_weights(['IQ2_XXS']))}", flush=True)
     {"cache": phase_cache, "evalset": phase_evalset, "train": phase_train, "export": phase_export}[a.phase](a)
 
 

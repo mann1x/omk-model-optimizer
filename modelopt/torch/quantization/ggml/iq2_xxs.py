@@ -190,12 +190,64 @@ def _encode_blocks(
     return torch.where((d_float == 0).unsqueeze(1), 0, packed)
 
 
+def _llama_block_weights(
+    blocks: torch.Tensor, block_importance: torch.Tensor, start: int
+) -> torch.Tensor:
+    """llama.cpp's per-value IQ2_XXS weights of flattened blocks ``start:start + len(blocks)``.
+
+    ``quantize_row_iq2_xxs_impl`` weights value i of a 256-value super-block by
+    ``qw[i] * sqrt(sigma2 + x[i]^2)`` with ``sigma2 = sum(x^2) / 256`` over that super-block, ``qw``
+    being the imatrix column. Returned as float32 ``[len(blocks), 256]``, one row per block, which
+    the CUDA kernel and :func:`chunk_importance` index directly (block % rows == block).
+    """
+    x = narrow_to_float32(blocks)
+    x2 = x.square()
+    sigma2 = x2.mean(dim=1, keepdim=True)
+    rows = torch.arange(start, start + x.shape[0], device=x.device) % block_importance.shape[0]
+    return (block_importance[rows] * (sigma2 + x2).sqrt()).contiguous()
+
+
+_LLAMA_WEIGHT_CHUNK_BLOCKS = 1 << 18  # 64M values: bounds the per-value weight buffer to 256 MiB
+
+
+def _quantize_iq2_xxs_llama_weighted(
+    weight: torch.Tensor, block_importance: torch.Tensor, block_chunk_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`quantize_iq2_xxs` with llama.cpp's per-value weights, built chunk by chunk."""
+    logical_shape = torch.tensor(weight.shape, dtype=torch.int64)
+    blocks = weight.contiguous().reshape(-1, IQ2_XXS_BLOCK_SIZE)
+    grid = iq2_xxs_grid(weight.device)
+    packed_shape = (
+        *weight.shape[:-1],
+        weight.shape[-1] // IQ2_XXS_BLOCK_SIZE,
+        IQ2_XXS_BLOCK_BYTES,
+    )
+    extension = get_cuda_ext_ggml() if weight.is_cuda else None
+    chunk = _LLAMA_WEIGHT_CHUNK_BLOCKS if extension is not None else block_chunk_size
+    out = []
+    for start in range(0, blocks.shape[0], chunk):
+        part = blocks[start : start + chunk]
+        weights = _llama_block_weights(part, block_importance, start)
+        if extension is not None:
+            scales = torch.cat(
+                [
+                    _predict_iq2_xxs_scales(part[s : s + _SCALE_BLOCK_CHUNK_SIZE])
+                    for s in range(0, part.shape[0], _SCALE_BLOCK_CHUNK_SIZE)
+                ]
+            )
+            out.append(extension.iq2_xxs_pack(part, grid, scales, weights))
+        else:
+            out.append(_encode_blocks(part, grid, weights.reshape(-1, GGML_BLOCK_SIZE // 8, 8)))
+    return torch.cat(out).reshape(packed_shape), logical_shape
+
+
 @torch.no_grad()
 def quantize_iq2_xxs(
     weight: torch.Tensor,
     *,
     block_chunk_size: int = _DEFAULT_BLOCK_CHUNK_SIZE,
     importance: torch.Tensor | None = None,
+    llama_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack a floating-point weight into GGML-compatible IQ2_XXS blocks.
 
@@ -204,10 +256,15 @@ def quantize_iq2_xxs(
     the logical-shape metadata is kept on CPU. Non-finite input elements are
     treated as zero during packing. ``importance``, a non-negative per-input-column vector,
     weights each value's squared error in the search, as llama.cpp's imatrix does.
+    ``llama_weights`` (needs ``importance``) uses llama.cpp's per-value weight instead,
+    ``importance * sqrt(sigma2 + x^2)`` (:func:`_llama_block_weights`): the importance alone
+    over-fits the high-activation columns (omk bm-892: lower imatrix-weighted error, higher KL).
     """
     validate_weight(weight, "IQ2_XXS")
     validate_block_chunk_size(block_chunk_size)
     block_importance = importance_blocks(importance, weight, "IQ2_XXS")
+    if llama_weights and block_importance is not None:
+        return _quantize_iq2_xxs_llama_weighted(weight, block_importance, block_chunk_size)
 
     logical_shape = torch.tensor(weight.shape, dtype=torch.int64)
     blocks = weight.contiguous().reshape(-1, IQ2_XXS_BLOCK_SIZE)

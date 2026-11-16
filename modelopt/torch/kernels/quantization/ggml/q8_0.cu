@@ -48,9 +48,12 @@ __global__ void encode(const scalar_t *input, int64_t num_blocks, uint8_t *outpu
   uint8_t *payload = output + block * kPayloadBytes;
   if (lane == 0) {
     d = fminf(amax / kMaxQuant, 65504.0f);
-    const uint16_t d_bits = __half_as_ushort(__float2half_rn(d));
-    payload[0] = static_cast<uint8_t>(d_bits);
-    payload[1] = static_cast<uint8_t>(d_bits >> 8);
+    // One aligned 16-bit store, never two byte stores: ptxas (12.6 and 12.8) compiles
+    // `payload[0] = static_cast<uint8_t>(half_bits)` to F2I.U8.F16 -- the half's VALUE truncated to an
+    // integer (0 for any scale < 1) instead of its low byte -- so every Q8_0 block scale lost its low
+    // mantissa byte (values shrunk 0-20 %, mean 8 %; bm-892, 2026-11-16; same miscompile as omk_qad
+    // iq4.cu bug-832). The payload is 2-byte aligned: 34-byte blocks from a tensor allocation.
+    *reinterpret_cast<uint16_t *>(payload) = __half_as_ushort(__float2half_rn(d));
   }
   d = __shfl_sync(0xffffffff, d, 0);
   const float inverse = d > 0.0f ? 1.0f / d : 0.0f;
