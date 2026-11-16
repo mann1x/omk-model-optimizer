@@ -13,11 +13,11 @@ LLAMA = next((p for p in (os.environ.get("OMK_LLAMA_CPP"), "/opt/llama.cpp", "/m
 needs_lib = pytest.mark.skipif(LLAMA is None, reason="no llama.cpp tree with build/bin/libggml-base.so")
 
 
-def test_iq2_without_llama_cpp_is_refused(monkeypatch):
-    """An IQ2 type is only encodable through libggml; without --llama-cpp the module must say so, early."""
+def test_ggml_type_without_llama_cpp_is_refused(monkeypatch):
+    """A libggml-only type (IQ2_XS; IQ2_XXS / IQ2_S have kernels since bm-896) needs --llama-cpp, said early."""
     monkeypatch.setitem(kfac_round._GGML, "mod", None)
     with pytest.raises(ValueError, match="--llama-cpp"):
-        kfac_round.native("IQ2_XXS")
+        kfac_round.native("IQ2_XS")
     with pytest.raises(ValueError, match="not a supported type"):
         kfac_round.native("BF16")
 

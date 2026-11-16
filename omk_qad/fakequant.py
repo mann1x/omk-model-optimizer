@@ -4,9 +4,9 @@
 Every large weight is a *latent* (float16 on GPU, 2 bytes/weight; stochastic rounding on write). Its *served*
 value is built when its module runs: for each GGUF tensor the layout maps to it, the latent rows the GGUF
 tensor holds are gathered in GGUF column order (so the GGML blocks are exactly the GGUF's), encoded to the
-planned type, decoded and scattered back. Encoders: ModelOpt (torch/CUDA) for IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/
-IQ2_S/Q8_0, omk_qad.iq4 / omk_qad.iq3 (CUDA, byte-identical to llama-quantize) for IQ4_XS/IQ4_NL/IQ3_XXS/
-IQ3_S, libggml (the code llama-quantize runs) for everything else (K-quants, ...). Export
+planned type, decoded and scattered back. Encoders: omk_qad.iq4 / iq3 / iq2 (CUDA, byte-identical to
+llama-quantize) for IQ4_XS/IQ4_NL/IQ3_XXS/IQ3_S/IQ2_XXS/IQ2_S, ModelOpt (torch/CUDA) for IQ1_S/IQ1_M/IQ2_XS/
+Q8_0, libggml (the code llama-quantize runs) for everything else (K-quants, ...). Export
 re-encodes the final latent with the same encoder, so the GGUF holds the blocks training served.
 
 The gradient of the served weight is the latent's gradient (straight-through). It is captured in the
@@ -34,9 +34,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-MODELOPT_TYPES = {"IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q8_0"}
-# omk_qad's own CUDA encoders, byte-identical to llama-quantize (no CPU fallback on a CUDA device)
-NATIVE_TYPES = {"IQ4_XS": "iq4", "IQ4_NL": "iq4", "IQ3_XXS": "iq3", "IQ3_S": "iq3"}  # type -> omk_qad module
+MODELOPT_TYPES = {"IQ1_S", "IQ1_M", "IQ2_XS", "Q8_0"}
+# omk_qad's own CUDA encoders, byte-identical to llama-quantize (no CPU fallback on a CUDA device). IQ2_XXS / IQ2_S
+# moved here from ModelOpt on 2026-11-16 (bm-896): ModelOpt's IQ2_XXS scored 31 % worse than llama-quantize's.
+NATIVE_TYPES = {"IQ4_XS": "iq4", "IQ4_NL": "iq4", "IQ3_XXS": "iq3", "IQ3_S": "iq3",
+                "IQ2_XXS": "iq2", "IQ2_S": "iq2"}  # type -> omk_qad module
 GPU_TYPES = MODELOPT_TYPES | set(NATIVE_TYPES)  # encoded on the training device (``refresh``); the rest by libggml
 FLOAT_TYPES = {"F32", "F16", "BF16"}
 TERNARY_TYPES = {"PQ2_0", "PTQ1_0"}  # PrismML Bonsai 2 (omk_qad.ternary); the latent lives in the folded basis
@@ -61,24 +63,27 @@ def use_llama_weights(types) -> set[str]:
 
 
 def force_ggml(types) -> set[str]:
-    """Encode ``types`` (ModelOpt types) with libggml -- llama-quantize's own search -- in training and export.
+    """Encode ``types`` (GPU types) with libggml -- llama-quantize's own search, on the CPU -- in training and export.
 
     ModelOpt's IQ1/IQ2 encoders predict the block scale and weight the error by the imatrix alone; llama.cpp
     searches the scale and weights it by ``imatrix * sqrt(sigma2 + x^2)``. On gemma-4-26B the ModelOpt dense
-    ffn_up/ffn_gate cost KL 0.258 -> 0.326 against llama-quantize (bm-892). The sets are mutated in place so
-    every importer (imatrix.importance_for, the refresh split) sees the change. Returns the forced set.
+    ffn_up/ffn_gate cost KL 0.258 -> 0.326 against llama-quantize (bm-892). A native type (omk_qad's own kernels,
+    byte-identical to libggml) can be forced too, as the A/B control. The sets are mutated in place so every
+    importer (imatrix.importance_for, the refresh split) sees the change. Returns the forced set.
     """
     forced = {t.upper() for t in types if t}
-    bad = forced - MODELOPT_TYPES
+    bad = forced - GPU_TYPES
     if bad:
-        raise ValueError(f"--ggml-encode: {sorted(bad)} are not ModelOpt types {sorted(MODELOPT_TYPES)}")
+        raise ValueError(f"--ggml-encode: {sorted(bad)} are not GPU-encoded types {sorted(GPU_TYPES)}")
     MODELOPT_TYPES.difference_update(forced)
+    for t in forced:
+        NATIVE_TYPES.pop(t, None)
     GPU_TYPES.difference_update(forced)
     return forced
 
 
 def _native(qtype: str):
-    """The omk_qad module (iq4 / iq3) that encodes and decodes a native type."""
+    """The omk_qad module (iq4 / iq3 / iq2) that encodes and decodes a native type."""
     import importlib
 
     return importlib.import_module(f".{NATIVE_TYPES[qtype]}", __package__)

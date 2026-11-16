@@ -2079,7 +2079,8 @@ def main(argv=None) -> None:
     ap.add_argument("--export-only", default="embedding", help="classes quantized at export only, not in training")
     ap.add_argument("--ggml-refresh", type=int, default=1, help="re-encode libggml-typed segments every N steps")
     ap.add_argument("--refresh", type=int, default=1,
-                    help="re-encode ModelOpt-typed segments (IQ1/IQ2/Q8_0) every N steps instead of every update")
+                    help="re-encode GPU-typed segments (ModelOpt IQ1/IQ2_XS/Q8_0, native IQ2/IQ3/IQ4) every N steps "
+                         "instead of every update")
     ap.add_argument("--gate", type=float, default=0.01, help="max top-K KL of the unquantized student (lossless gate)")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument("--save-every", type=int, default=100, help="rolling last.pt every N steps")
@@ -2127,13 +2128,18 @@ def main(argv=None) -> None:
 
         print(f"encoders: libggml ({a.llama_cpp}) for {sorted(force_ggml(a.ggml_encode.split(',')))}", flush=True)
     if a.iq2_llama_weights:
-        from .fakequant import MODELOPT_TYPES, use_llama_weights
+        from .fakequant import MODELOPT_TYPES, NATIVE_TYPES, use_llama_weights
 
         if a.imatrix_convention != "msq":
             raise SystemExit("--iq2-llama-weights needs --imatrix-convention msq (llama.cpp's qw is E[x^2] itself)")
-        if "IQ2_XXS" not in MODELOPT_TYPES:
+        if "IQ2_XXS" in NATIVE_TYPES:  # omk_qad.iq2 IS llama.cpp's encoder, weights included (bm-896)
+            print("--iq2-llama-weights: no-op, IQ2_XXS is encoded by omk_qad's own llama.cpp-exact CUDA kernel",
+                  flush=True)
+        elif "IQ2_XXS" not in MODELOPT_TYPES:
             raise SystemExit("--iq2-llama-weights: IQ2_XXS is in --ggml-encode (libggml already weights it so)")
-        print(f"encoders: ModelOpt with llama.cpp weights for {sorted(use_llama_weights(['IQ2_XXS']))}", flush=True)
+        else:
+            print(f"encoders: ModelOpt with llama.cpp weights for {sorted(use_llama_weights(['IQ2_XXS']))}",
+                  flush=True)
     {"cache": phase_cache, "evalset": phase_evalset, "train": phase_train, "export": phase_export}[a.phase](a)
 
 

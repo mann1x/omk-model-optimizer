@@ -64,11 +64,12 @@ STEM_SETS = {"gate_up": ["ffn_gate_up_exps"], "routed": ["ffn_gate_up_exps", "ff
              "down_dense": ["ffn_down_exps", "ffn_gate", "ffn_up", "ffn_down"]}  # on top of a gate_up-rounded --ref
 METHODS = ("rtn", "gptq")
 # Encoded by libggml (ggml_quantize_chunk, the code llama-quantize runs); need --llama-cpp. Every llama.cpp type a
-# published ladder puts on the routed gate_up: the IQ1/IQ2 family, the K-quants Q2_K..Q6_K and the legacy block-32
-# types. IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL keep the project's own kernels (byte-identical to llama-quantize).
-GGML_TYPES = ("IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ4_NL",
+# published ladder puts on the routed gate_up: IQ1_S/IQ1_M/IQ2_XS, the K-quants Q2_K..Q6_K and the legacy block-32
+# types. IQ2_XXS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS keep the project's own CUDA kernels (byte-identical to
+# llama-quantize; IQ2 since bm-896, 2026-11-16 -- before that libggml on the CPU, ~200 s per refresh).
+GGML_TYPES = ("IQ1_S", "IQ1_M", "IQ2_XS", "IQ4_NL",
               "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0")
-KERNEL_TYPES = ("IQ4_XS", "IQ3_XXS", "IQ3_S")  # project kernels (256-wide super-blocks only)
+KERNEL_TYPES = ("IQ4_XS", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_S")  # project kernels (256-wide super-blocks only)
 QTYPES = (*KERNEL_TYPES, *GGML_TYPES)
 AUTO = "auto"  # --qtype auto: each layer takes the type its --ref gate_up tensor carries (a mixed ladder tier)
 _GGML: dict[str, GgmlNative | None] = {"mod": None}
@@ -128,6 +129,8 @@ def native(qtype: str):
         from . import iq4 as m
     elif qtype in ("IQ3_XXS", "IQ3_S"):
         from . import iq3 as m
+    elif qtype in ("IQ2_XXS", "IQ2_S"):
+        from . import iq2 as m
     elif qtype in GGML_TYPES:
         if _GGML["mod"] is None:
             raise ValueError(f"{qtype} is encoded by libggml: pass --llama-cpp <llama.cpp tree with "
