@@ -49,7 +49,9 @@ class GGMLLib:
         self.lib.ggml_quantize_requires_imatrix.argtypes = (ctypes.c_int,)
         self.lib.ggml_get_type_traits.restype = ctypes.POINTER(_TypeTraits)
         self.lib.ggml_get_type_traits.argtypes = (ctypes.c_int,)
-        self.threads = threads or max(1, (os.cpu_count() or 2) // 2)
+        # OMK_GGML_THREADS caps the encoder's CPU threads when the host also runs a trainer whose libggml refresh
+        # must not be starved (bs2, 2026-11-16: 32 cores, two 16-thread encoders halved the QAD's step rate)
+        self.threads = threads or int(os.environ.get("OMK_GGML_THREADS", "0")) or max(1, (os.cpu_count() or 2) // 2)
         self.path = path
 
     @cache  # one binding per process; the cache only holds small decoder handles
