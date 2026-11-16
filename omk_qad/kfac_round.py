@@ -145,13 +145,18 @@ def rtn_expert(w0: torch.Tensor, imp: torch.Tensor, qtype: str) -> tuple[torch.T
     return p, q, w0
 
 
-def gptq_expert(w0: torch.Tensor, a: torch.Tensor, imp: torch.Tensor, qtype: str, damp: float):
+def gptq_expert(w0: torch.Tensor, a: torch.Tensor, imp: torch.Tensor, qtype: str, damp: float, latent_dtype=None):
     """GPTQ with the encoder's 256-column block as the group: payload, Q, and the error-fed latent W_adj.
 
     ``a`` is the per-token input second moment E[x xᵀ] [C, C] (the GPTQ Hessian up to a factor). Columns the data
     never excites (zero diagonal) get a unit diagonal and keep their weights. The latent returned is the weight each
     block was quantised from (W0 plus the folded errors of the earlier blocks): encoding it block by block gives
     exactly this payload, so it is the start point of the STE refinement.
+
+    ``latent_dtype`` (e.g. torch.float16): every block is rounded to that storage type BEFORE it is encoded, and
+    the fed-back error is taken against the rounded block, so the returned latent is exactly representable in that
+    dtype and a trainer storing it so (omk_qad.train --latent-dtype fp16 --init-latents) re-encodes to this very
+    payload. Without it the fp16 copy of an fp32-encoded W_adj flips ~0.3 % of the IQ2_XXS bytes (bm-892).
     """
     rows, cols = w0.shape
     u, floored = inverse_cholesky(a, damp)
@@ -160,11 +165,12 @@ def gptq_expert(w0: torch.Tensor, a: torch.Tensor, imp: torch.Tensor, qtype: str
     pay = []
     for s0 in range(0, cols, BLOCK):
         s1 = s0 + BLOCK
-        adj[:, s0:s1] = w[:, s0:s1]
-        p, q = encode_decode(qtype, w[:, s0:s1], imp[s0:s1])
+        blk = w[:, s0:s1] if latent_dtype is None else w[:, s0:s1].to(latent_dtype).float()
+        adj[:, s0:s1] = blk
+        p, q = encode_decode(qtype, blk, imp[s0:s1])
         pay.append(p)
         if s1 < cols:
-            err = torch.linalg.solve_triangular(u[s0:s1, s0:s1], w[:, s0:s1] - q, upper=True, left=False)
+            err = torch.linalg.solve_triangular(u[s0:s1, s0:s1], blk - q, upper=True, left=False)
             w[:, s1:].addmm_(err, u[s0:s1, s1:], alpha=-1.0)
         w[:, s0:s1] = q
     return torch.cat(pay, 1), w, adj, floored
@@ -321,6 +327,7 @@ def main(argv=None) -> None:
         refp = ref_payload(ref, j, a.qtype) if ref is not None else None
         per_exp = refp.size // w0_all.shape[0] if refp is not None else 0
         lat_out = [] if a.save_latents else None
+        latent_dtype = torch.float16 if a.save_latents else None  # a saved seed must re-encode to this very payload
         for e in range(n_exp):
             w0 = w0_all[e].to(device)
             a_e, g_e = fac["gu_A"][e], fac["gu_G"][e]
@@ -333,7 +340,7 @@ def main(argv=None) -> None:
                 mine = p_rtn.reshape(-1).cpu().numpy()
                 match += int(np.array_equal(mine, refp[e * per_exp:(e + 1) * per_exp]))
             if a.method == "gptq":
-                p_m, q_m, latent, fl = gptq_expert(w0, a_e, imp, a.qtype, a.damp)
+                p_m, q_m, latent, fl = gptq_expert(w0, a_e, imp, a.qtype, a.damp, latent_dtype)
                 floored += fl
             else:
                 p_m, q_m, latent = p_rtn, q_rtn, w0

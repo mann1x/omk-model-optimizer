@@ -60,3 +60,26 @@ def test_iq2_gptq_runs_at_block_granularity():
         assert l_gptq <= l_rtn * 1.02, (l_gptq, l_rtn)
     finally:
         kfac_round._GGML["mod"] = None
+
+
+@needs_lib
+def test_iq2_gptq_fp16_latent_reencodes_to_its_own_payload():
+    """With latent_dtype=fp16 the returned W_adj is fp16-exact and its block-wise re-encode IS the payload (bm-892)."""
+    kfac_round._GGML["mod"] = kfac_round.GgmlNative(LLAMA)
+    try:
+        g = torch.Generator().manual_seed(2)
+        w0 = torch.randn(16, 512, generator=g) * 0.05
+        mix = torch.eye(512) + 0.3 * torch.randn(512, 512, generator=g) / 512 ** 0.5
+        xs = torch.randn(4096, 512, generator=g) @ mix
+        a = xs.T @ xs / 4096
+        imp = a.diagonal().clone()
+        p, _, latent, _ = kfac_round.gptq_expert(w0, a, imp, "IQ2_XXS", 0.01, torch.float16)
+        assert torch.equal(latent, latent.half().float()), "latent is not fp16-exact"
+        stored = latent.half().float()  # what the trainer holds after --init-latents
+        again = torch.cat([kfac_round.encode_decode("IQ2_XXS", stored[:, s:s + 256], imp[s:s + 256])[0]
+                           for s in range(0, 512, 256)], 1)
+        assert torch.equal(again, p), "re-encoding the stored fp16 seed does not give the saved payload"
+        p32, _, lat32, _ = kfac_round.gptq_expert(w0, a, imp, "IQ2_XXS", 0.01)
+        assert not torch.equal(lat32, lat32.half().float())  # the fp32 path is what the old files were encoded from
+    finally:
+        kfac_round._GGML["mod"] = None
