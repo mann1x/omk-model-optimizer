@@ -338,8 +338,13 @@ def hub_readme(api: HfApi, repo: str) -> str:
         return ""
 
 
+def _stable(txt: str) -> str:
+    """The card without its render timestamp line (else every cycle would be a new README commit)."""
+    return "\n".join(line for line in txt.strip().splitlines() if "Card table rendered" not in line)
+
+
 def push_card(api: HfApi, repo: str, txt: str, label: str, msg: str) -> None:
-    if not txt or txt.strip() == hub_readme(api, repo).strip():
+    if not txt or _stable(txt) == _stable(hub_readme(api, repo)):
         return
     out = CARDS / f".{label}.rendered.md"
     out.write_text(txt)
