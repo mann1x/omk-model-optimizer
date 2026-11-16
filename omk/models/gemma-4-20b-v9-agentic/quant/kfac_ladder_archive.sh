@@ -19,18 +19,21 @@ end=$(( $(date +%s) + HOURS * 3600 ))
 while [ $(date +%s) -lt $end ]; do
   for spec in "26b_agentic $RUNS/g4_agentic_kfac" "20b_v9agentic_sft12 $RUNS/g4_20b_kfac"; do
     set -- $spec; M=$1; K=$2
-    for T in $($BS2 "cd $K/ladder 2>/dev/null && for d in */; do d=\${d%/}; [ -s \$d/kfac.gguf ] && [ -s \$d/kfac.eval.json ] && [ ! -e \$d/.archived_solidpc ] && echo \$d; done" 2>/dev/null); do
+    # a tier qualifies as a K-FAC rounding (kfac.gguf + kfac.eval.json) or as a seeded QAD (qad.gguf + qad.done); the
+    # method's gguf is archived (qad.gguf is a symlink to the run's export: -L dereferences it)
+    for TM in $($BS2 "cd $K/ladder 2>/dev/null && for d in */; do d=\${d%/}; [ -e \$d/.archived_solidpc ] && continue; if [ -s \$d/kfac.gguf ] && [ -s \$d/kfac.eval.json ]; then echo \$d:kfac; elif [ -s \$d/qad.gguf ] && [ -e \$d/qad.done ]; then echo \$d:qad; fi; done" 2>/dev/null); do
+      T=${TM%:*}; G=${TM#*:}.gguf
       D=$K/ladder/$T; A=$ARCH/$M/$T; mkdir -p $A
-      want=$($BS2 "cd $D && { [ -s kfac.gguf.sha256 ] || sha256sum kfac.gguf > kfac.gguf.sha256; }; cut -d' ' -f1 kfac.gguf.sha256")
+      want=$($BS2 "cd $D && { [ -s $G.sha256 ] || sha256sum $G > $G.sha256; }; cut -d' ' -f1 $G.sha256")
       [ ${#want} = 64 ] || { say "KA_FAIL $M $T: no sha from bs2 ('$want')"; continue; }
       t0=$(date +%s)
-      rsync -a --partial --inplace --include='kfac.gguf' --include='*.sha256' --include='*.json' --include='*.log' --exclude='*' \
+      rsync -aL --partial --inplace --include="$G" --include='*.sha256' --include='*.json' --include='*.log' --include='qad.done' --exclude='*' \
             bs2:$D/ $A/ >> $LOG 2>&1 || { say "KA_FAIL $M $T: rsync"; continue; }
-      got=$(sha256sum $A/kfac.gguf | cut -d' ' -f1)
+      got=$(sha256sum $A/$G | cut -d' ' -f1)
       [ "$got" = "$want" ] || { say "KA_FAIL $M $T: sha $got != bs2 $want (partial copy kept for resume)"; continue; }
-      sz=$(stat -c %s $A/kfac.gguf)
+      sz=$(stat -c %s $A/$G)
       $BS2 "touch $D/.archived_solidpc"
-      say "KA_TIER $M $T archived $((sz / 1048576)) MiB in $(( $(date +%s) - t0 )) s, sha ${want:0:12} OK -> $A"
+      say "KA_TIER $M $T ($G) archived $((sz / 1048576)) MiB in $(( $(date +%s) - t0 )) s, sha ${want:0:12} OK -> $A"
     done
     # owner-granted reclaim (2026-11-16 22:29 CET "bs2 archive-copy deletion granted") of bs2 copies that are archived
     # (sha-verified above) AND published to HF AND pushed to ollama (the bs2 pusher needs the file: .published_ollama)

@@ -29,6 +29,8 @@ DL=/srv/ml/tmp_sdc_relief/ollama_dl; mkdir -p $DL
 AUX=$RUNS/ollama_aux; mkdir -p $AUX
 HOURS=${HOURS:-48}
 TOKEN=$(cat /root/.cache/huggingface/token 2>/dev/null); [ -n "$TOKEN" ] || { echo "no HF token"; exit 1; }
+# the token never goes on a command line (ps shows argv to every user): curl reads it from a 0600 config file
+CURLRC=$AUX/.curlrc; ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > $CURLRC ); unset TOKEN
 say() { echo "[ko $(date -u +%FT%TZ)] $*" | tee -a $LOG; }
 MSG='
 I have used my thinking budget. I must stop analysing now and act on what I have: make the tool call, or give a short final answer if no call is needed.
@@ -44,13 +46,12 @@ cfg() {
   esac
 }
 hub_get() {  # <repo> <file> <out>  resumable single-stream download with the token (private repos too)
-  curl -4 -sS -L -C - --retry 5 --retry-delay 20 -H "Authorization: Bearer $TOKEN" \
-    "https://huggingface.co/$1/resolve/main/$2" -o "$3"
+  curl -4 -sS -L -C - --retry 5 --retry-delay 20 -K $CURLRC "https://huggingface.co/$1/resolve/main/$2" -o "$3"
 }
-hub_sha() {  # <repo> <file> -> lfs sha256 via the API
-  curl -4 -sS -H "Authorization: Bearer $TOKEN" "https://huggingface.co/api/models/$1/paths-info/main" \
+hub_sha() {  # <repo> <file> -> lfs sha256 via the API (paths-info names it lfs.oid)
+  curl -4 -sS -K $CURLRC "https://huggingface.co/api/models/$1/paths-info/main" \
     -X POST -H "Content-Type: application/json" -d "{\"paths\":[\"$2\"],\"expand\":true}" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d[0].get("lfs") or {}).get("sha256",""))' 2>/dev/null
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); l=d[0].get("lfs") or {}; print(l.get("oid") or l.get("sha256") or "")' 2>/dev/null
 }
 ensure_aux() {  # the mmproj of this model, once, sha-verified
   local out=$AUX/$MM
