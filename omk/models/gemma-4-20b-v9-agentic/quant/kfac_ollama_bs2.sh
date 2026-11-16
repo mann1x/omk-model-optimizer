@@ -6,7 +6,7 @@
 #   20b: ManniX-ITA/gemma-4-20B-v9-agentic-GGUF  -> mannix/gemma-4-20B-v9-agentic   (PRIVATE repo on ollama.com)
 #   26b: ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF -> mannix/gemma4-26b-agentic
 # Recipe = the public 26B tags read back from registry.ollama.ai (2026-11-16): config renderer gemma4 / parser gemma4;
-# params {min_p 0, presence_penalty 0.025, repeat_penalty 1, temperature 0.8, top_k 64, top_p 0.95}; mtp- variants add
+# params {min_p 0, presence_penalty 0.025 (26B) / 0.035 (20B, owner 2026-11-16 23:47), repeat_penalty 1, temperature 0.8, top_k 64, top_p 0.95}; mtp- variants add
 # DRAFT gemma-4-26B-A4B-it-assistant Q8_0, draft_num_predict 2, think_budget high + the stop phrase; vision- variants
 # add the model's own mmproj (downloaded once from its HF repo). Preflight (feedback_ollama_publish_preflight): RENDERER
 # and PARSER declared -> no jinja-mined stop; host xollama 0.40.13 knows gemma4; the store is the service's XOLLAMA_MODELS.
@@ -40,9 +40,9 @@ I'"'"'ll be more terse and concise now and maybe I need to consider a different 
 cfg() {
   case $1 in
     20b) HF=ManniX-ITA/gemma-4-20B-v9-agentic-GGUF; PFX=gemma-4-20B-v9-agentic; OL=mannix/gemma-4-20B-v9-agentic
-         LAD=$RUNS/g4_20b_kfac/ladder; MM=mmproj-gemma-4-20B-v9-agentic-F16.gguf; PUBLIC=0 ;;
+         LAD=$RUNS/g4_20b_kfac/ladder; MM=mmproj-gemma-4-20B-v9-agentic-F16.gguf; PUBLIC=0; PRES=0.035 ;;  # owner 2026-11-16 23:47: 0.025 -> 0.035
     26b) HF=ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF; PFX=gemma-4-26B-A4B-agentic; OL=mannix/gemma4-26b-agentic
-         LAD=$RUNS/g4_agentic_kfac/ladder; MM=mmproj-gemma-4-26B-A4B-agentic-BF16.gguf; PUBLIC=1 ;;
+         LAD=$RUNS/g4_agentic_kfac/ladder; MM=mmproj-gemma-4-26B-A4B-agentic-BF16.gguf; PUBLIC=1; PRES=0.025 ;;
   esac
 }
 hub_get() {  # <repo> <file> <out>  resumable single-stream download with the token (private repos too)
@@ -68,7 +68,7 @@ modelfile() {  # <variant> <gguf> -> stdout
   echo "FROM $g"
   case $v in *mtp*) echo "DRAFT $DRAFT";; esac
   case $v in *vision*) echo "FROM $AUX/$MM";; esac
-  printf 'RENDERER gemma4\nPARSER gemma4\nPARAMETER temperature 0.8\nPARAMETER top_k 64\nPARAMETER top_p 0.95\nPARAMETER min_p 0\nPARAMETER presence_penalty 0.025\nPARAMETER repeat_penalty 1\n'
+  printf 'RENDERER gemma4\nPARSER gemma4\nPARAMETER temperature 0.8\nPARAMETER top_k 64\nPARAMETER top_p 0.95\nPARAMETER min_p 0\nPARAMETER presence_penalty %s\nPARAMETER repeat_penalty 1\n' "$PRES"
   case $v in *mtp*) printf 'PARAMETER draft_num_predict 2\nPARAMETER think_budget high\nPARAMETER think_budget_message "%s"\n' "$MSG";; esac
 }
 push_tag() {  # <tag> <modelfile> -> 0 on verified push

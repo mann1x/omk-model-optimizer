@@ -178,7 +178,7 @@ temperature      0.8
 top_k            64
 top_p            0.95
 min_p            0
-presence_penalty 0.025
+presence_penalty 0.035   (0.025 until 2026-11-16; raised after testing)
 repeat_penalty   1.0   (none)
 ```
 
@@ -192,7 +192,7 @@ llama-server -m gemma-4-20B-v9-agentic-Q4_K_M.gguf -c 32768 -ngl 99 --jinja -fa 
     --chat-template-kwargs '{"enable_thinking": true}' \
     --reasoning-budget 8192 \
     --reasoning-budget-message $'\n\nI have used my thinking budget. I must stop analysing now and act on what I have: make the tool call, or give a short final answer if no call is needed.\nI\'ll be more terse and concise now and maybe I need to consider a different approach.\n' \
-    --temp 0.8 --top-k 64 --top-p 0.95 --min-p 0 --presence-penalty 0.025
+    --temp 0.8 --top-k 64 --top-p 0.95 --min-p 0 --presence-penalty 0.035
 ```
 
 ## Reasoning budget and thinking stop phrase (llama.cpp)

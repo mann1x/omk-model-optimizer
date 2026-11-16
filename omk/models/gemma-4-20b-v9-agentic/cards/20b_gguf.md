@@ -135,12 +135,12 @@ llama-server -m gemma-4-20B-v9-agentic-Q4_K_M.gguf -c 32768 -ngl 99 --jinja -fa 
     --chat-template-kwargs '{"enable_thinking": true}' \
     --reasoning-budget 8192 \
     --reasoning-budget-message $'\n\nI have used my thinking budget. I must stop analysing now and act on what I have: make the tool call, or give a short final answer if no call is needed.\nI\'ll be more terse and concise now and maybe I need to consider a different approach.\n' \
-    --temp 0.8 --top-k 64 --top-p 0.95 --min-p 0 --presence-penalty 0.025
+    --temp 0.8 --top-k 64 --top-p 0.95 --min-p 0 --presence-penalty 0.035
 ```
 
 - **`--jinja` is required**: it uses the embedded official template and gives the reasoning budget its delimiters.
 - **Sampler** (the one the sft12 model is tested and deployed with, the same as the 26B agentic): temperature 0.8,
-  top_k 64, top_p 0.95, **min_p 0** (llama.cpp defaults to 0.05), presence_penalty 0.025, **no repetition penalty**.
+  top_k 64, top_p 0.95, **min_p 0** (llama.cpp defaults to 0.05), presence_penalty 0.035 (raised from 0.025 on 2026-11-16 after testing; the Ollama tags carry it), **no repetition penalty**.
   The previous build needed `repeat_penalty 1.06`; this one does not — the SFT, not the sampler, keeps it from
   looping.
 - **`--reasoning-budget`** bounds the thinking block (keep `-c` several times larger); the stop phrase tells the model
