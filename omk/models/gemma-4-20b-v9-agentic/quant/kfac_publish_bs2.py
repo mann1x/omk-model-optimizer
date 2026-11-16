@@ -204,12 +204,22 @@ def publish_tier(api: HfApi, which: str, cfg: dict, d: Path, method: str = "kfac
     upload(api, cfg["repo"], side, f"{name}.sha256", f"{tier}: sha256 sidecar")
     (d / ".published_hf").write_text(f"{s}  {cfg['repo']}/{name}  {method}\n")
     say("KP_TIER", which, tier, method, "->", f"{cfg['repo']}/{name}", f"{g.stat().st_size / 2**30:.2f} GiB sha {s[:12]};", twin(d, method))
-    if method == "kfac" and (d / ".archived_solidpc").exists():
-        real = g.resolve()
-        say("KP_RM", which, tier, f"bs2 copy removed ({real}); verified copies: hub + solidpc")
-        real.unlink(missing_ok=True)
-        if g.is_symlink():
-            g.unlink(missing_ok=True)
+    reclaim(which, d, method)
+
+
+def reclaim(which: str, d: Path, method: str = "kfac") -> None:
+    """Remove the bs2 copy of a K-FAC tier once three things hold: hub sha verified (.published_hf), solidpc archive
+    verified (.archived_solidpc) and the Ollama tags pushed from it (.published_ollama: the pusher needs the file)."""
+    g = d / f"{method}.gguf"
+    if method != "kfac" or not g.exists():
+        return
+    if not ((d / ".published_hf").exists() and (d / ".archived_solidpc").exists() and (d / ".published_ollama").exists()):
+        return
+    real = g.resolve()
+    say("KP_RM", which, d.name, f"bs2 copy removed ({real}); verified copies: hub + solidpc, ollama tags pushed")
+    real.unlink(missing_ok=True)
+    if g.is_symlink():
+        g.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- cards
@@ -384,6 +394,7 @@ def main() -> None:
                     publish_once(api, which, cfg, src, name, "extra", f"{name}: this build's unquantised GGUF (llama.cpp b12386)")
                 for d in sorted(p for p in cfg["ladder"].iterdir() if p.is_dir()):
                     if (d / ".published_hf").exists():
+                        reclaim(which, d)  # the ollama pusher may have finished since
                         continue
                     method = method_of(d)
                     if method is None or (d.name in SKIP_TIERS and method != "qad"):

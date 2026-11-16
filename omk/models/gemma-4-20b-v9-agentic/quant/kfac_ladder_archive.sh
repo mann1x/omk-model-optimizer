@@ -32,9 +32,10 @@ while [ $(date +%s) -lt $end ]; do
       $BS2 "touch $D/.archived_solidpc"
       say "KA_TIER $M $T archived $((sz / 1048576)) MiB in $(( $(date +%s) - t0 )) s, sha ${want:0:12} OK -> $A"
     done
-    # owner-granted reclaim of bs2 copies that are archived (sha-verified above)
+    # owner-granted reclaim (2026-11-16 22:29 CET "bs2 archive-copy deletion granted") of bs2 copies that are archived
+    # (sha-verified above) AND published to HF AND pushed to ollama (the bs2 pusher needs the file: .published_ollama)
     if $BS2 "test -e $K/ladder/.rm_kfac_archived_granted"; then
-      for T in $($BS2 "cd $K/ladder && for d in */; do d=\${d%/}; [ -e \$d/.archived_solidpc ] && [ -s \$d/kfac.gguf ] && echo \$d; done" 2>/dev/null); do
+      for T in $($BS2 "cd $K/ladder && for d in */; do d=\${d%/}; [ -e \$d/.archived_solidpc ] && [ -e \$d/.published_hf ] && [ -e \$d/.published_ollama ] && [ -s \$d/kfac.gguf ] && echo \$d; done" 2>/dev/null); do
         [ "$(sha256sum $ARCH/$M/$T/kfac.gguf 2>/dev/null | cut -d' ' -f1)" = "$(cut -d' ' -f1 $ARCH/$M/$T/kfac.gguf.sha256)" ] \
           || { say "KA_FAIL $M $T: archive copy does not verify, NOT removing bs2 copy"; continue; }
         say "KA_RM $M $T: $($BS2 "rm -v $K/ladder/$T/kfac.gguf" 2>&1 | tr '\n' ' ') (archived copy verified)"
