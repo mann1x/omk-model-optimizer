@@ -2,7 +2,7 @@
 
 **Published:** [ManniX-ITA/gemma-4-26B-A4B-agentic](https://huggingface.co/ManniX-ITA/gemma-4-26B-A4B-agentic)
 (BF16 safetensors) · [ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF](https://huggingface.co/ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF)
-(F16, Q8_0, Q6_K, Q4_K_M + imatrix) · corpus
+(F16 + the [K-FAC ladder](#gguf-k-fac-ladder-2026-11), IQ2_XXS from the seeded QAD, imatrix) · corpus
 [ManniX-ITA/gemma-4-26B-A4B-agentic-sft](https://huggingface.co/datasets/ManniX-ITA/gemma-4-26B-A4B-agentic-sft) ·
 [ManniX-ITA/hermes-agent-kimi-traces-gemma4-31b](https://huggingface.co/datasets/ManniX-ITA/hermes-agent-kimi-traces-gemma4-31b).
 
@@ -223,7 +223,70 @@ cache's `cache.json`, so a metadata-only cache works; `eval.pt` and `--eval-set 
   (`calib_train.txt`, sha256 `33fef70c…`, 3,043 documents, 4.91 M tokens), all 9,590 chunks, `--parse-special`;
   published in the GGUF repo under `calibration/` next to `imatrix.dat` (sha256 `609a0a04…`).
 - `llama-quantize --imatrix imatrix.dat` for Q4_K_M, Q6_K, Q8_0 (Q8_0 carries the imatrix KV tags but ggml's Q8_0
-  quantizer does not use importance weights).
+  quantizer does not use importance weights). **These three files were replaced on 2026-11-16 by the K-FAC ladder
+  below** (same names); `imatrix.dat` and `calibration/` stay as the record of that first publish.
+
+## GGUF: K-FAC ladder (2026-11)
+
+Method: [`docs/kfac-rounding.md`](../../docs/kfac-rounding.md). Every tier is `llama-quantize` (b12386) with the
+QAD cache's imatrix and the Gemma-4 attention rule (attention Q8_0 from Q4_K_M up, Q6_K below), re-rounded with
+`omk_qad.kfac_round --stems all --qtype auto`; published as `gemma-4-26B-A4B-agentic-<TIER>.gguf` with the twin
+numbers in the commit message and in the card's table. Scripts as run: [`kfac/`](kfac/).
+
+- **cache** — the bm-892 r16k QAD cache ([`qad_iq2/recipe_iq2_r16k.yaml`](qad_iq2/recipe_iq2_r16k.yaml)): the 11 sft11
+  role families, 4,217 windows × 16,384 tokens, top-64, assistant positions only; its imatrix (`cache/imatrix.gguf`,
+  the first 256 windows, per expert, sha256 `80e56b9b…`, published as `imatrix.gguf`) is the one every K-FAC tier,
+  the arm-E reference, the seed and the QAD export share. Eval reference: `cache/eval.pt`, 44 rows, 614,086 scored
+  positions, the bf16 teacher's own top-64.
+- **factors** — [`kfac/kfac_collect_r.sh 0 g10`](kfac/kfac_collect_r.sh): `omk_qad.kfac --windows 512 --seq 2048
+  --seed 1 --layers-per-pass 3 --down-g diag --dense --drop-grow 10` → `factors_w512_s2048_g10`, 77 GB.
+- **tiers** — `kfac_ladder_twins.sh 26b <TIER> all` ([copy](../gemma-4-20b-v9-agentic/quant/kfac_ladder_twins.sh);
+  base = `gemma-4-26B-A4B-it-bm889-sft11-sfinal-BF16-eos106.gguf`, the BF16 GGUF the factors were collected on), lanes,
+  archive and publisher as for the 20B ([`../gemma-4-20b-v9-agentic/quant/`](../gemma-4-20b-v9-agentic/quant/)).
+  Ladder: Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q4_K_S, IQ4_XS, IQ4_NL, Q3_K_M, IQ3_M, IQ3_XS, IQ3_XXS, IQ2_M, IQ2_S,
+  IQ2_XS + IQ2_XXS from the QAD.
+
+| tier | size | llama-quantize + imatrix | K-FAC | ΔKL |
+|---|---:|---:|---:|---:|
+| Q4_K_M (attention Q8_0) | 17.33 GB | 0.00798 / 0.9796 | **0.00660 / 0.9815** | −17.3 % |
+| IQ4_XS (attention Q6_K) | 14.24 GB | 0.01530 / 0.9715 | **0.01157 / 0.9751** | −24.4 % |
+
+(44 rows, top-256 KL / top-1 vs the bf16 teacher; the complete table is regenerated on the GGUF card as tiers land.)
+
+### IQ2_XXS: QAD seeded from the K-FAC rounding
+
+The 2-bit tier is not a rounding but a trained student ([`docs/qad.md`](../../docs/qad.md)) that starts from the K-FAC
+rounding of the same layout. [`kfac/step1_layouts.sh`](kfac/step1_layouts.sh) built the arm ladder A–E of
+`llama-quantize` references on the cache imatrix (`--token-embedding-type q5_K`, preset IQ2_M, per-arm tensor types);
+**arm E** = routed gate_up IQ2_XXS, routed down IQ4_NL, dense gate/up Q4_K, dense down IQ4_NL, attention Q8_0
+(9.54 GiB): klk 0.0675 / top1 0.9392. Then:
+
+1. gate_up rounding `kfac_round --qtype IQ2_XXS --method gptq --ref E.gguf --save-latents round/E_latents` (2,650 s,
+   latents 29 GB): 0.05757 / 0.9469 (−14.7 %); [`kfac/kfac_down_dense_chain.sh`](kfac/kfac_down_dense_chain.sh) added
+   the down experts + dense MLP (`--stems down_dense`, 66 min CPU): 0.05586 / 0.9480 (−17.2 %, the all-MLP K-FAC arm).
+2. [`kfac/qad_seeded_E_chain.sh`](kfac/qad_seeded_E_chain.sh): seed gate (untrained export with `--init-latents` at
+   layout E: `SEED_LATENTS … 30 gate_up`, attention bytes identical to the rounding, routed IQ2_XXS within the fp16
+   margin, |Δklk| ≤ 0.0005 → `QSE_GATE_PASS`), then **training at layout E6** (= E with attention **Q6_K**, the
+   shipping attention type below Q4_K_M; seed score 0.05915 / 0.9460): `--seq 4096 --n-seq 16000 --bs 1 --accum 1
+   --steps 600 --lr 2e-6 --fp-lr 2e-6 --min-lr 1e-7 --warmup 50 --beta1 0 --beta2 0.999 --clip 1.0 --loss kl
+   --anchor-as-teacher --mtp train --mtp-weight 0.3 --refresh 4 --ggml-refresh 4 --ggml-encode Q8_0 --latent-dtype fp16
+   --export-only embedding --imatrix cache/imatrix.pt --imatrix-convention msq --topk 64`, GPU1 (~39 s/step; the
+   plateau rule was switched off by the owner and the run resumed from step 301 to 600:
+   [`kfac/qad_seeded_E_chain_resume600.sh`](kfac/qad_seeded_E_chain_resume600.sh)). W&B `omk-qad-26b-agentic-iq2-qad`.
+3. export `qadE6_kfacseed_s600.gguf` → published as `gemma-4-26B-A4B-agentic-IQ2_XXS.gguf`.
+
+| | klk | top1 |
+|---|---:|---:|
+| arm E, llama-quantize + imatrix (RTN) | 0.0675 | 0.9392 |
+| arm E, K-FAC all-MLP rounding | 0.0559 | 0.9480 |
+| seeded QAD, E6 seed (attention Q6_K) | 0.0592 | 0.9460 |
+| seeded QAD step 300 | 0.0493 | — |
+| seeded QAD step 400 | 0.0487 | 0.9492 |
+| seeded QAD step 500 | 0.0483 | 0.9494 |
+
+Earlier unseeded students of this cache (`qad_iq2/`: the iq2 student at 4,217 steps, qadC_kl7, qadB_mo6) are the
+baselines the seeded run replaced; the eleven2go A/B tags `kfac-iq2xxs-e` / `mtp-vision-IQ2-kfac-e` are the all-MLP
+K-FAC arm E as a file.
 
 ## Known gaps
 
@@ -235,4 +298,7 @@ cache's `cache.json`, so a metadata-only cache works; `eval.pt` and `--eval-set 
 - Older work on this model (sft4, sft5) is in [`sft4/`](sft4/) and [`sft5/`](sft5/); the unpublished sft7–sft10
   experiments in [`sft7_sft10/`](sft7_sft10/).
 - [`v9a_sft11_mlk8_98e/`](v9a_sft11_mlk8_98e/): the sft11 recipe rerun on the 98-expert v9-agentic ml_k8 prune of
-  this model (2026-11-14, in progress).
+  this model (2026-11-14, stopped at step 748). The prune that shipped is sft12:
+  [`../gemma-4-20b-v9-agentic/`](../gemma-4-20b-v9-agentic/README.md).
+- The 26B K-FAC twins and the seeded QAD score on the QAD cache's eval rows (teacher = the bf16 model in torch); the
+  20B's score on its own F16 GGUF's top-64. The two `klk` scales are therefore not directly comparable across models.

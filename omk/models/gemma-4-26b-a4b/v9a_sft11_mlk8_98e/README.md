@@ -1,4 +1,12 @@
-# sft11 recipe on the 98-expert v9-agentic ml_k8 prune (bm-893, 2026-11-14, in progress)
+# sft11 recipe on the 98-expert v9-agentic ml_k8 prune (bm-893, 2026-11-14 — stopped at step 748, superseded by sft12)
+
+> **Outcome.** Stopped at step 748 of 2,108 (owner, 2026-11-14 20:55 CET): the code families regressed from step 200
+> (opencode 0.222 → 0.246, kimi31b 0.377 → 0.414, swe 0.294 → 0.313) while the long chat families the prune cannot
+> recover (ifchat, multilingual, science: ~65 % of the loss) drove the training. The step-600 export was A/B-tested on
+> eleven2go as `mtp-sft11-mlk8-sft600-Q4_K_M`. The model that shipped is **sft12**, trained from the same `mlk8-noa`
+> prune on a short, convergent agentic selection with attention frozen:
+> [`../../gemma-4-20b-v9-agentic/`](../../gemma-4-20b-v9-agentic/README.md). The prune itself (ml_k8 map, no shared
+> upweight) is described below and unchanged.
 
 The sft11 agentic model ([ManniX-ITA/gemma-4-26B-A4B-agentic](https://huggingface.co/ManniX-ITA/gemma-4-26B-A4B-agentic))
 pruned to 98 experts per layer with the published v9-agentic map, then trained again with the sft11 recipe, to recover

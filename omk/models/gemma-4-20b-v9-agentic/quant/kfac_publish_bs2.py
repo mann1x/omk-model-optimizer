@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""kfac_publish_bs2.py -- RUNS ON bs2 (omnimergekit env). Publish every finished, scored K-FAC ladder tier to its HF repo
+and keep the three model cards current.
+
+Owner 2026-11-16 21:25 CET: "publish on HF, why can't you do it now from bs2?" -- republish (20B v9-agentic sft12) and
+re-publish/expand (26B agentic) with the K-FAC files; IQ2_XXS comes from the QAD exports later.
+Owner 2026-11-16 21:45 CET: "update the HF repo for the weights with the new recipe used ... update the GGUF with the
+details about the quantizations with KFAC ... Document properly everything, nothing must be missed." -> v2: the cards.
+
+Every 5 min, for both ladders, a tier dir qualifies when: kfac.gguf exists (file or symlink to the root-fs relief copy),
+kfac.log holds KFACR_DONE (bug-949: a killed rounder leaves a copy of the PTQ), kfac.eval.json + ptq.eval.json are
+scored, no .published_hf marker.  Then:
+  1. sha256 (kfac.gguf.sha256 sidecar, computed when missing)
+  2. upload as <repo name minus -GGUF>-<TIER>.gguf (overwrites the same name: that IS the re-publish), commit message
+     carries the twin numbers; retries with backoff
+  3. verify: hub LFS sha256 == local (get_paths_info expand), else KP_FAIL and the marker is NOT written
+  4. upload the <name>.gguf.sha256 sidecar; once per repo the imatrix the ladder used (+ .sha256) and the repo's
+     EXTRA files (20B: the sft12 F16 GGUF, replacing the 2026-10 build's F16)
+  5. write .published_hf (hub sha); remove the bs2 copy ONLY if .archived_solidpc exists too (two verified copies:
+     hub + solidpc), resolving a relief symlink to its target.
+Cards (v2): after every cycle the manifest <ladder>/published.json is rebuilt (hub size + sha per published tier, twin
+numbers from the eval jsons, bits/weight from the base GGUF's element count) and rendered into the card template
+<CARDS>/<which>_gguf.md at the markers <!-- OMK:TIERS -->, <!-- OMK:STALE --> (hub files that are not ours: the
+previous build's tiers) and <!-- OMK:BENCH --> (<CARDS>/20b_bench.json when present); the README is uploaded only
+when it differs from the hub's. <CARDS>/20b_weights.md goes to the weights repo the same way (static).
+Sentinels KP_START / KP_TIER / KP_IMATRIX / KP_EXTRA / KP_CARD / KP_RM / KP_FAIL / KP_DONE.
+"""
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+from huggingface_hub import HfApi, hf_hub_download
+
+RUNS = Path("/mnt/sdc/omk-model-optimizer/runs")
+CARDS = RUNS / "cards"
+LADDERS = {
+    "20b": dict(repo="ManniX-ITA/gemma-4-20B-v9-agentic-GGUF", prefix="gemma-4-20B-v9-agentic",
+                ladder=RUNS / "g4_20b_kfac/ladder",
+                imatrix=Path("/mnt/sdc/ml/v9a_sft11/mlk8-noa-sft12/gguf/imatrix_ac.dat"), imatrix_name="imatrix.dat",
+                base=Path("/srv/ml/scratch/sft12_ac_imatrix/gemma-4-20B-v9-agentic-sft11-mlk8-noa-sft12-F16.gguf"),
+                extra={"gemma-4-20B-v9-agentic-F16.gguf":
+                       Path("/srv/ml/scratch/sft12_ac_imatrix/gemma-4-20B-v9-agentic-sft11-mlk8-noa-sft12-F16.gguf")},
+                keep={"imatrix.dat", "imatrix.dat.sha256", "README.md", ".gitattributes",
+                      "mmproj-gemma-4-20B-v9-agentic-F16.gguf", "gemma-4-20B-v9-agentic-F16.gguf",
+                      "gemma-4-20B-v9-agentic-F16.gguf.sha256"},
+                attn_from="Q4_K_M", weights_repo="ManniX-ITA/gemma-4-20B-v9-agentic", weights_card="20b_weights.md"),
+    "26b": dict(repo="ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF", prefix="gemma-4-26B-A4B-agentic",
+                ladder=RUNS / "g4_agentic_kfac/ladder",
+                imatrix=RUNS / "g4_agentic_iq2_r16k/cache/imatrix.gguf", imatrix_name="imatrix.gguf",
+                base=Path("/mnt/sdc/bm889-exports/gemma-4-26B-A4B-it-bm889-sft11-sfinal-BF16-eos106.gguf"),
+                extra={},
+                keep={"imatrix.gguf", "imatrix.gguf.sha256", "imatrix.dat", "README.md", ".gitattributes",
+                      "mmproj-gemma-4-26B-A4B-agentic-BF16.gguf", "gemma-4-26B-A4B-agentic-F16.gguf",
+                      "gemma-4-26B-A4B-agentic-F16.gguf.sha256"},
+                attn_from="Q4_K_M", weights_repo=None, weights_card=None),
+}
+LOG = RUNS / "kfac_publish_bs2.log"
+HOURS = float(os.environ.get("HOURS", "48"))
+SKIP_TIERS = {"IQ2_XXS"}  # QAD exports, published by their own chain
+# the Gemma-4 A4B attention rule of quantize_gguf / kfac_ladder_twins.sh: Q4_K_M and above -> Q8_0, else Q6_K
+ATTN_Q8 = {"Q4_K_M", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q5_0", "Q5_1", "Q6_K", "Q6_K_L", "Q8_0"}
+# ladder order on the card (coarse last)
+ORDER = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "IQ4_XS", "IQ4_NL", "Q3_K_M", "IQ3_M", "IQ3_XS",
+         "IQ3_XXS", "IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS"]
+
+
+def say(*a):
+    line = f"[kp {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] " + " ".join(str(x) for x in a)
+    print(line, flush=True)
+    with LOG.open("a") as f:
+        f.write(line + "\n")
+
+
+def sha256_of(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def local_sha(d: Path) -> str:
+    side = d / "kfac.gguf.sha256"
+    if side.exists():
+        s = side.read_text().split()[0]
+        if len(s) == 64:
+            return s
+    s = sha256_of(d / "kfac.gguf")
+    side.write_text(f"{s}  kfac.gguf\n")
+    return s
+
+
+def hub_files(api: HfApi, repo: str) -> dict:
+    """name -> (size, lfs sha256 or None) for every file of the repo."""
+    for attempt in range(5):
+        try:
+            info = api.model_info(repo, files_metadata=True)
+            out = {}
+            for s in info.siblings:
+                lfs = getattr(s, "lfs", None)
+                sha = None
+                if lfs:
+                    sha = lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
+                out[s.rfilename] = (getattr(s, "size", None), sha)
+            return out
+        except Exception as e:  # noqa: BLE001
+            say("hub_files retry", attempt + 1, type(e).__name__, str(e)[:120])
+            time.sleep(20 * (attempt + 1))
+    return {}
+
+
+def hub_sha(api: HfApi, repo: str, name: str) -> str | None:
+    for attempt in range(5):
+        try:
+            info = api.get_paths_info(repo, [name], expand=True)
+            for e in info:
+                lfs = getattr(e, "lfs", None)
+                if lfs:
+                    return lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
+            return None
+        except Exception as e:  # noqa: BLE001
+            say("hub_sha retry", attempt + 1, type(e).__name__, str(e)[:120])
+            time.sleep(20 * (attempt + 1))
+    return None
+
+
+def upload(api: HfApi, repo: str, src: Path, name: str, msg: str) -> bool:
+    for attempt in range(1, 7):
+        try:
+            t0 = time.time()
+            api.upload_file(path_or_fileobj=str(src), path_in_repo=name, repo_id=repo, repo_type="model", commit_message=msg)
+            say(f"uploaded {name} ({src.stat().st_size / 2**30:.2f} GiB) in {time.time() - t0:.0f} s")
+            return True
+        except Exception as e:  # noqa: BLE001
+            say(f"upload {name} attempt {attempt} failed: {type(e).__name__} {str(e)[:160]}")
+            time.sleep(30 * attempt)
+    return False
+
+
+def twin(d: Path) -> str:
+    try:
+        p, k = json.load(open(d / "ptq.eval.json")), json.load(open(d / "kfac.eval.json"))
+        return (f"K-FAC {k['klk']:.5f}/{k['top1']:.4f} vs llama.cpp+imatrix {p['klk']:.5f}/{p['top1']:.4f} "
+                f"({100 * (k['klk'] - p['klk']) / p['klk']:+.1f}% KL, 44-row top-256 KL vs F16)")
+    except Exception as e:  # noqa: BLE001
+        return f"twin numbers unavailable ({type(e).__name__})"
+
+
+def publish_once(api: HfApi, which: str, cfg: dict, src: Path, name: str, tag: str, msg: str) -> None:
+    """imatrix / extra files: upload once per repo (marker), verify by sha, sidecar."""
+    marker = cfg["ladder"] / f".published_{tag}_{name}"
+    if marker.exists() or not src.exists():
+        return
+    s = sha256_of(src)
+    if hub_sha(api, cfg["repo"], name) == s:
+        marker.write_text(s + "\n")
+        say(f"KP_{tag.upper()}", which, name, "already on the hub, sha", s[:12])
+        return
+    if not upload(api, cfg["repo"], src, name, f"{msg} (sha256 {s[:12]})"):
+        say("KP_FAIL", which, name, "upload")
+        return
+    if hub_sha(api, cfg["repo"], name) != s:
+        say("KP_FAIL", which, name, "hub sha differs")
+        return
+    side = cfg["ladder"] / f"{name}.sha256"
+    side.write_text(f"{s}  {name}\n")
+    upload(api, cfg["repo"], side, f"{name}.sha256", f"sha256 of {name}")
+    marker.write_text(s + "\n")
+    say(f"KP_{tag.upper()}", which, name, "sha", s[:12], f"{src.stat().st_size / 2**30:.2f} GiB")
+
+
+def publish_tier(api: HfApi, which: str, cfg: dict, d: Path) -> None:
+    tier = d.name
+    name = f"{cfg['prefix']}-{tier}.gguf"
+    g = d / "kfac.gguf"
+    s = local_sha(d)
+    if hub_sha(api, cfg["repo"], name) != s:
+        if not upload(api, cfg["repo"], g, name, f"{tier}: K-FAC rounded (omk_qad.kfac_round, all MLP tensors) -- {twin(d)}"):
+            say("KP_FAIL", which, tier, "upload")
+            return
+        hs = hub_sha(api, cfg["repo"], name)
+        if hs != s:
+            say("KP_FAIL", which, tier, f"hub sha {hs} != local {s} (marker not written)")
+            return
+    side = d / f"{name}.sha256"
+    side.write_text(f"{s}  {name}\n")
+    upload(api, cfg["repo"], side, f"{name}.sha256", f"{tier}: sha256 sidecar")
+    (d / ".published_hf").write_text(f"{s}  {cfg['repo']}/{name}\n")
+    say("KP_TIER", which, tier, "->", f"{cfg['repo']}/{name}", f"{g.stat().st_size / 2**30:.2f} GiB sha {s[:12]};", twin(d))
+    if (d / ".archived_solidpc").exists():
+        real = g.resolve()
+        say("KP_RM", which, tier, f"bs2 copy removed ({real}); verified copies: hub + solidpc")
+        real.unlink(missing_ok=True)
+        if g.is_symlink():
+            g.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- cards
+def element_count(cfg: dict) -> int | None:
+    """Tensor element count of the base GGUF (bits/weight denominator), cached beside the ladder."""
+    cache = cfg["ladder"] / ".elements.json"
+    if cache.exists():
+        return json.load(open(cache))["elements"]
+    if not cfg["base"].exists():
+        return None
+    try:
+        import gguf  # noqa: PLC0415
+        r = gguf.GGUFReader(str(cfg["base"]))
+        n = int(sum(int(t.n_elements) for t in r.tensors))
+        json.dump({"elements": n, "base": str(cfg["base"])}, open(cache, "w"))
+        return n
+    except Exception as e:  # noqa: BLE001
+        say("element_count failed", type(e).__name__, str(e)[:120])
+        return None
+
+
+def manifest(api: HfApi, which: str, cfg: dict, files: dict) -> dict:
+    rows = {}
+    for d in sorted(p for p in cfg["ladder"].iterdir() if p.is_dir()):
+        m = d / ".published_hf"
+        if not m.exists():
+            continue
+        tier = d.name
+        name = f"{cfg['prefix']}-{tier}.gguf"
+        sha = m.read_text().split()[0]
+        size, hsha = files.get(name, (None, None))
+        row = {"tier": tier, "name": name, "sha256": sha, "bytes": size, "hub_sha_ok": hsha == sha,
+               "attention": "Q8_0" if tier in ATTN_Q8 else "Q6_K",
+               "published_utc": time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(m.stat().st_mtime))}
+        for arm, key in (("ptq", "ptq"), ("kfac", "kfac")):
+            try:
+                e = json.load(open(d / f"{key}.eval.json"))
+                row[arm] = {"klk": e["klk"], "top1": e["top1"]}
+            except Exception:  # noqa: BLE001
+                row[arm] = None
+        rows[tier] = row
+    out = {"repo": cfg["repo"], "elements": element_count(cfg), "tiers": rows,
+           "hub_files": {k: v[0] for k, v in files.items()},
+           "rendered_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    (cfg["ladder"] / "published.json").write_text(json.dumps(out, indent=1))
+    return out
+
+
+def fmt_gb(b) -> str:
+    return "—" if not b else f"{b / 1e9:.2f} GB ({b / 2**30:.2f} GiB)"
+
+
+def render_tiers(man: dict) -> str:
+    rows = man["tiers"]
+    n = man.get("elements")
+    hdr = ("| Tier | attention | size | bpw | sha256 | llama-quantize + imatrix<br>KL / top-1 | **K-FAC**<br>KL / top-1 | ΔKL |\n"
+           "|---|---|---:|---:|---|---:|---:|---:|\n")
+    lines = []
+    for t in ORDER:
+        r = rows.get(t)
+        if not r:
+            continue
+        bpw = f"{8 * r['bytes'] / n:.2f}" if (n and r["bytes"]) else "—"
+        p, k = r.get("ptq"), r.get("kfac")
+        pt = f"{p['klk']:.5f} / {p['top1']:.4f}" if p else "—"
+        kt = f"**{k['klk']:.5f} / {k['top1']:.4f}**" if k else "—"
+        dk = f"{100 * (k['klk'] - p['klk']) / p['klk']:+.1f} %" if (p and k) else "—"
+        lines.append(f"| **{t}** | {r['attention']} | {fmt_gb(r['bytes'])} | {bpw} | `{r['sha256'][:12]}…` | {pt} | {kt} | {dk} |")
+    pending = [t for t in ORDER if t not in rows and t != "IQ2_XXS"]
+    txt = hdr + "\n".join(lines) if lines else "_No K-FAC tier published yet._"
+    txt += ("\n\n_IQ2_XXS: the seeded QAD export (see below), published when its run ends._"
+            if "IQ2_XXS" not in rows else "")
+    if pending:
+        txt += "\n\n_Building (K-FAC, published as each tier lands): " + ", ".join(pending) + "._"
+    return txt
+
+
+def render_stale(man: dict, cfg: dict) -> str:
+    ours = {r["name"] for r in man["tiers"].values()} | {r["name"] + ".sha256" for r in man["tiers"].values()} | cfg["keep"]
+    stale = sorted(f for f in man["hub_files"] if f not in ours and not f.startswith("calibration/")
+                   and not f.endswith(".sha256") and f.endswith(".gguf"))
+    if not stale:
+        return "_None._"
+    tot = sum(man["hub_files"][f] or 0 for f in stale)
+    return ("The following `.gguf` files in this repo are **the previous build** (2026-10-17, pruned from the stock "
+            f"`-it` with the α=1.2 shared-FFN upweight, llama.cpp b9700 imatrix): {len(stale)} files, {tot / 1e9:.0f} GB. "
+            "They are not the sft12 model and are kept only until their K-FAC replacement lands or they are removed; "
+            "a tier name that appears in the table above has already been replaced.\n\n"
+            + "\n".join(f"- `{f}` ({fmt_gb(man['hub_files'][f])})" for f in stale))
+
+
+def render_bench(path: Path) -> str:
+    if not path.exists():
+        return "_The canonical suite on the K-FAC Q6_K is running; results land here when it finishes._"
+    b = json.load(open(path))
+    lines = [f"**{b.get('title', 'Benchmarks')}**", "", b.get("basis", ""), "",
+             "| Benchmark | " + " | ".join(b["columns"]) + " |", "|---|" + "---:|" * len(b["columns"])]
+    for r in b["rows"]:
+        lines.append("| " + r["name"] + " | " + " | ".join(str(x) if x is not None else "—" for x in r["values"]) + " |")
+    if b.get("notes"):
+        lines += ["", b["notes"]]
+    return "\n".join(lines)
+
+
+def render_card(which: str, cfg: dict, man: dict) -> str | None:
+    tpl = CARDS / f"{which}_gguf.md"
+    if not tpl.exists():
+        return None
+    txt = tpl.read_text()
+    txt = txt.replace("<!-- OMK:TIERS -->", render_tiers(man))
+    txt = txt.replace("<!-- OMK:STALE -->", render_stale(man, cfg))
+    txt = txt.replace("<!-- OMK:BENCH -->", render_bench(CARDS / f"{which}_bench.json"))
+    txt = txt.replace("<!-- OMK:RENDERED -->", man["rendered_utc"])
+    return txt
+
+
+def hub_readme(api: HfApi, repo: str) -> str:
+    try:
+        p = hf_hub_download(repo, "README.md", repo_type="model", cache_dir=str(CARDS / ".hfcache"), force_download=True)
+        return Path(p).read_text()
+    except Exception as e:  # noqa: BLE001
+        say("hub_readme failed", repo, type(e).__name__, str(e)[:120])
+        return ""
+
+
+def push_card(api: HfApi, repo: str, txt: str, label: str, msg: str) -> None:
+    if not txt or txt.strip() == hub_readme(api, repo).strip():
+        return
+    out = CARDS / f".{label}.rendered.md"
+    out.write_text(txt)
+    if upload(api, repo, out, "README.md", msg):
+        say("KP_CARD", repo, label, f"{len(txt)} chars")
+    else:
+        say("KP_FAIL", repo, "card upload", label)
+
+
+def cards(api: HfApi) -> None:
+    for which, cfg in LADDERS.items():
+        files = hub_files(api, cfg["repo"])
+        if not files:
+            say("KP_FAIL", which, "hub listing empty, card not rendered")
+            continue
+        man = manifest(api, which, cfg, files)
+        txt = render_card(which, cfg, man)
+        if txt:
+            push_card(api, cfg["repo"], txt, f"{which}_gguf",
+                      f"card: K-FAC ladder ({len(man['tiers'])} tiers published), recipe and provenance")
+        if cfg.get("weights_repo") and cfg.get("weights_card") and (CARDS / cfg["weights_card"]).exists():
+            push_card(api, cfg["weights_repo"], (CARDS / cfg["weights_card"]).read_text(), cfg["weights_card"],
+                      "card: sft12 build -- the ml_k8 prune without shared-expert upweight, the sft12 recipe, K-FAC quants")
+
+
+def main() -> None:
+    api = HfApi()
+    CARDS.mkdir(exist_ok=True)
+    say("KP_START as", api.whoami()["name"], "for", HOURS, "h;", {k: v["repo"] for k, v in LADDERS.items()}, "cards", str(CARDS))
+    end = time.time() + HOURS * 3600
+    while time.time() < end:
+        for which, cfg in LADDERS.items():
+            try:
+                publish_once(api, which, cfg, cfg["imatrix"], cfg["imatrix_name"], "imatrix",
+                             f"imatrix used by the K-FAC ladder ({cfg['imatrix'].name})")
+                for name, src in cfg["extra"].items():
+                    publish_once(api, which, cfg, src, name, "extra", f"{name}: this build's unquantised GGUF (llama.cpp b12386)")
+                for d in sorted(p for p in cfg["ladder"].iterdir() if p.is_dir()):
+                    if d.name in SKIP_TIERS or (d / ".published_hf").exists():
+                        continue
+                    g = d / "kfac.gguf"
+                    if not (g.exists() and (d / "kfac.eval.json").exists() and (d / "ptq.eval.json").exists()):
+                        continue
+                    klog = d / "kfac.log"
+                    if not klog.exists() or "KFACR_DONE" not in klog.read_text(errors="ignore"):
+                        say("skip", which, d.name, "kfac.log has no KFACR_DONE (partial rounding, bug-949)")
+                        continue
+                    publish_tier(api, which, cfg, d)
+            except Exception as e:  # noqa: BLE001
+                say("KP_FAIL", which, "loop error", type(e).__name__, str(e)[:200])
+        try:
+            cards(api)
+        except Exception as e:  # noqa: BLE001
+            say("KP_FAIL", "cards", type(e).__name__, str(e)[:200])
+        time.sleep(300)
+    say("KP_DONE", HOURS, "h elapsed")
+
+
+if __name__ == "__main__":
+    main()

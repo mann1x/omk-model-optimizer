@@ -77,6 +77,11 @@ $ENV -m omk_qad.train --phase train --model MODEL_DIR --layout runs/x/layout.pt 
 | `--guard-ratio` | 0 (off) | divergence guard: roll back + cut LR when the loss exceeds ratio × EMA |
 | `--snapshot-every` / `--snapshot-keep` | 100 / 4 | numbered `ckpt_stepNNNNNNN.pt` besides the rolling `last.pt` |
 
+**Seeding from a K-FAC rounding.** `--init-latents DIR` starts the routed gate_up latents from the error-fed latents
+of `omk_qad.kfac_round --save-latents` instead of RTN; the trainer logs `SEED_LATENTS … N gate_up`. The seed is exact
+only when the PTQ reference, the rounder, the trainer and the export share one imatrix and one layout: run the seed
+gate first. Method, gate and the two Gemma-4 runs: [kfac-rounding.md](kfac-rounding.md).
+
 Runs are **pausable and resumable bit for bit**: Ctrl-C / SIGTERM or `touch <out>/stage1/PAUSE` checkpoints at
 the step boundary and exits; the same command then resumes from `last.pt`. `echo pause > <out>/stage1/control`
 checkpoints and waits in-process until the file says `run`. A resume with different run-critical settings is
@@ -101,3 +106,10 @@ tensor against gguf-py's reference decoders, and writes the imatrix next to it.
 
 [`evaluation.md`](evaluation.md): KLD vs the F16 GGUF and HumanEval/HE+, next to stock `llama-quantize` tiers of the
 same F16 and llama.cpp build. Worked example with numbers: [Qwen3.5-4B](../models/qwen3.5-4b/README.md).
+
+## Beyond 2 bits: K-FAC rounding of the other tiers
+
+A QAD run is worth its GPU hours at IQ2_XXS. For every other tier of a ladder, [K-FAC rounding](kfac-rounding.md)
+re-rounds the `llama-quantize` file with the model's curvature at no training cost (−6 % to −24 % KL at identical
+size), and its latents seed the IQ2_XXS QAD. The two published Gemma-4 agentic ladders are built that way:
+[gemma-4-26b-a4b](../models/gemma-4-26b-a4b/README.md), [gemma-4-20b-v9-agentic](../models/gemma-4-20b-v9-agentic/README.md).
