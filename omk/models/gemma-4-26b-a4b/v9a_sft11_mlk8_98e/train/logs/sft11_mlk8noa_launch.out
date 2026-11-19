@@ -1,0 +1,2 @@
+SFTM_START 2026-11-14T10:48:23Z windows 4217 steps 2108 lr 4.74e-06 train 11 eval 20
+SFTM_FAIL train: wandb: ⭐️ View project at: https://wandb.ai/mannix/omk-qad wandb: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s) wandb: Find logs at: runs/g4_bf16_sft11_mlk8noa/stage1/wandb/run-20261114_110125-d953b7c5f51b373e/logs 

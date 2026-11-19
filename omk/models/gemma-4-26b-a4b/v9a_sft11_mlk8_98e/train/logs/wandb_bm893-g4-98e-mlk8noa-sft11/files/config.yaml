@@ -1,0 +1,283 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            j3to3yb3t5sebxrblz3ttg3rlwe4o86b:
+                args:
+                    - --phase
+                    - train
+                    - --mode
+                    - bf16
+                    - --model
+                    - /mnt/sdc/ml/v9a_sft11/mlk8-noa/gemma-4-20B-v9-agentic-sft11-mlk8-noa
+                    - --cache
+                    - cache_teacher_r4
+                    - --out
+                    - runs/g4_bf16_sft11_mlk8noa
+                    - --train-scope
+                    - classes:attention,dense_mlp,router,routed_experts
+                    - --bs
+                    - "2"
+                    - --steps
+                    - "2108"
+                    - --lr
+                    - "4.74e-06"
+                    - --fp-lr
+                    - "4.74e-06"
+                    - --warmup
+                    - "10"
+                    - --seq
+                    - "16384"
+                    - --loss
+                    - ce
+                    - --sft-data
+                    - sft11_build/render/agentic.train.roles.jsonl,sft11_build/render/cp.train.roles.jsonl,sft11_build/render/hermes.train.roles.jsonl,sft11_build/render/ifchat_v1.train.roles.jsonl,sft11_build/render/ifchat_v2.train.roles.jsonl,sft11_build/render/kimi31b.train.roles.jsonl,sft11_build/render/math.train.roles.jsonl,sft11_build/render/multilingual.train.roles.jsonl,sft11_build/render/opencode.train.roles.jsonl,sft11_build/render/science.train.roles.jsonl,sft11_build/render/swe.train.roles.jsonl
+                    - --sft-eval
+                    - sft11_build/render/agentic.eval.roles.jsonl,sft11_build/render/cp.eval.roles.jsonl,sft11_build/render/hermes.eval.roles.jsonl,sft11_build/render/ifchat_v1.eval.roles.jsonl,sft11_build/render/ifchat_v2.eval.roles.jsonl,sft11_build/render/kimi31b.eval.roles.jsonl,sft11_build/render/math.eval.roles.jsonl,sft11_build/render/multilingual.eval.roles.jsonl,sft11_build/render/opencode.eval.roles.jsonl,sft11_build/render/science.eval.roles.jsonl,sft11_build/render/swe.eval.roles.jsonl,sft_build/sft_mix_v1_cp_reasoning_eval.roles.jsonl,sft_build/sft_mix_v1_exercism_sql_eval.roles.jsonl,sft_build/sft_mix_v1_opencode_eval.roles.jsonl,sft_build/sft_mix_v1_swe_agentless_eval.roles.jsonl,sft_build/sft_mix_v2_agentic_eval.roles.jsonl,sft_build/sft_mix_v2_cp_reasoning_eval.roles.jsonl,sft_build/sft_mix_v2_exercism_sql_eval.roles.jsonl,sft_build/sft_mix_v2_opencode_eval.roles.jsonl,sft_build/sft_mix_v2_swe_agentless_eval.roles.jsonl
+                    - --mtp
+                    - freeze
+                    - --eval-every
+                    - "200"
+                    - --save-every
+                    - "100"
+                    - --snapshot-every
+                    - "100"
+                    - --snapshot-keep
+                    - "2"
+                    - --guard-ratio
+                    - "3"
+                    - --wandb-project
+                    - omk-qad
+                    - --wandb-name
+                    - bm893-g4-98e-mlk8noa-sft11
+                cpu_count: 32
+                cpu_count_logical: 32
+                cudaVersion: "13.4"
+                disk:
+                    /:
+                        total: "2164144291840"
+                        used: "1792295022592"
+                email: fcalpini@gmail.com
+                executable: /mnt/sdc/omk-model-optimizer/venv/bin/python
+                gpu: NVIDIA RTX PRO 6000 Blackwell Server Edition
+                gpu_count: 2
+                gpu_nvidia:
+                    - architecture: Blackwell
+                      cudaCores: 24064
+                      memoryTotal: "102641958912"
+                      name: NVIDIA RTX PRO 6000 Blackwell Server Edition
+                      uuid: GPU-625d9565-441b-d82b-76ee-3441c3c01b01
+                    - architecture: Blackwell
+                      cudaCores: 24064
+                      memoryTotal: "102641958912"
+                      name: NVIDIA RTX PRO 6000 Blackwell Server Edition
+                      uuid: GPU-d033f19b-fbb7-e131-c80d-35f76603dc65
+                host: localhost
+                memory:
+                    total: "371722686464"
+                os: Linux-6.8.0-147-generic-x86_64-with-glibc2.39
+                program: -m omk_qad.train
+                python: CPython 3.11.15
+                root: runs/g4_bf16_sft11_mlk8noa/stage1
+                startedAt: "2026-11-14T11:01:25.352450Z"
+                writerId: j3to3yb3t5sebxrblz3ttg3rlwe4o86b
+        m: []
+        python_version: 3.11.15
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+                - 71
+            "2":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+                - 71
+            "3":
+                - 2
+                - 13
+                - 14
+                - 16
+                - 61
+            "4": 3.11.15
+            "5": 0.26.1
+            "6": 5.5.0
+            "12": 0.26.1
+            "13": linux-x86_64
+accum:
+    value: 1
+allow_change:
+    value: []
+anchor:
+    value: false
+anchor_weight:
+    value: 1
+beta1:
+    value: 0
+beta2:
+    value: 0.999
+branch:
+    value: ""
+bs:
+    value: 2
+cache:
+    value: cache_teacher_r4
+cache_bs:
+    value: 4
+cache_meta:
+    value:
+        n_seq: 3370
+        seq: 16384
+        topk: 64
+ce_weight:
+    value: 0
+clip:
+    value: 1
+data:
+    value: ""
+data_order:
+    value: shuffle
+device:
+    value: cuda:0
+eval_data:
+    value: ""
+eval_every:
+    value: 200
+eval_set:
+    value: ""
+export_only:
+    value: embedding
+fp_lr:
+    value: 4.74e-06
+gate:
+    value: 0.01
+ggml_refresh:
+    value: 1
+gguf:
+    value: ""
+guard_cut:
+    value: 0.5
+guard_every:
+    value: 25
+guard_max:
+    value: 4
+guard_patience:
+    value: 3
+guard_ratio:
+    value: 3
+imatrix:
+    value: none
+imatrix_seqs:
+    value: 256
+init_from:
+    value: ""
+latent_dtype:
+    value: fp16
+latent_min:
+    value: 1048576
+layout:
+    value: ""
+llama_cpp:
+    value: /opt/llama.cpp
+load:
+    value: ""
+log_every:
+    value: 25
+loop_weight:
+    value: 1
+loss:
+    value: ce
+loss_chunk:
+    value: 1024
+lr:
+    value: 4.74e-06
+min_lr:
+    value: 1e-07
+mode:
+    value: bf16
+model:
+    value: /mnt/sdc/ml/v9a_sft11/mlk8-noa/gemma-4-20B-v9-agentic-sft11-mlk8-noa
+mtp:
+    value: freeze
+mtp_weight:
+    value: 0.3
+n_eval:
+    value: 32
+n_seq:
+    value: 16000
+no_wandb:
+    value: false
+origin:
+    value:
+        cache: cache_teacher_r4
+        imatrix: none
+        layout: ""
+out:
+    value: runs/g4_bf16_sft11_mlk8noa
+out_hf:
+    value: ""
+phase:
+    value: train
+refresh:
+    value: 1
+save_every:
+    value: 100
+save_minutes:
+    value: 20
+seed:
+    value: 0
+seq:
+    value: 16384
+sft_data:
+    value: sft11_build/render/agentic.train.roles.jsonl,sft11_build/render/cp.train.roles.jsonl,sft11_build/render/hermes.train.roles.jsonl,sft11_build/render/ifchat_v1.train.roles.jsonl,sft11_build/render/ifchat_v2.train.roles.jsonl,sft11_build/render/kimi31b.train.roles.jsonl,sft11_build/render/math.train.roles.jsonl,sft11_build/render/multilingual.train.roles.jsonl,sft11_build/render/opencode.train.roles.jsonl,sft11_build/render/science.train.roles.jsonl,sft11_build/render/swe.train.roles.jsonl
+sft_eval:
+    value: sft11_build/render/agentic.eval.roles.jsonl,sft11_build/render/cp.eval.roles.jsonl,sft11_build/render/hermes.eval.roles.jsonl,sft11_build/render/ifchat_v1.eval.roles.jsonl,sft11_build/render/ifchat_v2.eval.roles.jsonl,sft11_build/render/kimi31b.eval.roles.jsonl,sft11_build/render/math.eval.roles.jsonl,sft11_build/render/multilingual.eval.roles.jsonl,sft11_build/render/opencode.eval.roles.jsonl,sft11_build/render/science.eval.roles.jsonl,sft11_build/render/swe.eval.roles.jsonl,sft_build/sft_mix_v1_cp_reasoning_eval.roles.jsonl,sft_build/sft_mix_v1_exercism_sql_eval.roles.jsonl,sft_build/sft_mix_v1_opencode_eval.roles.jsonl,sft_build/sft_mix_v1_swe_agentless_eval.roles.jsonl,sft_build/sft_mix_v2_agentic_eval.roles.jsonl,sft_build/sft_mix_v2_cp_reasoning_eval.roles.jsonl,sft_build/sft_mix_v2_exercism_sql_eval.roles.jsonl,sft_build/sft_mix_v2_opencode_eval.roles.jsonl,sft_build/sft_mix_v2_swe_agentless_eval.roles.jsonl
+shard:
+    value: 1000
+snapshot_every:
+    value: 100
+snapshot_keep:
+    value: 2
+softcap:
+    value: 30
+source_window:
+    value: 32
+stage:
+    value: 1
+state_dtype:
+    value: fp32
+steps:
+    value: 2108
+stop_at:
+    value: 0
+teacher_gguf:
+    value: ""
+teacher_gguf_bin:
+    value: ""
+teacher_ngl:
+    value: 999
+teacher_ubatch:
+    value: 512
+ternary_method:
+    value: top:86
+topk:
+    value: 64
+train_router:
+    value: false
+train_scope:
+    value: classes:attention,dense_mlp,router,routed_experts
+ul_weight:
+    value: 1
+wandb_entity:
+    value: ""
+wandb_name:
+    value: bm893-g4-98e-mlk8noa-sft11
+wandb_project:
+    value: omk-qad
+warmup:
+    value: 10

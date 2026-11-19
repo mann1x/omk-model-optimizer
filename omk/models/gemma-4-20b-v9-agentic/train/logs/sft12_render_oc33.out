@@ -1,0 +1,6 @@
+[window gate] nobos 0 cut_end 0
+SFT12_START 2026-11-14T19:43:52Z render sft12_build/render_oc33 windows 1710 steps 855 lr 2e-6 train 6 eval 20
+SFT12_EVAL 2026-11-14T19:54:22Z OK init agentic 0.428(+0.000) opencode 0.222(+0.000) kimi31b 0.377(+0.000) swe 0.294(+0.000) cp 0.231(+0.000) hermes 0.243(+0.000) ifchat_v1 0.721(+0.000)
+SFT12_EVAL 2026-11-14T21:03:26Z STOP step100 agentic 0.408(-0.020) opencode 0.224(+0.002) kimi31b 0.388(+0.010) swe 0.296(+0.002) cp 0.231(-0.000) hermes 0.236(-0.006) ifchat_v1 0.666(-0.055) worse:kimi31b.eval
+SFT12_STOP_RULE 2026-11-14T21:03:26Z STOP step100 agentic 0.408(-0.020) opencode 0.224(+0.002) kimi31b 0.388(+0.010) swe 0.296(+0.002) cp 0.231(-0.000) hermes 0.236(-0.006) ifchat_v1 0.666(-0.055) worse:kimi31b.eval
+SFT12_STOPPED_BY_RULE 2026-11-14T21:06:26Z last {"step":100,"saved_at":"2026-11-1421:05:53","stage":1,"branch":"","cache":"cache_teacher_r4","layout":"","imatrix":"none"}

@@ -1,0 +1,91 @@
+{
+  "os":  "Linux-6.8.0-147-generic-x86_64-with-glibc2.39",
+  "python":  "CPython 3.11.15",
+  "startedAt":  "2026-11-11T11:40:31.485634Z",
+  "args":  [
+    "--phase",
+    "train",
+    "--mode",
+    "bf16",
+    "--model",
+    "/mnt/sdc/ml/models/gemma-4-26B-A4B-it",
+    "--cache",
+    "cache_teacher_r4",
+    "--out",
+    "runs/g4_bf16_sft11",
+    "--train-scope",
+    "classes:attention,dense_mlp,router,routed_experts",
+    "--bs",
+    "2",
+    "--steps",
+    "2108",
+    "--lr",
+    "4.74e-06",
+    "--fp-lr",
+    "4.74e-06",
+    "--warmup",
+    "10",
+    "--seq",
+    "16384",
+    "--loss",
+    "ce",
+    "--sft-data",
+    "sft11_build/render/agentic.train.roles.jsonl,sft11_build/render/cp.train.roles.jsonl,sft11_build/render/hermes.train.roles.jsonl,sft11_build/render/ifchat_v1.train.roles.jsonl,sft11_build/render/ifchat_v2.train.roles.jsonl,sft11_build/render/kimi31b.train.roles.jsonl,sft11_build/render/math.train.roles.jsonl,sft11_build/render/multilingual.train.roles.jsonl,sft11_build/render/opencode.train.roles.jsonl,sft11_build/render/science.train.roles.jsonl,sft11_build/render/swe.train.roles.jsonl",
+    "--sft-eval",
+    "sft11_build/render/agentic.eval.roles.jsonl,sft11_build/render/cp.eval.roles.jsonl,sft11_build/render/hermes.eval.roles.jsonl,sft11_build/render/ifchat_v1.eval.roles.jsonl,sft11_build/render/ifchat_v2.eval.roles.jsonl,sft11_build/render/kimi31b.eval.roles.jsonl,sft11_build/render/math.eval.roles.jsonl,sft11_build/render/multilingual.eval.roles.jsonl,sft11_build/render/opencode.eval.roles.jsonl,sft11_build/render/science.eval.roles.jsonl,sft11_build/render/swe.eval.roles.jsonl,sft_build/sft_mix_v1_cp_reasoning_eval.roles.jsonl,sft_build/sft_mix_v1_exercism_sql_eval.roles.jsonl,sft_build/sft_mix_v1_opencode_eval.roles.jsonl,sft_build/sft_mix_v1_swe_agentless_eval.roles.jsonl,sft_build/sft_mix_v2_agentic_eval.roles.jsonl,sft_build/sft_mix_v2_cp_reasoning_eval.roles.jsonl,sft_build/sft_mix_v2_exercism_sql_eval.roles.jsonl,sft_build/sft_mix_v2_opencode_eval.roles.jsonl,sft_build/sft_mix_v2_swe_agentless_eval.roles.jsonl",
+    "--mtp",
+    "freeze",
+    "--eval-set",
+    "heldout",
+    "--eval-every",
+    "200",
+    "--save-every",
+    "100",
+    "--snapshot-every",
+    "100",
+    "--snapshot-keep",
+    "2",
+    "--guard-ratio",
+    "3",
+    "--wandb-project",
+    "omk-qad",
+    "--wandb-name",
+    "bm889-g4-bf16-sft11"
+  ],
+  "program":  "-m omk_qad.train",
+  "email":  "fcalpini@gmail.com",
+  "root":  "runs/g4_bf16_sft11/stage1",
+  "host":  "localhost",
+  "executable":  "/mnt/sdc/omk-model-optimizer/venv/bin/python",
+  "cpu_count":  32,
+  "cpu_count_logical":  32,
+  "gpu":  "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_count":  2,
+  "disk":  {
+    "/":  {
+      "total":  "2164144291840",
+      "used":  "1803279364096"
+    }
+  },
+  "memory":  {
+    "total":  "371722686464"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memoryTotal":  "102641958912",
+      "cudaCores":  24064,
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-625d9565-441b-d82b-76ee-3441c3c01b01"
+    },
+    {
+      "name":  "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "memoryTotal":  "102641958912",
+      "cudaCores":  24064,
+      "architecture":  "Blackwell",
+      "uuid":  "GPU-d033f19b-fbb7-e131-c80d-35f76603dc65"
+    }
+  ],
+  "cudaVersion":  "13.4",
+  "writerId":  "aoabg98rtvx9c2n2nbfp8g8s032x1mso"
+}
