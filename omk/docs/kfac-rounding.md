@@ -78,9 +78,11 @@ per-channel or per-group scale: a column's codes are independent of its neighbou
 an IQ4_XS, Q4_K or IQ2_XXS block encodes 32 or 256 consecutive weights **jointly** — one super-block scale, per-block
 sub-scales (or a shared codebook for the IQ types) and the codes are chosen by a search over the whole block. The
 rounder therefore applies GPTQ's idea at the block's granularity: every 256-column super-block of **every row** of the
-tensor is quantized together with the exact encoder llama-quantize would run (`omk_qad.iq3` / `omk_qad.iq4` CUDA
-kernels and libggml itself for the K-quants, IQ2 family, IQ4_NL, Q8_0 — all byte-identical to `llama-quantize`, checked
-on every tensor), its rounding error is folded into the later columns through the Cholesky factor of the damped
+tensor is quantized together with the exact encoder llama-quantize would run — for IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S,
+IQ4_XS and IQ4_NL the project's own CUDA ports of `ggml-quants.c` (`omk_qad/kernels/iq{2,3,4}.cu`, operation by
+operation in float32 with explicit rounding intrinsics, verified byte-identical to libggml), for the K-quants, IQ2_XS,
+IQ1 and the legacy types libggml itself, loaded through ctypes and run on the CPU; the `rtn` bytes of every tensor are
+compared with the `llama-quantize` file — its rounding error is folded into the later columns through the Cholesky factor of the damped
 inverse of `A_e` (`--damp 0.01`, eigenvalue floor `1e-6 · λmax`), and the next block is encoded on the compensated
 weights. When a whole column block is fixed at once the OBS compensation is the same for any `G`, so at the shipped
 tiers the rounding decision is GPTQ on the full `A_e`; `G_e` enters through `kfac_validate` / `kfac_probe` (predicting
@@ -89,9 +91,11 @@ full gradient `G Δ A` (default 0 on the published ladders).
 
 Three things make this different from "GPTQ for GGUF":
 
-- **the encoders are llama.cpp's**, bit for bit (`rtn` mode reproduces the `llama-quantize` payload byte for byte,
-  the `ENCODER_MATCH` gate), so a K-FAC file is a legal GGUF of the stock type and the comparison with the stock tier
-  is a rounding-only difference;
+- **the encoders are llama.cpp's**, bit for bit: our CUDA ports of `ggml-quants.c` for the IQ2/IQ3/IQ4 types
+  (verified byte-identical against libggml) and libggml itself for the rest, never NVIDIA ModelOpt's fake-quant
+  kernels (whose IQ2_XXS search scored 31 % worse KL than llama-quantize's and was retired from this path).
+  `rtn` mode reproduces the `llama-quantize` payload byte for byte (the `ENCODER_MATCH` gate), so a K-FAC file is a
+  legal GGUF of the stock type and the comparison with the stock tier is a rounding-only difference;
 - **the curvature is per expert**: a routed expert's `A_e` is the second moment of the tokens *it* saw, with `n_e` as
   its weight in the whole-model loss (an expert that never fired has zero factors and is left at the stock rounding);
 - **the input imatrix is still used**, as `E[x²]` per column inside the encoders' scale search (the same weighting
@@ -228,7 +232,7 @@ CUDA_VISIBLE_DEVICES=0 OMK_GGML_THREADS=8 CUDA_HOME=/usr/local/cuda-12.8 $PY -m 
 | `--stems all` | every MLP tensor: routed `ffn_gate_up_exps` + `ffn_down_exps`, dense `ffn_gate` / `ffn_up` / `ffn_down` (`gate_up`, `routed`, `down_dense` are the subsets) |
 | `--method gptq` (default) | block-wise GPTQ on `A_e` (§2); `--damp 0.01` |
 | `--ste K` | K straight-through steps on the full quadratic `G Δ A` after GPTQ, best iterate kept (default 0 = the published ladders) |
-| `--llama-cpp` | the tree whose `libggml` encodes the K-quants, IQ2_XS/S/M, IQ4_NL, Q8_0 and legacy types on the CPU (`OMK_GGML_THREADS`); IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS use the project's CUDA kernels — all byte-identical to llama-quantize |
+| `--llama-cpp` | the tree whose `libggml` encodes the K-quants, IQ2_XS, IQ1_S/M, Q8_0 and legacy types on the CPU (`OMK_GGML_THREADS`); IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL use the project's CUDA kernels — all byte-identical to llama-quantize |
 | `--save-latents DIR` | the error-fed fp16 latents of the routed gate_up per layer (`layer_NN.pt`): the QAD seed (§5) |
 | `--report` | per layer and stem: the kfac / diagonal / plain-`Σ Δ²` predictions for `rtn` and for the final rounding |
 
