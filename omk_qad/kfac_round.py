@@ -7,10 +7,11 @@ the factors were collected on) is rounded to a GGUF type so that the curvature-w
     L_e(Δ) = ½ tr(Δ A_e Δᵀ G_e),   Δ = Q(W) − W0_e
 
 is small, where A_e = E[x xᵀ] (the layer input) and G_e = E[g gᵀ] (the sampled-label Fisher of the gate_up output)
-come from :mod:`omk_qad.kfac` (``factors_w512_s2048_g10``). The encoders are the project's own IQ3_XXS / IQ4_XS
-kernels (:mod:`omk_qad.iq3`, :mod:`omk_qad.iq4`), byte-identical to llama-quantize's, and for the IQ2 family
-(IQ2_XXS / IQ2_XS / IQ2_S) libggml itself through :mod:`omk_qad.ggml_lib` (``--llama-cpp``: the exact code
-llama-quantize runs, on the CPU), all fed the same imatrix (``E[x²]`` per column, 1 where an expert saw no token), so
+come from :mod:`omk_qad.kfac` (``factors_w512_s2048_g10``). The encoders are the project's own CUDA kernels
+(:mod:`omk_qad.iq2` / :mod:`omk_qad.iq3` / :mod:`omk_qad.iq4` / :mod:`omk_qad.q8`: IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS /
+IQ3_S, IQ4_XS / IQ4_NL, Q8_0), byte-identical to llama-quantize's, and for IQ1_S / IQ1_M, the K-quants and the legacy
+types libggml itself through :mod:`omk_qad.ggml_lib` (``--llama-cpp``: the exact code llama-quantize runs, on the
+CPU), all fed the same imatrix (``E[x²]`` per column, 1 where an expert saw no token), so
 
   * ``rtn``  reproduces llama-quantize's PTQ codes exactly (the ``--ref`` GGUF's payload is compared byte for byte:
     ENCODER_MATCH); it is the floor every other method has to beat;
@@ -63,14 +64,15 @@ STEMS = {
 STEM_SETS = {"gate_up": ["ffn_gate_up_exps"], "routed": ["ffn_gate_up_exps", "ffn_down_exps"], "all": list(STEMS),
              "down_dense": ["ffn_down_exps", "ffn_gate", "ffn_up", "ffn_down"]}  # on top of a gate_up-rounded --ref
 METHODS = ("rtn", "gptq")
-# Encoded by libggml (ggml_quantize_chunk, the code llama-quantize runs); need --llama-cpp. Every llama.cpp type a
-# published ladder puts on the routed gate_up: IQ1_S/IQ1_M/IQ2_XS, the K-quants Q2_K..Q6_K and the legacy block-32
-# types. IQ2_XXS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL keep the project's own CUDA kernels (byte-identical to
-# llama-quantize; IQ2 since bm-896, 2026-11-16 -- before that libggml on the CPU, ~200 s per refresh; IQ4_NL since
-# 2026-11-19 -- the kernel existed for QAD (fakequant.NATIVE_TYPES) but the rounder still sent it to libggml).
-GGML_TYPES = ("IQ1_S", "IQ1_M", "IQ2_XS",
-              "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0")
-KERNEL_TYPES = ("IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_S")  # project kernels (IQ4_NL: block 32)
+# Encoded by libggml (ggml_quantize_chunk, the code llama-quantize runs); need --llama-cpp: IQ1_S / IQ1_M only.
+# Every other llama.cpp type a published ladder puts on an MLP tensor has a project CUDA kernel, byte-identical to
+# llama-quantize: IQ2_XXX / IQ2_S since bm-896 (2026-11-16 -- before that libggml on the CPU, ~200 s per refresh);
+# IQ4_NL, Q8_0 and IQ2_XS since 2026-11-19 (bm-900); the K-quants Q2_K..Q6_K and the legacy block-32 types Q4_0 /
+# Q4_1 / Q5_0 / Q5_1 since 2026-11-19 too (bm-901, omk_qad.kquant -- llama-quantize puts Q5_0 / Q5_1 / Q4_0 on the
+# 1408-wide expert down projections of Gemma-4's K-quant tiers). kquant's CPU path IS libggml (the tree given here).
+GGML_TYPES = ("IQ1_S", "IQ1_M")
+KERNEL_TYPES = ("IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_S", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q8_0",
+                "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q4_1", "Q5_0", "Q5_1")  # project kernels
 QTYPES = (*KERNEL_TYPES, *GGML_TYPES)
 AUTO = "auto"  # --qtype auto: each layer takes the type its --ref gate_up tensor carries (a mixed ladder tier)
 _GGML: dict[str, GgmlNative | None] = {"mod": None}
@@ -87,14 +89,15 @@ class GgmlNative:
     def __init__(self, llama_cpp: str | Path):
         """Bind ``<llama_cpp>/build/bin/libggml-base.so``."""
         from .ggml_lib import GGMLLib
+        from .gguf_export import _import_llama_cpp
 
         self.lib = GGMLLib(Path(llama_cpp))
+        # the TREE's gguf-py, never a pip gguf: importing another gguf first makes every later Codec / export refuse
+        # ("a different gguf is already imported", bug-973 -- a test-order trap until 2026-11-19)
+        self.gguf = _import_llama_cpp(Path(llama_cpp))[0]
 
-    @staticmethod
-    def _id(qtype: str) -> int:
-        import gguf
-
-        return int(gguf.GGMLQuantizationType[qtype])
+    def _id(self, qtype: str) -> int:
+        return int(self.gguf.GGMLQuantizationType[qtype])
 
     def encode(self, qtype: str, x: torch.Tensor, importance: torch.Tensor | None = None) -> torch.Tensor:
         """uint8 payload [rows, cols / block, block bytes] of float32 ``x`` [rows, cols]; ``importance`` = E[x²] [cols]."""  # noqa: E501
@@ -128,10 +131,14 @@ def native(qtype: str):
     """The encoder/decoder module of ``qtype`` (a libggml type needs ``--llama-cpp`` to have been given)."""
     if qtype in ("IQ4_XS", "IQ4_NL"):
         from . import iq4 as m
+    elif qtype == "Q8_0":
+        from . import q8 as m
     elif qtype in ("IQ3_XXS", "IQ3_S"):
         from . import iq3 as m
-    elif qtype in ("IQ2_XXS", "IQ2_S"):
+    elif qtype in ("IQ2_XXS", "IQ2_XS", "IQ2_S"):
         from . import iq2 as m
+    elif qtype in ("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q4_0", "Q4_1", "Q5_0", "Q5_1"):
+        from . import kquant as m
     elif qtype in GGML_TYPES:
         if _GGML["mod"] is None:
             raise ValueError(f"{qtype} is encoded by libggml: pass --llama-cpp <llama.cpp tree with "
@@ -367,6 +374,9 @@ def main(argv=None) -> None:
     device = torch.device(a.device)
     if a.llama_cpp:
         _GGML["mod"] = GgmlNative(a.llama_cpp)
+        from . import kquant
+
+        kquant.set_llama_cpp(a.llama_cpp)  # its CPU path (never taken on cuda) and the oracle use the same tree
     fdir = Path(a.factors)
     avail = sorted(int(p.stem.split("_")[1]) for p in fdir.glob("layer_*.pt"))
     layers = parse_layers(a.layers, avail)

@@ -78,10 +78,11 @@ per-channel or per-group scale: a column's codes are independent of its neighbou
 an IQ4_XS, Q4_K or IQ2_XXS block encodes 32 or 256 consecutive weights **jointly** — one super-block scale, per-block
 sub-scales (or a shared codebook for the IQ types) and the codes are chosen by a search over the whole block. The
 rounder therefore applies GPTQ's idea at the block's granularity: every 256-column super-block of **every row** of the
-tensor is quantized together with the exact encoder llama-quantize would run — for IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S,
-IQ4_XS and IQ4_NL the project's own CUDA ports of `ggml-quants.c` (`omk_qad/kernels/iq{2,3,4}.cu`, operation by
-operation in float32 with explicit rounding intrinsics, verified byte-identical to libggml), for the K-quants, IQ2_XS,
-IQ1 and the legacy types libggml itself, loaded through ctypes and run on the CPU; the `rtn` bytes of every tensor are
+tensor is quantized together with the exact encoder llama-quantize would run — for IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+IQ3_S, IQ4_XS, IQ4_NL, Q8_0, the K-quants Q2_K … Q6_K and the legacy Q4_0 / Q4_1 / Q5_0 / Q5_1 the project's own CUDA
+ports of `ggml-quants.c` (`omk_qad/kernels/{iq2,iq3,iq4,q8,kquant}.cu`, operation by operation in float32 with explicit
+rounding intrinsics, verified byte-identical to libggml; the K-quant / legacy ports landed 2026-11-19, bm-901), for IQ1_S /
+IQ1_M libggml itself, loaded through ctypes and run on the CPU; the `rtn` bytes of every tensor are
 compared with the `llama-quantize` file — its rounding error is folded into the later columns through the Cholesky factor of the damped
 inverse of `A_e` (`--damp 0.01`, eigenvalue floor `1e-6 · λmax`), and the next block is encoded on the compensated
 weights. When a whole column block is fixed at once the OBS compensation is the same for any `G`, so at the shipped
@@ -232,7 +233,7 @@ CUDA_VISIBLE_DEVICES=0 OMK_GGML_THREADS=8 CUDA_HOME=/usr/local/cuda-12.8 $PY -m 
 | `--stems all` | every MLP tensor: routed `ffn_gate_up_exps` + `ffn_down_exps`, dense `ffn_gate` / `ffn_up` / `ffn_down` (`gate_up`, `routed`, `down_dense` are the subsets) |
 | `--method gptq` (default) | block-wise GPTQ on `A_e` (§2); `--damp 0.01` |
 | `--ste K` | K straight-through steps on the full quadratic `G Δ A` after GPTQ, best iterate kept (default 0 = the published ladders) |
-| `--llama-cpp` | the tree whose `libggml` encodes the K-quants, IQ2_XS, IQ1_S/M, Q8_0 and legacy types on the CPU (`OMK_GGML_THREADS`); IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL use the project's CUDA kernels — all byte-identical to llama-quantize |
+| `--llama-cpp` | the tree whose `libggml` encodes IQ1_S/M on the CPU (`OMK_GGML_THREADS`) and whose gguf-py names the types; every other MLP type (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q8_0, Q2_K … Q6_K, Q4_0 / Q4_1 / Q5_0 / Q5_1) uses the project's CUDA kernels — all byte-identical to llama-quantize |
 | `--save-latents DIR` | the error-fed fp16 latents of the routed gate_up per layer (`layer_NN.pt`): the QAD seed (§5) |
 | `--report` | per layer and stem: the kfac / diagonal / plain-`Σ Δ²` predictions for `rtn` and for the final rounding |
 

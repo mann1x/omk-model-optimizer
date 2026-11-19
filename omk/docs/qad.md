@@ -71,7 +71,7 @@ $ENV -m omk_qad.train --phase train --model MODEL_DIR --layout runs/x/layout.pt 
 | `--lr` / `--min-lr` / `--warmup` | 1e-5 / 1e-7 / 50 | Bolt schedule (warmup, then cosine to min) |
 | `--bs`, `--accum` | 8, 1 | rows per micro-batch, micro-batches per update |
 | `--latent-dtype` | fp16 | latents with stochastic rounding |
-| `--ggml-refresh` | 1 | re-encode libggml-typed (K-quant, IQ3) segments every N steps (CPU encoders) |
+| `--ggml-refresh` | 1 | re-encode libggml-typed segments every N steps (CPU encoders; since 2026-11-19 only IQ1_S / IQ1_M and types forced there by `--ggml-encode` — the K-quants and legacy types have CUDA kernels, `omk_qad.kquant`) |
 | `--export-only` | `embedding` | classes quantized at export only |
 | `--mtp` | `train` | distil the MTP head with the trunk detached, or `freeze` |
 | `--guard-ratio` | 0 (off) | divergence guard: roll back + cut LR when the loss exceeds ratio × EMA |

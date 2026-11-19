@@ -4,9 +4,9 @@
 Every large weight is a *latent* (float16 on GPU, 2 bytes/weight; stochastic rounding on write). Its *served*
 value is built when its module runs: for each GGUF tensor the layout maps to it, the latent rows the GGUF
 tensor holds are gathered in GGUF column order (so the GGML blocks are exactly the GGUF's), encoded to the
-planned type, decoded and scattered back. Encoders: omk_qad.iq4 / iq3 / iq2 (CUDA, byte-identical to
-llama-quantize) for IQ4_XS/IQ4_NL/IQ3_XXS/IQ3_S/IQ2_XXS/IQ2_S, ModelOpt (torch/CUDA) for IQ1_S/IQ1_M/IQ2_XS/
-Q8_0, libggml (the code llama-quantize runs) for everything else (K-quants, ...). Export
+planned type, decoded and scattered back. Encoders: omk_qad.iq4 / iq3 / iq2 / q8 (CUDA, byte-identical to
+llama-quantize) for IQ4_XS/IQ4_NL/IQ3_XXS/IQ3_S/IQ2_XXS/IQ2_XS/IQ2_S/Q8_0, ModelOpt (torch/CUDA) for IQ1_S/IQ1_M,
+libggml (the code llama-quantize runs) for everything else (K-quants, ...). Export
 re-encodes the final latent with the same encoder, so the GGUF holds the blocks training served.
 
 The gradient of the served weight is the latent's gradient (straight-through). It is captured in the
@@ -34,11 +34,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-MODELOPT_TYPES = {"IQ1_S", "IQ1_M", "IQ2_XS", "Q8_0"}
+MODELOPT_TYPES = {"IQ1_S", "IQ1_M"}  # neither is llama-quantize's search (bm-900 probe, 2026-11-19); ports pending
 # omk_qad's own CUDA encoders, byte-identical to llama-quantize (no CPU fallback on a CUDA device). IQ2_XXS / IQ2_S
 # moved here from ModelOpt on 2026-11-16 (bm-896): ModelOpt's IQ2_XXS scored 31 % worse than llama-quantize's.
+# Q8_0 on 2026-11-19 (bm-900): ModelOpt's CUDA packer zeroed the low byte of every fp16 block scale (bug-966).
+# IQ2_XS on 2026-11-19 (bm-900 step 2): ModelOpt's search produced none of llama-quantize's blocks.
+# K-quants + legacy block-32 on 2026-11-19 (bm-901): omk_qad.kquant; on the CPU its encode IS libggml (Codec's tree).
 NATIVE_TYPES = {"IQ4_XS": "iq4", "IQ4_NL": "iq4", "IQ3_XXS": "iq3", "IQ3_S": "iq3",
-                "IQ2_XXS": "iq2", "IQ2_S": "iq2"}  # type -> omk_qad module
+                "IQ2_XXS": "iq2", "IQ2_XS": "iq2", "IQ2_S": "iq2", "Q8_0": "q8",
+                "Q2_K": "kquant", "Q3_K": "kquant", "Q4_K": "kquant", "Q5_K": "kquant", "Q6_K": "kquant",
+                "Q4_0": "kquant", "Q4_1": "kquant", "Q5_0": "kquant", "Q5_1": "kquant"}  # type -> omk_qad module
 GPU_TYPES = MODELOPT_TYPES | set(NATIVE_TYPES)  # encoded on the training device (``refresh``); the rest by libggml
 FLOAT_TYPES = {"F32", "F16", "BF16"}
 TERNARY_TYPES = {"PQ2_0", "PTQ1_0"}  # PrismML Bonsai 2 (omk_qad.ternary); the latent lives in the folded basis
@@ -103,6 +108,9 @@ class Codec:
         self.gguf = _import_llama_cpp(Path(llama_cpp))[0]
         self.llama_cpp = Path(llama_cpp)
         self._ggml = None
+        from . import kquant
+
+        kquant.set_llama_cpp(self.llama_cpp)  # the K-quant / legacy CPU path encodes with this tree's libggml
         self.ternary_method = ternary_method
 
     @property

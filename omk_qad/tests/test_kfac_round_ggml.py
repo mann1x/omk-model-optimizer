@@ -14,10 +14,18 @@ needs_lib = pytest.mark.skipif(LLAMA is None, reason="no llama.cpp tree with bui
 
 
 def test_ggml_type_without_llama_cpp_is_refused(monkeypatch):
-    """A libggml-only type (IQ2_XS; IQ2_XXS / IQ2_S have kernels since bm-896) needs --llama-cpp, said early."""
+    """A libggml-only type needs --llama-cpp, said early; an unknown type is refused by name.
+
+    The example is the first entry of ``kfac_round.GGML_TYPES`` rather than a literal: IQ2_XS was the literal until
+    its kernel landed (bm-900, 2026-11-19) and the test then asserted a refusal that no longer exists (bug-972). When
+    every type has a kernel the first half of the test has nothing to check and is skipped.
+    """
     monkeypatch.setitem(kfac_round._GGML, "mod", None)
-    with pytest.raises(ValueError, match="--llama-cpp"):
-        kfac_round.native("IQ2_XS")
+    if kfac_round.GGML_TYPES:
+        with pytest.raises(ValueError, match="--llama-cpp"):
+            kfac_round.native(kfac_round.GGML_TYPES[0])
+    for kernel_type in kfac_round.KERNEL_TYPES:
+        assert kfac_round.native(kernel_type) is not None  # a kernel type never needs libggml
     with pytest.raises(ValueError, match="not a supported type"):
         kfac_round.native("BF16")
 
@@ -88,7 +96,10 @@ def test_iq2_gptq_fp16_latent_reencodes_to_its_own_payload():
 @needs_lib
 @pytest.mark.parametrize("qtype", ["Q4_K", "Q6_K", "Q3_K", "Q5_0", "IQ4_NL", "Q8_0"])
 def test_kquant_types_round_through_libggml(qtype):
-    """The ladder's K-quant and block-32 types go through the same libggml contract; GPTQ never worse than RTN.
+    """The ladder's K-quant and block-32 types keep the encode/decode contract; GPTQ never worse than RTN.
+
+    On the CPU the K-quants and legacy types reach libggml through omk_qad.kquant (bm-901), IQ4_NL / Q8_0 their torch
+    references.
 
     IQ4_NL and Q8_0 blocks are row-independent (a 64-column slice encodes to the row's bytes); Q4_0/Q5_0 weight
     each block with the ROW's sigma2 in libggml, so a GPTQ group of them carries the group-local sigma2 instead.
