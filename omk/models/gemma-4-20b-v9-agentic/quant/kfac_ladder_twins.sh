@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bm-892/893/895: K-FAC vs llama.cpp imatrix, tier by tier, same layout, same size — the publish decision.
 #
-#   kfac_ladder_twins.sh <26b|20b> <TIER> <stage: ptq|kfac|score|all> [--rm-ptq]
+#   kfac_ladder_twins.sh <26b|20b|20b-base> <TIER> <stage: ptq|kfac|score|all> [--rm-ptq]
 #
 # For a tier T of the published ladder:
 #   ptq   : llama-quantize T from the base GGUF with the imatrix and the Gemma-4 A4B attention rule
@@ -13,11 +13,14 @@
 #   score : both files against the model's own bf16 reference eval set (step0_gguf_student_eval, klk + top1)
 #             -> ladder/T/{ptq,kfac}.eval.json, a TWIN line in ladder/twins.log
 #   --rm-ptq: after BOTH scores are recorded, remove ptq.gguf (owner's word required; default keep).
-# Sentinels: LT_START / LT_PTQ / LT_KFAC / LT_TWIN / LT_DONE / LT_FAIL. Never overwrites an existing file.
+# Sentinels: LT_START / LT_PTQ / LT_KFAC / LT_TWIN / LT_DONE / LT_FAIL / LT_SKIP / LT_RM_PTQ. Never overwrites an existing file.
+# bug-964 (2026-11-18): a SCORED tier is never rebuilt by any stage but score -- the lane's done-check is not the only
+# guard any more; an orphaned ptq.gguf of a scored tier is removed on sight under the owner's .rm_ptq_granted marker.
 set -u
 WHICH=${1:?26b|20b}; TIER=${2:?tier}; STAGE=${3:?ptq|kfac|score|all}; RMPTQ=0; [ "${4:-}" = "--rm-ptq" ] && RMPTQ=1
 PY=/srv/ml/envs/envs/omk-modelopt/bin/python
-OMK=/mnt/sdc/omk-model-optimizer/code/omk-wip-iq2w
+OMK=${OMK_CODE:-/mnt/sdc/omk-model-optimizer/code/omk-wip-iq2w}   # OMK_CODE: another code tree (omk-wip-kern = the Q8_0/IQ2_XS CUDA encoders, 2026-11-19)
+[ -n "${OMK_CODE:-}" ] && export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-$OMK/torch_ext}   # the .so the tree's verify run gated
 LLAMA=/mnt/sdc/ml/llama.cpp-b12386
 QUANT=$LLAMA/build/bin/llama-quantize
 TOPK=/mnt/sdc/omk-model-optimizer/llama_topk_b12386/llama_topk
@@ -29,6 +32,9 @@ case $WHICH in
   20b) K=/mnt/sdc/omk-model-optimizer/runs/g4_20b_kfac
        BASE=/srv/ml/scratch/sft12_ac_imatrix/gemma-4-20B-v9-agentic-sft11-mlk8-noa-sft12-F16.gguf
        IMAT=/mnt/sdc/ml/v9a_sft11/mlk8-noa-sft12/gguf/imatrix_ac.dat; EVAL=$K/eval_20b.pt ;;
+  20b-base) K=/mnt/sdc/omk-model-optimizer/runs/g4_20b_base_kfac   # bm-898: the 26B vendor base pruned with ml_k8 (no shared alpha), sft11 recipe once
+       BASE=/mnt/sdc/ml/v9a_base/mlk8-noa-sft11/gguf/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf
+       IMAT=/mnt/sdc/ml/v9a_base/mlk8-noa-sft11/gguf/imatrix_ac.dat; EVAL=$K/eval_20b_base.pt ;;
   *) echo "LT_FAIL which=$WHICH"; exit 1 ;;
 esac
 FACTORS=$K/factors_w512_s2048_g10
@@ -47,13 +53,32 @@ attn_type() {
 }
 need_disk() { local a; a=$(df --output=avail -BG /mnt/sdc | tail -1 | tr -dc 0-9); [ "$a" -ge "$1" ] || die "/mnt/sdc ${a}G < $1G"; }
 klk_of() { python3 -c "import json; r=json.load(open('$1')); print('%.4f/%.4f' % (r['klk'], r['top1']))"; }
-score_one() {  # <gguf> <json> <log>  (GPU0)
-  CUDA_VISIBLE_DEVICES=0 PYTHONPATH=$OMK CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH \
+free_gpu() {  # index of a GPU with < 60000 MiB in use (the QAD cache fills GPU0, its trainer GPU1); waits up to 3 h
+  local i u
+  for _ in $(seq 1 540); do
+    while read -r i u; do [ "$u" -lt 60000 ] && { echo "$i"; return 0; }; done < <(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | tr -d ,)
+    sleep 20
+  done
+  return 1
+}
+score_one() {  # <gguf> <json> <log>  on a free GPU (bug-951: a hard-wired GPU0 failed "llama_topk exited before it was ready" while the 20B QAD cache held it)
+  local g; g=$(free_gpu) || { echo "no GPU below 60000 MiB in 3 h" | tee -a $LOG; return 1; }
+  say "scoring $(basename $1) on GPU$g"
+  CUDA_VISIBLE_DEVICES=$g PYTHONPATH=$OMK CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH \
   $PY $R26/step0_gguf_student_eval.py --gguf $1 --eval $EVAL --bin $TOPK --omk $OMK --topk 256 --device cuda:0 \
     --out $2 > $3 2>&1 < /dev/null || { tail -12 $3 | tee -a $LOG; return 1; }
   grep -q "GGUF_STUDENT_EVAL OK" $3
 }
 
+# bug-964 guard: a SCORED tier (kfac.eval.json + ptq.eval.json + kfac.gguf.sha256) is never rebuilt. The dormant launcher
+# re-ran every published tier's PTQ on 2026-11-17; the rounder then failed and 24 fresh ptq.gguf (300 GiB) were left on
+# /mnt/sdc because the only rm sits at the end of the score stage. Only STAGE=score may enter (idempotent: an arm whose
+# eval.json exists is not re-scored). An orphaned ptq.gguf of a scored tier is the removal that failed run owed.
+if [ "$STAGE" != score ] && [ -s $D/kfac.eval.json ] && [ -s $D/ptq.eval.json ] && [ -s $D/kfac.gguf.sha256 ]; then
+  if [ "${RMPTQ:-0}" = 1 ] && [ -f $D/ptq.gguf ]; then say "LT_RM_PTQ orphaned ptq.gguf of a scored tier: $(rm -v $D/ptq.gguf)"; fi
+  say "LT_SKIP $TIER is a scored twin (K-FAC $(klk_of $D/kfac.eval.json)); stage $STAGE refused, nothing rebuilt (bug-964)"
+  say "LT_DONE stage $STAGE (skip)"; exit 0
+fi
 say "LT_START stage $STAGE base $BASE imatrix $IMAT factors $FACTORS"
 [ -s $BASE ] || die "no base $BASE"; [ -s $IMAT ] || die "no imatrix $IMAT"
 
