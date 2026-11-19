@@ -317,18 +317,45 @@ def ref_payload(ref: Gguf, layer: int, qtype: str, stem: str = STEM) -> np.ndarr
     return np.asarray(t.data).reshape(-1).view(np.uint8)
 
 
-def write_payload(out_path: str, layer: int, payload: np.ndarray, stem: str = STEM) -> None:
-    """Replace ``blk.<layer>.<stem>.weight`` in the (already copied) output GGUF, in place."""
-    import gguf
+_OUT: dict = {}  # out_path -> (GGUFReader "r+", tensors by name): opened ONCE per run (see write_payload)
 
-    r = gguf.GGUFReader(out_path, "r+")
-    t = {x.name: x for x in r.tensors}[f"blk.{layer}.{stem}.weight"]
+
+def _out_writer(out_path: str):
+    """The output GGUF's writable reader, opened once and kept for the run.
+
+    gguf.GGUFReader(out, "r+") takes ~17 s on a tier-sized file (it builds a view of every KV field and tensor,
+    the 262k-token vocab included) and r.data.flush() msyncs the whole mapping. Re-opening it for each of the
+    5 tensors x 30 layers a tier writes cost ~42 min of the 67 min Q6_K tier of 2026-11-19 (probe
+    scripts/omk_encoder_probes/kfac_write_payload_probe.py: open 16.5 s, write 0.02 s, flush 0.01-10 s).
+    """
+    if out_path not in _OUT:
+        import gguf
+
+        r = gguf.GGUFReader(out_path, "r+")
+        _OUT[out_path] = (r, {x.name: x for x in r.tensors})
+    return _OUT[out_path]
+
+
+def write_payload(out_path: str, layer: int, payload: np.ndarray, stem: str = STEM) -> None:
+    """Replace ``blk.<layer>.<stem>.weight`` in the (already copied) output GGUF, in place (no flush: see
+    ``flush_payloads``).
+    """  # noqa: D205
+    r, tensors = _out_writer(out_path)
+    t = tensors[f"blk.{layer}.{stem}.weight"]
     view = np.asarray(t.data).reshape(-1).view(np.uint8)
     if view.size != payload.size:
         raise SystemExit(f"KFACR_FAIL layer {layer}: payload {payload.size} bytes, GGUF tensor {view.size}")
     view[:] = payload
-    r.data.flush()
-    del r
+
+
+def flush_payloads(out_path: str, close: bool = False) -> None:
+    """Msync the output GGUF's written pages (once per layer); ``close`` drops the mapping at the end of the run."""
+    if out_path in _OUT:
+        r, _ = _OUT[out_path]
+        r.data.flush()
+        if close:
+            del _OUT[out_path]
+            del r
 
 
 def parse_layers(spec: str, avail: list[int]) -> list[int]:
@@ -412,6 +439,8 @@ def main(argv=None) -> None:
     tot = {"rtn": [0.0, 0.0, 0.0], a.method: [0.0, 0.0, 0.0], "final": [0.0, 0.0, 0.0]}
     tot_stem = {st: {k: [0.0, 0.0, 0.0] for k in tot} for st in stems}
     for j in layers:
+        if a.out:
+            flush_payloads(a.out)  # the previous layer's tensors reach the disk (0.5 s; a re-open was 17 s)
         fac = factors_of(fdir / f"layer_{j:02d}.pt", device, stems)
         if int(fac["meta"]["scored"]) != int(n_scored):
             raise SystemExit(f"KFACR_FAIL layer {j} scored {fac['meta']['scored']} != {int(n_scored)}")
@@ -515,6 +544,8 @@ def main(argv=None) -> None:
     if a.report:
         Path(a.report).write_text(json.dumps(rep, indent=1))
     r, f = rep["total"]["rtn"]["kfac"], rep["total"]["final"]["kfac"]
+    if a.out:
+        flush_payloads(a.out, close=True)
     print(f"KFACR_DONE {len(layers)} layers {time.time() - t_all:.0f}s kfac rtn {r:.5f} final {f:.5f} "
           f"({f / max(r, 1e-30):.3f}x) out {a.out}", flush=True)
 

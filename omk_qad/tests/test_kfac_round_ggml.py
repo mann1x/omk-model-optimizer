@@ -155,3 +155,43 @@ def test_layer_qtypes_auto_needs_ref_and_known_types():
     Ref.t["blk.1.ffn_gate_up_exps.weight"] = T("BF16")
     with pytest.raises(SystemExit, match="not a type this rounder encodes"):
         kfac_round.layer_qtypes("auto", Ref(), [0, 1])
+
+
+def test_write_payload_opens_the_output_once_and_flushes_on_demand(tmp_path):
+    """2026-11-19: re-opening the output GGUF per tensor cost ~17 s x 150 per tier (42 of 67 min). One reader per
+    run, payload lands, flush(close=True) makes it visible to a fresh reader and drops the mapping.
+    """  # noqa: D205
+    import numpy as np
+
+    from omk_qad import kfac_round as R
+    from omk_qad.gguf_export import _import_llama_cpp
+    from omk_qad.tests.test_qad_cpu import LLAMA_CPP
+
+    gguf = _import_llama_cpp(LLAMA_CPP)[0]
+    out = tmp_path / "tiny.gguf"
+    w = gguf.GGUFWriter(str(out), "llama")
+    w.add_block_count(1)
+    a = np.zeros((2, 4, 8), dtype=np.float32)
+    b = np.zeros((4, 8), dtype=np.float32)
+    w.add_tensor("blk.0.ffn_gate_up_exps.weight", a)
+    w.add_tensor("blk.0.ffn_gate.weight", b)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    pa = np.arange(a.nbytes, dtype=np.uint8)
+    pb = np.arange(b.nbytes, dtype=np.uint8)[::-1].copy()
+    R.write_payload(str(out), 0, pa, "ffn_gate_up_exps")
+    r1 = R._OUT[str(out)][0]
+    R.write_payload(str(out), 0, pb, "ffn_gate")
+    assert R._OUT[str(out)][0] is r1  # one reader for the run, not one per tensor
+    with pytest.raises(SystemExit, match="payload 3 bytes"):
+        R.write_payload(str(out), 0, np.zeros(3, dtype=np.uint8), "ffn_gate")
+    R.flush_payloads(str(out))
+    assert str(out) in R._OUT
+    R.flush_payloads(str(out), close=True)
+    assert str(out) not in R._OUT
+    rd = gguf.GGUFReader(str(out))
+    t = {x.name: x for x in rd.tensors}
+    assert np.array_equal(np.asarray(t["blk.0.ffn_gate_up_exps.weight"].data).reshape(-1).view(np.uint8), pa)
+    assert np.array_equal(np.asarray(t["blk.0.ffn_gate.weight"].data).reshape(-1).view(np.uint8), pb)
