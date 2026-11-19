@@ -146,14 +146,15 @@ def _ckpt(out: Path) -> dict:
 
 def test_bf16_mode_trains_only_the_scope_and_descends(g4):
     out = WORK / "run_teacher"
+    # this test's own scratch: a finished run from an earlier session is refused ("is finished and immutable") and
+    # tolerating that made the test read a 2026-10-23 checkpoint with bf16 latents (bug-977, 2026-11-19)
+    shutil.rmtree(out, ignore_errors=True)
     proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
                 "--out", str(out), "--steps", "8", "--eval-every", "8", "--save-every", "4", check=False)
     log = proc.stdout + proc.stderr
-    if proc.returncode != 0 and "is finished and immutable" not in log:
-        raise AssertionError(log[-3000:])
-    if proc.returncode == 0:
-        assert "LOSSLESS_GATE skipped" in log
-        assert "scope gemma4" in log and "head model.embed_tokens.weight (frozen)" in log
+    assert proc.returncode == 0, log[-3000:]
+    assert "LOSSLESS_GATE skipped" in log
+    assert "scope gemma4" in log and "head model.embed_tokens.weight (frozen)" in log
     ck = _ckpt(out)
     from omk_qad.ptq import load_text_causal_lm
     from omk_qad.recovery import scope_params
@@ -206,10 +207,11 @@ def test_bf16_trial_configs_train_and_descend(g4, name, extra):
 
 def test_bf16_lossless_gate_when_the_teacher_is_the_student(g4):
     out = WORK / "run_self"
+    shutil.rmtree(out, ignore_errors=True)  # own scratch; a leftover run is RUN_REFUSED (bug-977)
     proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_self"]),
                 "--out", str(out), "--steps", "2", "--eval-every", "2", "--stop-at", "1", check=False)
     log = proc.stdout + proc.stderr
-    assert "LOSSLESS_GATE klk=" in log or "RESUME" in log, log[-3000:]
+    assert "LOSSLESS_GATE klk=" in log, log[-3000:]
 
 
 def test_bf16_reverse_kl_trains_and_is_evaluated(g4, tmp_path):
@@ -350,10 +352,11 @@ def test_role_cache_carries_roles_and_anchor_targets(g4, roles_cache):
 
 def test_bf16_trains_on_roles(g4, roles_cache):
     out = WORK / "run_roles"
+    shutil.rmtree(out, ignore_errors=True)  # own scratch (bug-977)
     proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(roles_cache),
                 "--out", str(out), "--steps", "4", "--eval-every", "4", "--ul-weight", "0.5", check=False)
     log = proc.stdout + proc.stderr
-    assert proc.returncode == 0 or "is finished and immutable" in log, log[-3000:]
+    assert proc.returncode == 0, log[-3000:]
     ck = _ckpt(out)
     assert ck["step"] == 4 and all(torch.isfinite(t.float()).all() for t in ck["latents"].values())
     losses = [float(ln.split("loss=")[1].split()[0]) for ln in (out / "stage1" / "log.txt").read_text().splitlines()
