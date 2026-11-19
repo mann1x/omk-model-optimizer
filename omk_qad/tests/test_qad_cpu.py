@@ -676,6 +676,46 @@ def test_touch_drops_cached_payloads():
     assert lat._cache[0][0] == lat.version and lat._cache[0][1] == 0
 
 
+@pytest.mark.parametrize("path", ["small", "big"])
+def test_adafactor_step_matches_float64_on_tail_rows(monkeypatch, path):
+    """bug-978: the factored normaliser must not underflow fp32 on rows whose gradient is at the eps floor.
+
+    A head has a few present-token rows with real gradients and a long tail at ~0: the tail's row factor sits at
+    the eps floor (1e-30) and the column factor (~1e-12, set by the present rows) makes rh * ch a SUBNORMAL
+    (< 1.2e-38, 0-7 significant bits) or 0 -- the tail steps were rounding noise, and a 1e-6 gradient difference
+    became a 1 % step difference (test_accum_of_two_half_batches_is_the_whole_batch_update, 47 head elements,
+    2026-11-19). The update is (rh / mean rh) * ch, evaluated here on both the per-chunk ``update`` path and the
+    row-chunked ``_update_big`` path (CHUNK_ELEMS forced small) against the same step in float64.
+    """
+    from omk_qad import fakequant as fq
+
+    torch.manual_seed(0)
+    n_rows, n_cols = 64, 32
+    g = torch.randn(n_rows, n_cols) * 1e-16  # the tail: at the eps floor
+    g[:4] = torch.randn(4, n_cols) * 1e-6  # four present tokens
+    ctl = fq.Control(beta2=0.99, clip=1.0)
+    ctl.lr = 1e-3
+    if path == "big":
+        monkeypatch.setattr(fq, "CHUNK_ELEMS", 8 * n_cols)  # rows*cols > CHUNK_ELEMS: the head path, 8-row chunks
+    # the latent starts at 0 so the parameter holds the step at full fp32 resolution (a tail step is ~1e-7, the
+    # ulp of an O(1) weight is 1.2e-7: read back from a random weight the step would be quantised to half-ulps)
+    lat = fq.Latent("lm_head.weight", torch.nn.Parameter(torch.zeros(n_rows, n_cols)), [], ctl, None, torch.float32)
+    lat.update(g)
+    step32 = -lat.param.data
+
+    g64 = g.double()
+    g2 = g64.square() + ctl.eps
+    rh, ch = g2.mean(-1), g2.mean(-2)  # (1-b2)*mean / bc at t=1
+    v = rh[:, None] * ch[None, :] / rh.mean()
+    u = g64 / v.sqrt().clamp(min=1e-15)
+    u = u / (u.square().mean().sqrt() / ctl.clip).clamp(min=1.0)
+    step64 = ctl.lr * u
+    tiny = torch.finfo(torch.float32).tiny
+    assert bool((rh[4:, None] * ch[None, :] < tiny).all()), "the tail's rh * ch must be subnormal in fp32"
+    rel = (step32.double() - step64).abs() / step64.abs().clamp_min(1e-300)
+    assert float(rel.max()) < 1e-4, (path, float(rel.max()), float(rel.median()))
+
+
 def test_tied_train_export_verify_load(setup):
     """Tied embeddings + MTP (Qwen3.5-4B shape) train, export and load.
 

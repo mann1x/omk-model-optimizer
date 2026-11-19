@@ -584,7 +584,10 @@ class Latent:
             self.t[sl] += a
             bc = (1 - ctl.beta2 ** self.t[sl].clamp(min=1))[:, None]
             rh, ch = self.r[sl] / bc, self.c[sl] / bc
-            v = rh[:, :, None] * ch[:, None, :] / rh.mean(-1).clamp(min=1e-30)[:, None, None]
+            # (rh / mean) * ch, never rh * ch / mean: rh ~ 1e-30 (the eps floor) times ch < 1e-8 is an fp32
+            # SUBNORMAL (< 1.2e-38) with 0-7 significant bits -- on a 248k-row head 90 % of the products were
+            # subnormal and 13 % flushed to 0, so the step of a tail row was rounding noise (bug-978, 2026-11-19).
+            v = (rh / rh.mean(-1).clamp(min=1e-30)[:, None])[:, :, None] * ch[:, None, :]
             u = g / v.sqrt().clamp(min=1e-15)
             rms = u.square().mean((1, 2)).sqrt()
             u /= (rms / ctl.clip).clamp(min=1.0)[:, None, None]
@@ -622,10 +625,10 @@ class Latent:
         self.t[e] += 1
         bc = 1 - ctl.beta2 ** self.t[e].clamp(min=1)
         rh, ch = self.r[e] / bc, self.c[e] / bc
-        den = rh.mean().clamp(min=1e-30)
+        rn = rh / rh.mean().clamp(min=1e-30)  # divided FIRST: rh * ch underflows fp32 on tail rows (bug-978)
 
         def u_of(r0: int, r1: int) -> torch.Tensor:
-            return g[r0:r1] / (rh[r0:r1, None] * ch[None, :] / den).sqrt().clamp(min=1e-15)
+            return g[r0:r1] / (rn[r0:r1, None] * ch[None, :]).sqrt().clamp(min=1e-15)
 
         sq = torch.zeros((), device=g.device)
         for r0, r1 in spans:
