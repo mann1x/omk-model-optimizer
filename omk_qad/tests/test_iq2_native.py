@@ -168,7 +168,7 @@ def test_force_ggml_takes_a_native_type_off_the_gpu(monkeypatch):
     assert F.force_ggml(["iq2_xxs"]) == {"IQ2_XXS"}
     assert "IQ2_XXS" not in F.NATIVE_TYPES and "IQ2_XXS" not in F.GPU_TYPES and "IQ2_S" in F.NATIVE_TYPES
     with pytest.raises(ValueError, match="not GPU-encoded"):
-        F.force_ggml(["IQ1_S"])  # the only types without a kernel are IQ1_S / IQ1_M (Q4_K has one since bm-901)
+        F.force_ggml(["F16"])  # every quant type is GPU-encoded now (IQ1_* by ModelOpt, the rest by kernels, bm-901)
 
 
 def test_kfac_rounder_routes_iq2_to_the_kernel():
