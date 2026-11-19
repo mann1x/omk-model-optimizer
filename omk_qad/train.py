@@ -2079,7 +2079,7 @@ def main(argv=None) -> None:
     ap.add_argument("--export-only", default="embedding", help="classes quantized at export only, not in training")
     ap.add_argument("--ggml-refresh", type=int, default=1, help="re-encode libggml-typed segments every N steps")
     ap.add_argument("--refresh", type=int, default=1,
-                    help="re-encode GPU-typed segments (ModelOpt IQ1/IQ2_XS/Q8_0, native IQ2/IQ3/IQ4) every N steps "
+                    help="re-encode GPU-typed segments (ModelOpt IQ1_S/IQ1_M, native IQ2/IQ3/IQ4/Q8_0) every N steps "
                          "instead of every update")
     ap.add_argument("--gate", type=float, default=0.01, help="max top-K KL of the unquantized student (lossless gate)")
     ap.add_argument("--eval-every", type=int, default=250)

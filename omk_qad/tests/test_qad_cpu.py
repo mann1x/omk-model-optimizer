@@ -91,6 +91,7 @@ def setup():
     if not text.exists():
         text.write_text((LLAMA_CPP / "README.md").read_text()[:60000])
     out["cache"] = _cache(*out["moe"], WORK / "cache_moe", text)
+    out["cache_dense"] = _cache(*out["dense"], WORK / "cache_dense", text)
     out["cache_mtp"] = _cache(*out["moe_mtp"], WORK / "cache_moe_mtp", text)
     out["cache_tied"] = _cache(*out["dense_tied"], WORK / "cache_dense_tied", text)
     out["text"] = text
@@ -186,8 +187,9 @@ def test_loop_weight_is_a_weighted_mean_and_reports_its_share(setup):
     role[:, :5] = 0
     role[0, 10:14], role[1, 20:24] = 3, 4
     got = {}
+    imat = str(setup["cache"] / "imatrix.pt")  # IQ2_XXS encodes only with an imatrix (as llama-quantize, bm-896)
     for w in (1.0, 5.0):
-        a = _args(model, mtp="freeze", anchor_weight=1.0, ul_weight=1.0, loop_weight=w)
+        a = _args(model, mtp="freeze", anchor_weight=1.0, ul_weight=1.0, loop_weight=w, imatrix=imat)
         student, lats, fp, _, head = T.build_student(a, torch.load(lay, weights_only=False))
         for lat in lats.values():
             lat.update = lambda g: None  # no step: both weights see the same model
@@ -216,11 +218,12 @@ def test_gradients_match_autograd(setup, kind):
     from omk_qad.ptq import load_text_causal_lm
 
     model, lay = setup[kind]
-    a = _args(model, ce_weight=0.3, loss_chunk=24, mtp="freeze")
+    cache = setup["cache" if kind == "moe" else "cache_tied"]
+    a = _args(model, ce_weight=0.3, loss_chunk=24, mtp="freeze", imatrix=str(cache / "imatrix.pt"))
     student, lats, fp, ctl, head = T.build_student(a, torch.load(lay, weights_only=False))
     if kind == "dense_tied":
         assert head == "model.embed_tokens.weight" and lats[head].segments  # trained, fake-quantized
-    sh = torch.load(setup["cache" if kind == "moe" else "cache_tied"] / "train_0000.pt")
+    sh = torch.load(cache / "train_0000.pt")
     x, idx, val = sh["x"][:2].long(), sh["idx"][:2], sh["val"][:2]
     cap = {}
     for n, lat in lats.items():
@@ -256,7 +259,8 @@ def test_descends_on_one_batch(setup):
     from omk_qad import train as T
 
     model, lay = setup["moe"]
-    a = _args(model, export_only="embedding,lm_head", loss_chunk=64, loss="kl")
+    a = _args(model, export_only="embedding,lm_head", loss_chunk=64, loss="kl",
+              imatrix=str(setup["cache"] / "imatrix.pt"))
     student, lats, fp, ctl, head = T.build_student(a, torch.load(lay, weights_only=False))
     opt = torch.optim.AdamW(fp, lr=3e-3, betas=(0.9, 0.95), weight_decay=0.0)
     sh = torch.load(setup["cache"] / "train_0000.pt")
@@ -327,11 +331,14 @@ def _flat(payload) -> np.ndarray:
 
 
 def test_dense_ptq_floor_export(setup):
-    """Dense arch: export without training (the PTQ floor at the plan) verifies and loads."""
+    """Dense arch: export without training (the PTQ floor at the plan) verifies and loads.
+
+    With the cache's imatrix: IQ2_XXS encodes only with one, in llama-quantize and in our kernel alike (bm-896).
+    """
     model, lay = setup["dense"]
     out = WORK / "ptq_dense.gguf"
     _run("omk_qad.train", "--phase", "export", "--model", str(model), "--layout", str(lay), "--device", "cpu",
-         "--gguf", str(out), "--latent-min", "65536")
+         "--gguf", str(out), "--latent-min", "65536", "--imatrix", str(setup["cache_dense"] / "imatrix.pt"))
     rep = json.loads(out.with_suffix(".export.json").read_text())
     assert rep["verify_failures"] == [] and rep["type_mismatches"] == []
     assert rep["type_counts"]["IQ2_XXS"] == 4 * 3

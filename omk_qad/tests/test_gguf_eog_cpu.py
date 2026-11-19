@@ -53,8 +53,13 @@ def g4():
                     sd[k] = torch.full_like(sd[k], 0.25 + 0.1 * layer)
             save_file(sd, str(shard), metadata={"format": "pt"})
     lay = WORK / "layout_g4.pt"
-    if not lay.exists():
-        torch.save(build_layout(model, LLAMA_CPP, "IQ2_M", work=WORK / "lay_g4"), lay)
+    # always re-plan: a layout cached across code changes goes stale (a pre-floor layout_g4.pt of 2026-11-14 with
+    # attention IQ2_S failed the export's Gemma-4 attention-floor check on 2026-11-19); the tiny plan takes seconds.
+    # Q4_K_M / Q4_K experts, not the IQ2_XXS defaults: the IQ2 kernels refuse to encode without an imatrix, as
+    # llama-quantize does (bm-896), and this test exports none; Q4_K_M puts the Gemma-4 attention floor at Q8_0
+    # (omk_qad.q8) and the experts on libggml.
+    torch.save(build_layout(model, LLAMA_CPP, "Q4_K_M", fixed={"routed_experts": "q4_k", "shared_experts": "q4_k"},
+                            work=WORK / "lay_g4"), lay)
     scalars = {}
     for shard in sorted(model.glob("*.safetensors")):
         for k, v in load_file(str(shard)).items():

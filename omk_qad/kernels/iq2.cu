@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-// IQ2_XXS / IQ2_S CUDA encoder for omk_qad: llama.cpp's quantize_row_iq2_xxs_impl / quantize_row_iq2_s_impl
-// (ggml-quants.c), operation by operation in float32, so the payload is byte-identical to libggml's (omk_qad/iq2.py
-// has the derivation, the lattice tables and the torch reference). Every product, sum, quotient and square root goes
-// through an explicit round-to-nearest intrinsic (no fused multiply-add; the extension is also built with
-// --fmad=false), in llama.cpp's order.
+// IQ2_XXS / IQ2_XS / IQ2_S CUDA encoder for omk_qad: llama.cpp's quantize_row_iq2_xxs_impl / quantize_row_iq2_xs_impl
+// / quantize_row_iq2_s_impl (ggml-quants.c), operation by operation in float32, so the payload is byte-identical to
+// libggml's (omk_qad/iq2.py has the derivation, the lattice tables and the torch reference). Every product, sum,
+// quotient and square root goes through an explicit round-to-nearest intrinsic (no fused multiply-add; the extension
+// is also built with --fmad=false), in llama.cpp's order.
 //
 // One thread per sub-block: IQ2_XXS 8 threads x 32 values per 256-value super-block (4 groups of 8 with parity
-// signs, make_qp_quants seed scale, 13 trial scales, every group re-snapped), IQ2_S 16 threads x 16 values
-// (2 groups of 8 with full sign bytes, 19 trial scales, off-grid groups re-snapped). Then the super-block sets the
-// fp16 scale (IQ2_S x 0.9875) and the 4-bit sub-block scales. The tables (grid of odd levels, kmap over the 43692
-// 2-bit codes, neighbour lists) come from omk_qad.iq2.tables, built exactly as iq2xs_init_impl builds them.
+// signs, make_qp_quants seed scale, 13 trial scales, every group re-snapped); IQ2_XS 16 threads x 16 values (2 groups
+// of 8 with parity signs on the 512-point grid, 19 trial scales, off-grid groups re-snapped); IQ2_S 16 threads x 16
+// values (2 groups of 8 with full sign bytes on the 1024-point grid, 19 trial scales, off-grid groups re-snapped).
+// Then the super-block sets the fp16 scale (IQ2_S x 0.9875) and the 4-bit sub-block scales. The tables (grid of odd
+// levels, kmap over the 43692 2-bit codes, neighbour lists) come from omk_qad.iq2.tables, built exactly as
+// iq2xs_init_impl builds them. Variant index kT: 0 = IQ2_XXS, 1 = IQ2_XS, 2 = IQ2_S (omk_qad.iq2.KIND).
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -24,6 +26,7 @@ namespace {
 constexpr int kMaxQ = 3;
 constexpr int kThreads = 256;
 constexpr int kXxsBytes = 66;
+constexpr int kXsBytes = 74;
 constexpr int kSBytes = 82;
 constexpr int kKmap = 43692;
 
@@ -144,16 +147,17 @@ __device__ __forceinline__ void store_half(uint8_t *p, float v) {
   *reinterpret_cast<uint16_t *>(p) = __half_as_ushort(__float2half_rn(v));
 }
 
-template <bool kS>
+template <int kT>
 __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_row, const float *importance, Tables t,
                            uint8_t *out) {
-  constexpr int kSub = kS ? 16 : 32;      // values per sub-block (one thread)
+  constexpr bool kXxs = kT == 0, kXs = kT == 1, kS = kT == 2;
+  constexpr int kSub = kXxs ? 32 : 16;    // values per sub-block (one thread)
   constexpr int kNsub = 256 / kSub;       // threads per super-block
   constexpr int kNg = kSub / 8;           // 8-value groups per sub-block
   constexpr int kGroups = kThreads / kNsub;  // super-blocks per CUDA block
-  constexpr int kNbytes = kS ? kSBytes : kXxsBytes;
+  constexpr int kNbytes = kXxs ? kXxsBytes : kXs ? kXsBytes : kSBytes;
   constexpr float kFudge = kS ? 0.9875f : 1.f;
-  constexpr float kEps = kS ? 1e-8f : 1e-15f;  // GROUP_MAX_EPS_IQ2_S / GROUP_MAX_EPS
+  constexpr float kEps = kS ? 1e-8f : 1e-15f;  // GROUP_MAX_EPS_IQ2_S / GROUP_MAX_EPS (IQ2_XXS and IQ2_XS)
   __shared__ float s_scale[kThreads];
   __shared__ uint8_t s_hi[kThreads];  // IQ2_S: the two grid-index high bits of each group, 2 bits each
   __shared__ float s_id[kGroups];
@@ -193,7 +197,7 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
           s |= static_cast<uint8_t>(1 << i);
         }
       }
-      if (!kS && (nflip % 2)) {  // IQ2_XXS: an even number of flips
+      if (!kS && (nflip % 2)) {  // IQ2_XXS and IQ2_XS: an even number of flips (7 sign bits + parity)
         int imin = 0;
         float mn = __fmul_rn(__fmul_rn(weight[8 * k], xb[8 * k]), xb[8 * k]);
         for (int i = 1; i < 8; ++i) {
@@ -210,7 +214,7 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
     for (int i = 0; i < kSub; ++i) L[i] = 0;
     skip = mx < kEps;
     float denom = mx;
-    if (!skip && !kS) {
+    if (!skip && kXxs) {  // IQ2_XXS alone seeds the scale with make_qp_quants
       uint8_t Lu[32];
       scale = make_qp_quants(xval, weight, Lu);
       denom = __fmul_rn(scale, static_cast<float>(kMaxQ));  // eff_max
@@ -218,9 +222,9 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
     }
     if (!skip) {
       float best = 0.f;
-      if (kS) scale = __fdiv_rn(mx, static_cast<float>(2 * kMaxQ - 1));
+      if (!kXxs) scale = __fdiv_rn(mx, static_cast<float>(2 * kMaxQ - 1));
       for (int k = 0; k < kNg; ++k) on[k] = true;
-      constexpr int lo = kS ? -9 : -6;
+      constexpr int lo = kXxs ? -6 : -9;
       for (int is = lo; is <= -lo; ++is) {
         const float id =
             __fdiv_rn(__fadd_rn(static_cast<float>(2 * kMaxQ - 1), __fmul_rn(static_cast<float>(is), 0.1f)), denom);
@@ -242,10 +246,10 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
       }
       int n_off = 0;
       for (int k = 0; k < kNg; ++k) n_off += on[k] ? 0 : 1;
-      if (scale > 0.f && (!kS || n_off > 0)) {  // IQ2_XXS re-snaps every group, IQ2_S only the off-grid ones
+      if (scale > 0.f && (kXxs || n_off > 0)) {  // IQ2_XXS re-snaps every group, IQ2_XS / IQ2_S the off-grid ones
         const float id = __fdiv_rn(1.f, scale);
         for (int k = 0; k < kNg; ++k) {
-          if (kS && on[k]) continue;
+          if (!kXxs && on[k]) continue;
           int8_t l8[8];
           for (int i = 0; i < 8; ++i) l8[i] = static_cast<int8_t>(level(id, xval[8 * k + i]));
           const int u = code(l8);
@@ -283,7 +287,7 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
   auto sub_scale = [&](int k) {  // the 4-bit scale of sub-block k of this super-block: nearest_int(0.5f*(id*s - 1))
     return max(0, min(15, __float2int_rn(__fmul_rn(0.5f, __fsub_rn(__fmul_rn(s_id[g], s_scale[th - ib + k]), 1.f)))));
   };
-  if (!kS) {  // q2[2 ib] = grid indices, q2[2 ib + 1] = 7-bit signs | 4-bit scale << 28
+  if (kXxs) {  // q2[2 ib] = grid indices, q2[2 ib + 1] = 7-bit signs | 4-bit scale << 28
     uint32_t w0 = 0, w1 = static_cast<uint32_t>(sub_scale(ib)) << 28;
     if (!skip) {
       w0 = gidx[0] | (gidx[1] << 8) | (gidx[2] << 16) | (gidx[3] << 24);
@@ -293,6 +297,17 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
       p[2 + 8 * ib + b] = static_cast<uint8_t>(w0 >> (8 * b));
       p[6 + 8 * ib + b] = static_cast<uint8_t>(w1 >> (8 * b));
     }
+    return;
+  }
+  if (kXs) {  // q2[2 ib + k] = grid index | 7-bit signs << 9 (uint16, little-endian), scales nibbles per ib pair
+    if (!skip) {
+      for (int k = 0; k < 2; ++k) {
+        const uint32_t w = static_cast<uint32_t>(gidx[k]) | (static_cast<uint32_t>(sgn[k]) << 9);
+        p[2 + 2 * (2 * ib + k)] = static_cast<uint8_t>(w & 0xFF);
+        p[3 + 2 * (2 * ib + k)] = static_cast<uint8_t>(w >> 8);
+      }
+    }
+    if (ib % 2 == 0) p[66 + ib / 2] = static_cast<uint8_t>(sub_scale(ib) | (sub_scale(ib + 1) << 4));
     return;
   }
   // IQ2_S: i8 = 2 ib + k: qs[i8] low index byte, qs[32 + i8] signs, qh[i8 / 4] 2 high bits each, scales nibbles
@@ -310,16 +325,19 @@ __global__ void iq2_encode(const float *x, int64_t nblocks, int64_t blocks_per_r
 
 }  // namespace
 
-at::Tensor iq2_pack_cuda(at::Tensor input, std::optional<at::Tensor> importance, bool s, at::Tensor grid,
+at::Tensor iq2_pack_cuda(at::Tensor input, std::optional<at::Tensor> importance, int64_t kind, at::Tensor grid,
                          at::Tensor kmap, at::Tensor neigh) {
-  const char *name = s ? "IQ2_S" : "IQ2_XXS";
+  TORCH_CHECK(kind >= 0 && kind <= 2, "iq2_pack: kind must be 0 (IQ2_XXS), 1 (IQ2_XS) or 2 (IQ2_S), got ", kind);
+  const bool s = kind == 2;
+  const char *name = kind == 0 ? "IQ2_XXS" : kind == 1 ? "IQ2_XS" : "IQ2_S";
+  const int64_t grid_n = kind == 0 ? 256 : kind == 1 ? 512 : 1024;
   TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kFloat && input.dim() == 2 && input.is_contiguous(),
               name, ": input must be a contiguous float32 CUDA [rows, cols] tensor");
   const int64_t rows = input.size(0), cols = input.size(1);
   TORCH_CHECK(cols % 256 == 0, name, ": cols must be a multiple of 256");
   TORCH_CHECK(grid.is_cuda() && grid.scalar_type() == at::kByte && grid.is_contiguous() &&
-                  grid.device() == input.device() && grid.numel() == (s ? 1024 : 256) * 8,
-              name, ": grid must be a contiguous uint8 [n, 8] tensor on the input's device");
+                  grid.device() == input.device() && grid.numel() == grid_n * 8,
+              name, ": grid must be a contiguous uint8 [", grid_n, ", 8] tensor on the input's device");
   for (const auto *tab : {&kmap, &neigh})
     TORCH_CHECK(tab->is_cuda() && tab->scalar_type() == at::kInt && tab->is_contiguous() &&
                     tab->device() == input.device(),
@@ -336,21 +354,22 @@ at::Tensor iq2_pack_cuda(at::Tensor input, std::optional<at::Tensor> importance,
   TORCH_CHECK(s || imp, name, ": requires an importance matrix (llama.cpp: 'missing quantization weights')");
   c10::cuda::CUDAGuard guard(input.device());
   const int64_t bpr = cols / 256, nblocks = rows * bpr;
-  const int nbytes = s ? kSBytes : kXxsBytes;
+  const int nbytes = kind == 0 ? kXxsBytes : kind == 1 ? kXsBytes : kSBytes;
   auto out = at::zeros({rows, bpr, nbytes}, input.options().dtype(at::kByte));
   if (nblocks == 0) return out;
   const Tables t{grid.data_ptr<uint8_t>(), kmap.data_ptr<int>(), neigh.data_ptr<int>()};
   const auto stream = c10::cuda::getCurrentCUDAStream();
-  if (s) {
-    constexpr int kGroups = kThreads / 16;
-    const unsigned nblk = static_cast<unsigned>((nblocks + kGroups - 1) / kGroups);
-    iq2_encode<true><<<nblk, kThreads, 0, stream>>>(input.data_ptr<float>(), nblocks, bpr, imp, t,
-                                                     out.data_ptr<uint8_t>());
-  } else {
+  const float *xp = input.data_ptr<float>();
+  uint8_t *op = out.data_ptr<uint8_t>();
+  if (kind == 0) {
     constexpr int kGroups = kThreads / 8;
     const unsigned nblk = static_cast<unsigned>((nblocks + kGroups - 1) / kGroups);
-    iq2_encode<false><<<nblk, kThreads, 0, stream>>>(input.data_ptr<float>(), nblocks, bpr, imp, t,
-                                                      out.data_ptr<uint8_t>());
+    iq2_encode<0><<<nblk, kThreads, 0, stream>>>(xp, nblocks, bpr, imp, t, op);
+  } else {
+    constexpr int kGroups = kThreads / 16;
+    const unsigned nblk = static_cast<unsigned>((nblocks + kGroups - 1) / kGroups);
+    if (kind == 1) iq2_encode<1><<<nblk, kThreads, 0, stream>>>(xp, nblocks, bpr, imp, t, op);
+    else iq2_encode<2><<<nblk, kThreads, 0, stream>>>(xp, nblocks, bpr, imp, t, op);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: D103, F811
-"""IQ2_XXS / IQ2_S as native QAD formats (omk_qad.iq2, bm-896).
+"""IQ2_XXS / IQ2_XS / IQ2_S as native QAD formats (omk_qad.iq2, bm-896; IQ2_XS bm-900 step 2).
 
 Bytes == libggml (llama-quantize) for the torch reference and the CUDA kernel, decode == gguf-py, no CPU fallback on
 a CUDA device, the codec and the K-FAC rounder route the types to the kernel, and a student trained at each type
@@ -25,18 +25,18 @@ from omk_qad.tests.test_native_quants import (
     test_train_export_ships_the_trained_blocks as _train_export,
 )
 
-QTYPES = ("IQ2_XXS", "IQ2_S")
+QTYPES = ("IQ2_XXS", "IQ2_XS", "IQ2_S")
 
 
 def _imats(qtype, imats):
-    """IQ2_XXS cannot be encoded without an imatrix (llama.cpp aborts); IQ2_S has a no-imatrix weighting."""
+    """IQ2_XXS / IQ2_XS cannot be encoded without an imatrix (llama.cpp aborts); IQ2_S has a no-imatrix weighting."""
     return [i for i in imats if i is not None or qtype == "IQ2_S"]
 
 
 def test_tables_match_iq2xs_init_impl():
     from omk_qad import iq2
 
-    for qtype, n, nwant in (("IQ2_XXS", 256, 2), ("IQ2_S", 1024, 1)):
+    for qtype, n, nwant in (("IQ2_XXS", 256, 2), ("IQ2_XS", 512, 2), ("IQ2_S", 1024, 1)):
         t = iq2.tables(qtype)
         assert t["grid"].shape == (n, 8) and set(np.unique(t["grid"])) == {1, 3, 5}
         assert t["kmap"].shape == (iq2.KMAP,) and (t["kmap"] >= 0).sum() == n  # every grid point maps to itself
@@ -67,9 +67,10 @@ def test_reference_bytes_equal_libggml(lib, qtype, seed):
         assert np.array_equal(_flat(got), want), (qtype, seed, imat is None)
 
 
-def test_iq2_xxs_requires_an_imatrix():
+@pytest.mark.parametrize("qtype", ["IQ2_XXS", "IQ2_XS"])
+def test_parity_types_require_an_imatrix(qtype):
     with pytest.raises(ValueError, match="requires an importance matrix"):
-        _mod("IQ2_XXS").encode("IQ2_XXS", torch.randn(2, 256))
+        _mod(qtype).encode(qtype, torch.randn(2, 256))
 
 
 @CUDA
@@ -136,8 +137,8 @@ def test_codec_cpu_path_is_the_reference(lib):
     codec = Codec(LLAMA_CPP)
     x, imats = _inputs(7, rows=8)  # 24 x 1024: _inputs' edge blocks need 1024 columns
     msq = torch.from_numpy(imats[1])
-    assert torch.equal(importance_for("IQ2_XXS", msq), msq.float())
     for qtype in QTYPES:
+        assert torch.equal(importance_for(qtype, msq), msq.float()), qtype  # raw E[x^2], no ModelOpt convention
         got = codec.encode(qtype, torch.from_numpy(x), importance_for(qtype, msq))
         want = lib.quantize(int(_gguf().GGMLQuantizationType[qtype]), x, imats[1]).reshape(-1)
         assert np.array_equal(_flat(got), want), qtype
@@ -167,7 +168,7 @@ def test_force_ggml_takes_a_native_type_off_the_gpu(monkeypatch):
     assert F.force_ggml(["iq2_xxs"]) == {"IQ2_XXS"}
     assert "IQ2_XXS" not in F.NATIVE_TYPES and "IQ2_XXS" not in F.GPU_TYPES and "IQ2_S" in F.NATIVE_TYPES
     with pytest.raises(ValueError, match="not GPU-encoded"):
-        F.force_ggml(["Q4_K"])
+        F.force_ggml(["IQ1_S"])  # the only types without a kernel are IQ1_S / IQ1_M (Q4_K has one since bm-901)
 
 
 def test_kfac_rounder_routes_iq2_to_the_kernel():
@@ -181,7 +182,7 @@ def test_kfac_rounder_routes_iq2_to_the_kernel():
 def test_census_formats_price_the_gguf_bytes():
     from omk_qad.census import FORMATS
 
-    for t in ("iq2_xxs", "iq2_s"):
+    for t in ("iq2_xxs", "iq2_xs", "iq2_s"):
         block, bits = FORMATS[t]
         assert bits * block / 8 == _mod(t.upper()).SPECS[t.upper()][1], t
 

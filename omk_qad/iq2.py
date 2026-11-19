@@ -1,19 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""IQ2_XXS / IQ2_S as native QAD formats: a CUDA encoder that reproduces llama.cpp's, and their decoder.
+"""IQ2_XXS / IQ2_XS / IQ2_S as native QAD formats: a CUDA encoder that reproduces llama.cpp's, and their decoder.
 
-The encoder is llama.cpp's ``quantize_row_iq2_xxs_impl`` / ``quantize_row_iq2_s_impl`` (ggml-quants.c) ported
-operation by operation, with the lattice tables built exactly as ``iq2xs_init_impl`` builds them (bm-896: ModelOpt's
-IQ2_XXS encoder scored 31 % worse than llama-quantize's on gemma-4-26B, so IQ2 went through libggml on the CPU):
+The encoder is llama.cpp's ``quantize_row_iq2_xxs_impl`` / ``quantize_row_iq2_xs_impl`` / ``quantize_row_iq2_s_impl``
+(ggml-quants.c) ported operation by operation, with the lattice tables built exactly as ``iq2xs_init_impl`` builds
+them (bm-896: ModelOpt's IQ2_XXS encoder scored 31 % worse than llama-quantize's on gemma-4-26B, so IQ2 went through
+libggml on the CPU; bm-900, 2026-11-19: ModelOpt's IQ2_XS produced none of llama-quantize's blocks either):
 
-  * sub-blocks of 32 (IQ2_XXS) / 16 (IQ2_S) values taken by magnitude with per-8 sign bits (IQ2_XXS: an even number
-    of flips, the least important value flipped back if needed, 7 stored bits + parity);
-  * weights ``qw * sqrt(sigma2 + x^2)`` with ``sigma2 = sum x^2 / 256`` (IQ2_XXS, imatrix mandatory) or
+  * sub-blocks of 32 (IQ2_XXS) / 16 (IQ2_XS, IQ2_S) values taken by magnitude with per-8 sign bits (IQ2_XXS and
+    IQ2_XS: an even number of flips, the least important value flipped back if needed, 7 stored bits + parity;
+    IQ2_S: 8 stored bits);
+  * weights ``qw * sqrt(sigma2 + x^2)`` with ``sigma2 = sum x^2 / 256`` (IQ2_XXS, IQ2_XS: imatrix mandatory) or
     ``2 sum x^2 / 256`` (IQ2_S; without an imatrix ``0.25 sigma2 + x^2``);
-  * 8-value groups snapped to a 256 (IQ2_XXS) / 1024 (IQ2_S) point grid of odd levels 1 / 3 / 5: a group off the
-    grid takes the best of its precomputed neighbours (2 / 1 nearest distance shells) under ``sqrt(weight)``;
+  * 8-value groups snapped to a 256 (IQ2_XXS) / 512 (IQ2_XS) / 1024 (IQ2_S) point grid of odd levels 1 / 3 / 5: a
+    group off the grid takes the best of its precomputed neighbours (2 / 2 / 1 nearest distance shells) under
+    ``sqrt(weight)``;
   * IQ2_XXS: a first scale from ``make_qp_quants`` (4 levels, 8 trial scales, 5 greedy passes), then 13 trial scales
-    ``(5 + 0.1 t) / (3 scale)``; IQ2_S: 19 trial scales ``(5 + 0.1 t) / max``. The best weighted fit wins, then a
-    re-snap at the winning scale (IQ2_XXS: every group; IQ2_S: the off-grid groups) and a final least-squares scale;
+    ``(5 + 0.1 t) / (3 scale)``; IQ2_XS and IQ2_S: 19 trial scales ``(5 + 0.1 t) / max``. The best weighted fit wins,
+    then a re-snap at the winning scale (IQ2_XXS: every group; IQ2_XS, IQ2_S: the off-grid groups) and a final
+    least-squares scale;
   * 256-value super-block: fp16 ``d = max_scale / 31`` (IQ2_S times 0.9875) and 4-bit sub-block scales.
 
 Every sum runs in llama.cpp's order in float32 without fused multiply-adds (``--fmad=false`` plus explicit
@@ -47,6 +51,41 @@ KGRID_2BIT_256 = (  # kgrid_2bit_256 (ggml-quants.c iq2xs_init_impl): 256 points
     25988, 26690, 32768, 32770, 32778, 32833, 32898, 33028, 33048, 33088, 33297, 33793, 33796, 33808, 33813, 33856,
     33888, 34048, 34118, 34196, 34313, 34368, 34400, 34818, 35076, 35345, 36868, 36880, 36900, 36928, 37025, 37142,
     37248, 37445, 37888, 37922, 37956, 38225, 39041, 39200, 40962, 41040, 41093, 41225, 41472, 42008, 43088, 43268,
+)
+
+KGRID_2BIT_512 = (  # kgrid_2bit_512 (ggml-quants.c iq2xs_init_impl): 512 points, 8 x 2-bit levels per point
+    0, 2, 5, 8, 10, 17, 20, 22, 25, 32, 34, 37, 40, 65, 68, 70,
+    73, 80, 82, 85, 88, 97, 100, 128, 130, 133, 136, 145, 148, 153, 160, 257,
+    260, 262, 265, 272, 274, 277, 280, 282, 289, 292, 320, 322, 325, 328, 337, 340,
+    352, 360, 385, 388, 400, 512, 514, 517, 520, 529, 532, 544, 577, 580, 592, 597,
+    640, 650, 1025, 1028, 1030, 1033, 1040, 1042, 1045, 1048, 1057, 1060, 1088, 1090, 1093, 1096,
+    1105, 1108, 1110, 1120, 1153, 1156, 1168, 1280, 1282, 1285, 1288, 1297, 1300, 1312, 1345, 1348,
+    1360, 1377, 1408, 1537, 1540, 1552, 1574, 1600, 1602, 1668, 2048, 2050, 2053, 2056, 2058, 2065,
+    2068, 2080, 2085, 2113, 2116, 2128, 2136, 2176, 2208, 2218, 2305, 2308, 2320, 2368, 2433, 2441,
+    2560, 2592, 2600, 2710, 2720, 4097, 4100, 4102, 4105, 4112, 4114, 4117, 4120, 4129, 4132, 4160,
+    4162, 4165, 4168, 4177, 4180, 4192, 4202, 4225, 4228, 4240, 4352, 4354, 4357, 4360, 4369, 4372,
+    4384, 4417, 4420, 4432, 4480, 4500, 4502, 4609, 4612, 4614, 4624, 4672, 4704, 5120, 5122, 5125,
+    5128, 5137, 5140, 5152, 5185, 5188, 5193, 5200, 5220, 5248, 5377, 5380, 5392, 5440, 5632, 5652,
+    5705, 6145, 6148, 6160, 6162, 6208, 6228, 6278, 6400, 6405, 6502, 6737, 6825, 8192, 8194, 8197,
+    8200, 8202, 8209, 8212, 8224, 8257, 8260, 8272, 8320, 8352, 8449, 8452, 8464, 8512, 8520, 8549,
+    8704, 8738, 8832, 8872, 9217, 9220, 9232, 9257, 9280, 9472, 9537, 9554, 9625, 9729, 9754, 9894,
+    10240, 10248, 10250, 10272, 10325, 10376, 10402, 10600, 10640, 10760, 10784, 10882, 10888, 10890, 16385, 16388,
+    16390, 16393, 16400, 16402, 16405, 16408, 16417, 16420, 16448, 16450, 16453, 16456, 16458, 16465, 16468, 16480,
+    16485, 16513, 16516, 16528, 16640, 16642, 16645, 16648, 16657, 16660, 16672, 16705, 16708, 16720, 16768, 16773,
+    16802, 16897, 16900, 16912, 16914, 16937, 16960, 17408, 17410, 17413, 17416, 17425, 17428, 17433, 17440, 17473,
+    17476, 17488, 17536, 17556, 17665, 17668, 17680, 17700, 17728, 17818, 17920, 17930, 17988, 18000, 18433, 18436,
+    18448, 18496, 18501, 18516, 18530, 18688, 18705, 18756, 18768, 18793, 18948, 20480, 20482, 20485, 20488, 20497,
+    20500, 20512, 20520, 20545, 20548, 20560, 20608, 20737, 20740, 20752, 20757, 20800, 20802, 20992, 21060, 21162,
+    21505, 21508, 21520, 21537, 21568, 21600, 21633, 21665, 21760, 21768, 21888, 21896, 22049, 22120, 22177, 22528,
+    22548, 22593, 22608, 22681, 22810, 22848, 22850, 23173, 24577, 24580, 24592, 24640, 24660, 24674, 24710, 24745,
+    24832, 25124, 25162, 25234, 25600, 25622, 25872, 25920, 25925, 26020, 26625, 26730, 26917, 27142, 27220, 27234,
+    32768, 32770, 32773, 32776, 32785, 32788, 32800, 32810, 32833, 32836, 32848, 32896, 32898, 32936, 32938, 33025,
+    33028, 33030, 33040, 33088, 33105, 33113, 33280, 33312, 33408, 33410, 33440, 33448, 33793, 33796, 33808, 33810,
+    33813, 33856, 33888, 33929, 34048, 34116, 34213, 34328, 34410, 34816, 34824, 34853, 34906, 34944, 34946, 34984,
+    35078, 35362, 35456, 35464, 35478, 35496, 36865, 36868, 36880, 36928, 36950, 36996, 37120, 37154, 37220, 37462,
+    37513, 37888, 37893, 37956, 37968, 37976, 38185, 38288, 38290, 38465, 38993, 39078, 39241, 39445, 39520, 40960,
+    40962, 40968, 40970, 40992, 41002, 41120, 41297, 41305, 41382, 41472, 41474, 41480, 41514, 41600, 41632, 42048,
+    42133, 42597, 42648, 43018, 43040, 43042, 43048, 43168, 43176, 43268, 43396, 43398, 43560, 43562, 43665, 43690,
 )
 
 KGRID_2BIT_1024 = (  # kgrid_2bit_1024 (ggml-quants.c iq2xs_init_impl): 1024 points, 8 x 2-bit levels per point
@@ -116,23 +155,27 @@ KGRID_2BIT_1024 = (  # kgrid_2bit_1024 (ggml-quants.c iq2xs_init_impl): 1024 poi
     42148, 42240, 42265, 42577, 43018, 43048, 43170, 43348, 43398, 43528, 43530, 43552, 43554, 43560, 43656, 43690,
 )
 
-SPECS = {"IQ2_XXS": (256, 66), "IQ2_S": (256, 82)}  # type: (values per block, bytes per block)
+SPECS = {"IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ2_S": (256, 82)}  # qtype -> (values per block, bytes per block)
 TYPES = frozenset(SPECS)
+KIND = {"IQ2_XXS": 0, "IQ2_XS": 1, "IQ2_S": 2}  # the kernel's variant index
+PARITY = frozenset({"IQ2_XXS", "IQ2_XS"})  # 7 sign bits + parity (an even number of flips); imatrix mandatory
 KMAXQ = 3  # levels 0..2 -> odd values 1 / 3 / 5
 KMAP = 43692  # iq2xs_init_impl's kmap_size: codes of 8 x 2-bit levels <= 2 (0xAAAA + 2)
-EPS = {"IQ2_XXS": np.float32(1e-15), "IQ2_S": np.float32(1e-8)}  # GROUP_MAX_EPS / GROUP_MAX_EPS_IQ2_S
+EPS = {"IQ2_XXS": np.float32(1e-15), "IQ2_XS": np.float32(1e-15), "IQ2_S": np.float32(1e-8)}  # GROUP_MAX_EPS[_IQ2_S]
 _CFG = {  # grid points, distance shells kept per off-grid point, sub-block, trial scales, fp16 fudge
     "IQ2_XXS": (256, 2, 32, range(-6, 7), np.float32(1.0)),
+    "IQ2_XS": (512, 2, 16, range(-9, 10), np.float32(1.0)),
     "IQ2_S": (1024, 1, 16, range(-9, 10), np.float32(0.9875)),
 }
-_DEC = np.array([8, 25, 43], dtype=np.float32)  # iq2xxs_grid / iq2s_grid bytes per level (dequantize scale 0.25)
+_KGRID = {256: KGRID_2BIT_256, 512: KGRID_2BIT_512, 1024: KGRID_2BIT_1024}
+_DEC = np.array([8, 25, 43], dtype=np.float32)  # iq2xxs/iq2xs/iq2s_grid bytes per level (dequantize scale 0.25)
 
 
 @cache
 def tables(qtype: str) -> dict[str, np.ndarray]:
     """iq2xs_init_impl: grid (odd levels), kmap (index or -(neighbour offset + 1)), neighbour lists, decoder grid."""
     n, nwant = _CFG[qtype][:2]
-    kgrid = KGRID_2BIT_256 if n == 256 else KGRID_2BIT_1024
+    kgrid = _KGRID[n]
     grid = np.array([[2 * ((g >> 2 * i) & 3) + 1 for i in range(8)] for g in kgrid], dtype=np.int32)  # [n, 8]
     kmap = np.full(KMAP, -1, dtype=np.int32)
     kmap[[sum(((v - 1) // 2) << 2 * i for i, v in enumerate(p)) for p in grid]] = np.arange(n, dtype=np.int32)
@@ -192,7 +235,7 @@ def _ext():
             name="omk_cuda_ext_iq2",
             sources=[here / "iq2.cpp", here / "iq2.cu"],
             cuda_version_specifiers=">=11.8",
-            fail_msg="omk_qad IQ2_XXS/IQ2_S CUDA encoder is unavailable (no CPU fallback on a CUDA device).",
+            fail_msg="omk_qad IQ2_XXS/IQ2_XS/IQ2_S CUDA encoder is unavailable (no CPU fallback on a CUDA device).",
             extra_cuda_cflags=["-O3", "--fmad=false"],
             raise_if_failed=True,
         )
@@ -205,8 +248,8 @@ def _check(qtype: str, x: torch.Tensor, importance: torch.Tensor | None) -> None
     if x.dim() != 2 or x.dtype != torch.float32 or x.shape[1] % 256:
         raise ValueError(f"{qtype} needs float32 [rows, cols] with cols a multiple of 256, got {x.dtype} "
                          f"{tuple(x.shape)}")
-    if importance is None and qtype == "IQ2_XXS":
-        raise ValueError("IQ2_XXS requires an importance matrix (llama.cpp: 'missing quantization weights')")
+    if importance is None and qtype in PARITY:
+        raise ValueError(f"{qtype} requires an importance matrix (llama.cpp: 'missing quantization weights')")
     if importance is not None and (importance.dim() != 1 or importance.numel() != x.shape[1]):
         raise ValueError(f"importance must be [cols={x.shape[1]}], got {tuple(importance.shape)}")
 
@@ -218,11 +261,11 @@ def encode(qtype: str, x: torch.Tensor, importance: torch.Tensor | None = None) 
         return encode_reference(qtype, x, importance)
     t = _dev_tables(qtype, x.device)
     imp = None if importance is None else importance.to(device=x.device, dtype=torch.float32).contiguous()
-    return _ext().iq2_pack(x.contiguous(), imp, qtype == "IQ2_S", t["grid_u8"], t["kmap_i32"], t["neigh_i32"])
+    return _ext().iq2_pack(x.contiguous(), imp, KIND[qtype], t["grid_u8"], t["kmap_i32"], t["neigh_i32"])
 
 
 def decode(qtype: str, packed: torch.Tensor, rows: int, cols: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """[rows, cols] values of a payload (llama.cpp's dequantize_row_iq2_xxs / _s), on the payload's device."""
+    """[rows, cols] values of a payload (llama.cpp's dequantize_row_iq2_xxs / _xs / _s), on the payload's device."""
     nbytes = SPECS[qtype][1]
     p = packed.reshape(-1, nbytes)
     t = _dev_tables(qtype, p.device)
@@ -233,6 +276,13 @@ def decode(qtype: str, packed: torch.Tensor, rows: int, cols: int, dtype: torch.
         gi = (q[:, :, 0, None] >> (8 * torch.arange(4, device=p.device))) & 0xFF  # [B, 8, 4]
         db = (d * ((q[:, :, 1] >> 28).float() + 0.5)) * 0.25  # [B, 8]
         sg = t["ksigns"][(q[:, :, 1, None] >> (7 * torch.arange(4, device=p.device))) & 127]  # [B, 8, 4]
+    elif qtype == "IQ2_XS":
+        q = p[:, 2:66].contiguous().view(torch.int16).long().reshape(-1, 8, 4) & 0xFFFF  # qs[4 ib32 + l]: 9 + 7 bits
+        gi = q & 511
+        sg = t["ksigns"][q >> 9]  # [B, 8, 4]
+        sc = p[:, 66:74].long()  # [B, 8]: low nibble -> l 0..1, high nibble -> l 2..3
+        db = torch.stack([(d * ((sc & 0xF).float() + 0.5)) * 0.25, (d * ((sc >> 4).float() + 0.5)) * 0.25], 2)
+        db = db.repeat_interleave(2, 2)  # [B, 8, 4]
     else:
         qs = p[:, 2:34].long().reshape(-1, 8, 4)  # [B, ib32, l]
         qh = p[:, 66:74].long()  # [B, 8]
@@ -353,6 +403,7 @@ def _search(qtype: str, xs: torch.Tensor, w: torch.Tensor):
     _, _, sub, trials, _ = _CFG[qtype]
     ng = sub // 8
     xxs = qtype == "IQ2_XXS"
+    parity = qtype in PARITY
     t = _dev_tables(qtype, xs.device)
     ns = xs.shape[0]
     wa = torch.sqrt(w.double()).float()  # correctly rounded sqrtf
@@ -360,7 +411,7 @@ def _search(qtype: str, xs: torch.Tensor, w: torch.Tensor):
     xval = torch.where(neg, -xs, xs)
     bits = 1 << torch.arange(8, device=xs.device)
     sgn = (neg.reshape(ns, ng, 8).long() * bits).sum(-1)  # [S, ng]
-    if xxs:  # an even number of flips: flip back the least important value of an odd group
+    if parity:  # an even number of flips: flip back the least important value of an odd group
         odd = neg.reshape(ns, ng, 8).sum(-1) % 2 == 1
         imin = ((w * xs) * xs).reshape(ns, ng, 8).argmin(-1)  # first minimum (strict <)
         flat = (torch.arange(ng, device=xs.device) * 8 + imin)[odd]
@@ -405,7 +456,7 @@ def _search(qtype: str, xs: torch.Tensor, w: torch.Tensor):
         scale = torch.where(need & (sumq2 > 0), sumqx / torch.where(sumq2 > 0, sumq2, torch.ones_like(sumq2)), scale)
     flip = scale < 0  # "should never happen": positive scale, flipped signs
     scale = torch.where(flip, -scale, scale)
-    sgn = torch.where(flip[:, None], ~sgn & (127 if xxs else 255), sgn)
+    sgn = torch.where(flip[:, None], ~sgn & (127 if parity else 255), sgn)
     scale = torch.where(skip, torch.zeros_like(scale), scale)
     lev = torch.where(skip[:, None], torch.zeros_like(lev), lev)
     u = (lev.reshape(ns, ng, 8) << (2 * torch.arange(8, device=xs.device))).sum(-1)
@@ -419,7 +470,7 @@ def _weights(qtype: str, x: torch.Tensor, imp: torch.Tensor | None) -> torch.Ten
     sigma2 = torch.zeros(x.shape[0], dtype=torch.float32, device=x.device)
     for j in range(256):
         sigma2 = sigma2 + x[:, j] * x[:, j]
-    if qtype == "IQ2_XXS":
+    if qtype in PARITY:
         sigma2 = sigma2 / _f32(256, sigma2)
     else:
         sigma2 = (2 * sigma2) / _f32(256, sigma2)
@@ -462,6 +513,12 @@ def encode_reference(qtype: str, x: torch.Tensor, importance: torch.Tensor | Non
         words = torch.stack([w0, w1], 2).reshape(nb, 16)  # q2[2 ib + 0], q2[2 ib + 1]
         body = torch.stack([(words >> s) & 0xFF for s in (0, 8, 16, 24)], 2).reshape(nb, 64)
         out[:, 2:] = torch.where(live[:, None], body, torch.zeros_like(body)).to(torch.uint8)
+        return out.reshape(rows, cols // 256, nbytes)
+    if qtype == "IQ2_XS":  # q2[2 ib + k] = grid index | signs << 9 (uint16, 32 per block), scales nibbles per ib pair
+        words = (gi | (sgn << 9)).reshape(nb, 32)
+        out[:, 2:66] = torch.stack([words & 0xFF, words >> 8], 2).reshape(nb, 64).to(torch.uint8)
+        out[:, 66:74] = (lsc[:, 0::2] | (lsc[:, 1::2] << 4)).to(torch.uint8)
+        out = torch.where(live[:, None], out, torch.zeros_like(out))  # a dead super-block is all zero (memset)
         return out.reshape(rows, cols // 256, nbytes)
     # IQ2_S: i8 = 2 ib + k: qs[i8] (low byte), signs at qs[32 + i8], qh[i8 / 4] 2 bits each, scales nibbles per ib
     g = gi.reshape(nb, 32)
