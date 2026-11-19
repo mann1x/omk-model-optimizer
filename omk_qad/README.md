@@ -3,6 +3,7 @@
 Repo overview, recipes, datasets, evaluations and per-model results: [`.github/README.md`](../.github/README.md).
 
 User guides, one per mode: [QAD](../omk/docs/qad.md) · [ternary recovery](../omk/docs/ternary.md) ·
+[K-FAC rounding of llama-quantize GGUFs](../omk/docs/kfac-rounding.md) ·
 [BF16 recovery](../omk/docs/bf16-recovery.md) · [QAD + ternary on one or more GPUs](../omk/docs/qad-ternary-together.md).
 This page is the module reference.
 

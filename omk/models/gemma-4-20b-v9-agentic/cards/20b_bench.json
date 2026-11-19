@@ -1,19 +1,21 @@
 {
- "title": "Canonical 9-bench suite on the K-FAC Q6_K (sft12) — running",
- "basis": "llama.cpp b12386 (+ the PEG-degrade patch), two RTX 3090, `--parallel 2`, greedy decoding with `presence_penalty 0.025` and no repetition penalty (the model's deployment profile `gemma-4-v9-agentic-sft11`, sampler `greedy_pres`), thinking on with the templates' budgets, scores read from each bench's `summary.json`. The *previous build* column is the 2026-10-17 model's published Q6_K run (plain `llama-quantize`, greedy with `repeat_penalty 1.06 / repeat_last_n 96 / presence 0.025`, llama.cpp b9700): a different model and sampler, shown for reference only.",
- "columns": ["previous build (2026-10) Q6_K", "sft12 · K-FAC Q6_K"],
+ "title": "Canonical suite — v9-agentic (sft12, K-FAC Q6_K) against its parent and v7-coder",
+ "basis": "The v9-agentic column is one run of the K-FAC Q6_K (sha 56cc506911569bb1) on pod 60948837 (two RTX 3090, 2026-11-16 19:16Z → 2026-11-17 03:59Z): llama.cpp b12386 (+ the PEG-degrade patch), `--parallel 2`, greedy decoding with `presence_penalty 0.025` and no repetition penalty (the model's deployment profile, sampler `greedy_pres`), thinking on with the templates' budgets, scores read from each bench's `summary.json`. The 128e and v7-coder columns are the cells carried on this model line's cards since the first v9-agentic release: each model on its own Q6_K, greedy, llama.cpp b9700, their own samplers (see the weights card for the per-model sampler and loop counts). Same prompts and scorers; the sampler and server build differ across columns, so read gaps of a few points as basis, not model.",
+ "columns": ["gemma-4-26B-A4B-it (128e, parent)", "gemma-4-26B-A4B-v7-coder", "gemma-4-20B-v9-agentic (sft12) · K-FAC Q6_K"],
  "rows": [
-  {"name": "GPQA-diamond (198q)", "values": [55.56, null]},
-  {"name": "AIME (30q)", "values": [86.67, null]},
-  {"name": "MATH500 (100q)", "values": [81.00, null]},
-  {"name": "GSM8K (100q, qwen stops)", "values": [97.00, null]},
-  {"name": "ARC-Challenge (full)", "values": [86.77, null]},
-  {"name": "IFEval (100q, strict)", "values": [96.00, null]},
-  {"name": "HumanEval (164)", "values": [98.17, 98.17]},
-  {"name": "HumanEval+ (164)", "values": [90.24, 90.85]},
-  {"name": "LCB-medium-55 v4", "values": [98.18, null]},
-  {"name": "LCB-medium-100 v4", "values": [97.00, null]},
-  {"name": "MultiPL-E (100 × 3, native)", "values": [90.00, null]}
+  {"name": "GPQA-diamond (198q)", "values": [67.17, 51.52, 47.98]},
+  {"name": "AIME (30q)", "values": [73.33, 80.00, 76.67]},
+  {"name": "MATH500 (100q)", "values": [92.00, 95.00, 83.00]},
+  {"name": "GSM8K (100q)", "values": [89.00, 91.00, 94.00]},
+  {"name": "ARC-Challenge (full)", "values": [96.50, 92.15, 87.03]},
+  {"name": "IFEval (100q, strict)", "values": [97.00, 92.00, 94.00]},
+  {"name": "HumanEval (164)", "values": [97.56, 98.17, 98.17]},
+  {"name": "HumanEval+ (164)", "values": [92.07, 92.07, 90.85]},
+  {"name": "LCB-medium-55 v4", "values": [96.36, 98.18, 94.55]},
+  {"name": "LCB-medium-100 v4", "values": [97.00, 94.00, 95.00]},
+  {"name": "LCB-hard-77", "values": [79.22, 84.42, 87.01]},
+  {"name": "MultiPL-E (100 × 3, native)", "values": [90.00, 89.67, 89.33]},
+  {"name": "tool-eval-bench hardmode (176 pts, Q4_K_M, 5 seeds)", "values": [null, null, 142.6]}
  ],
- "notes": "Metrics: GPQA & GSM8K = `exact_match` flexible-extract · MATH500 = `math_verify` · ARC & AIME = `exact_match` · IFEval = `prompt_level_strict_acc` · HumanEval/+ = `pass@1` chat-extract · LCB & MultiPL-E = `pass@1`. Empty cells are still running; the table is refreshed as each bench finishes."
+ "notes": "Metrics: GPQA & GSM8K = `exact_match` flexible-extract · MATH500 = `math_verify` · ARC & AIME = `exact_match` · IFEval = `prompt_level_strict_acc` · HumanEval/+ = `pass@1` chat-extract · LCB & MultiPL-E = `pass@1` · tool-eval-bench = mean Total Points over seeds 42–46 (95 % CI 141.2–144.0; per seed 143 / 141 / 144 / 143 / 142), scorer 2.6.0, `--hardmode --weight-by-difficulty`, 64k context, pressure 0.25, on the **K-FAC Q4_K_M** with greedy + `presence_penalty 0.035`, stock llama.cpp b12386 on an RTX PRO 6000; 6th of 12 in the in-house 64k cohort (omnimerge-v6 156.4, qwen3.8-27b 150.8, ornith-1.5-35b 146.2, omnimerge-v4 146.2, qwen3.6-27b 144.0, **this build 142.6**, qwen3.6-35b-a3b 141.6, previous v9-agentic build 137.6, a3b-coderx 137.4, ornith-27b-coder 136.8, ornith-27b-coderx 134.0, a3b-coder 123.2); the parent and v7-coder have no cell in that cohort. Empty cell = not run for this build. Raw `summary.json` / samples of the v9-agentic column: `google/v9a_sft11/mlk8-noa-sft12/pod_q6k_kfac_eval/`; tool-eval-bench reports: `omnimergekit/eval/toolbench/cohort64k_v9sft12/`."
 }

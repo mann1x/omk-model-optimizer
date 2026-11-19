@@ -247,12 +247,28 @@ numbers in the commit message and in the card's table. Scripts as run: [`kfac/`]
   Ladder: Q8_0, Q6_K, Q5_K_M, Q5_K_S, Q4_K_M, Q4_K_S, IQ4_XS, IQ4_NL, Q3_K_M, IQ3_M, IQ3_XS, IQ3_XXS, IQ2_M, IQ2_S,
   IQ2_XS + IQ2_XXS from the QAD.
 
-| tier | size | llama-quantize + imatrix | K-FAC | ΔKL |
+| tier | size (GiB) | llama-quantize + imatrix | K-FAC | ΔKL |
 |---|---:|---:|---:|---:|
-| Q4_K_M (attention Q8_0) | 17.33 GB | 0.00798 / 0.9796 | **0.00660 / 0.9815** | −17.3 % |
-| IQ4_XS (attention Q6_K) | 14.24 GB | 0.01530 / 0.9715 | **0.01157 / 0.9751** | −24.4 % |
+| Q8_0 | 25.02 | 0.00236 / 0.9893 | **0.00223 / 0.9895** | −5.5 % |
+| Q6_K | 21.33 | 0.00280 / 0.9881 | **0.00259 / 0.9887** | −7.5 % |
+| Q5_K_M | 18.20 | 0.00419 / 0.9855 | **0.00376 / 0.9863** | −10.3 % |
+| Q5_K_S | 17.14 | 0.00456 / 0.9847 | **0.00408 / 0.9858** | −10.5 % |
+| Q4_K_M | 16.14 | 0.00798 / 0.9796 | **0.00660 / 0.9815** | −17.3 % |
+| Q4_K_S | 14.67 | 0.01019 / 0.9766 | **0.00882 / 0.9788** | −13.5 % |
+| IQ4_XS | 13.26 | 0.01530 / 0.9715 | **0.01157 / 0.9751** | −24.4 % |
+| IQ4_NL | 13.71 | 0.01495 / 0.9717 | **0.01159 / 0.9753** | −22.5 % |
+| Q3_K_M | 12.71 | 0.03656 / 0.9564 | **0.02167 / 0.9664** | −40.7 % |
+| IQ3_M | 11.88 | 0.02476 / 0.9634 | **0.02001 / 0.9676** | −19.2 % |
+| IQ3_XS | 11.27 | 0.03531 / 0.9556 | **0.02641 / 0.9630** | −25.2 % |
+| IQ3_XXS | 11.02 | 0.04100 / 0.9542 | **0.02825 / 0.9615** | −31.1 % |
+| IQ2_M | 10.11 | 0.07626 / 0.9358 | **0.05413 / 0.9479** | −29.0 % |
+| IQ2_S | 9.65 | 0.09346 / 0.9282 | **0.07069 / 0.9405** | −24.4 % |
+| IQ2_XS | 9.65 | 0.09309 / 0.9285 | **0.07082 / 0.9406** | −23.9 % |
+| IQ2_XXS (E6, seeded QAD step 600) | 9.5 | 0.0675 / 0.9392 | **0.0485 / 0.9496** | −28.2 % |
 
-(44 rows, top-256 KL / top-1 vs the bf16 teacher; the complete table is regenerated on the GGUF card as tiers land.)
+(44 rows, 256,853 assistant positions, top-256 KL / top-1 vs the bf16 teacher; attention Q8_0 from Q4_K_M up, Q6_K
+below; stock and K-FAC files have identical byte counts. Per-family breakdown and the reading of the table:
+[`docs/kfac-rounding.md §6`](../../docs/kfac-rounding.md#6-results); the GGUF card carries the same table with shas.)
 
 ### IQ2_XXS: QAD seeded from the K-FAC rounding
 

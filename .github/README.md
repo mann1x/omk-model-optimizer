@@ -22,6 +22,14 @@ root [`README.md`](../README.md), untouched. Everything omk adds lives in `omk_q
 QAD and ternary students of one model share one teacher cache and train side by side, on one GPU or several:
 [`omk/docs/qad-ternary-together.md`](../omk/docs/qad-ternary-together.md).
 
+**And one post-training method, no training at all — K-FAC rounding** ([`omk/docs/kfac-rounding.md`](../omk/docs/kfac-rounding.md)):
+the MLP tensors of any `llama-quantize` GGUF are re-rounded against the model's Kronecker-factored curvature
+(`H ≈ G ⊗ A`, collected once per model) with llama.cpp's own encoders, so the file keeps the stock layout, size and
+metadata and runs everywhere, with 6 % (Q8_0) to 41 % (Q3_K_M) less quantization KL at identical size. Its latents also
+seed the IQ2_XXS QAD students. Every tier of the two published Gemma-4 agentic GGUF repos is built this way; the guide
+walks through what K-FAC is, how it descends from OBS / OBQ / GPTQ, how to build a ladder tier by tier, and the
+measured results.
+
 | | |
 |---|---|
 | [Install](#install) | conda env, llama.cpp, CUDA toolkit |
@@ -138,6 +146,20 @@ Head-to-head on the `manic_miner` agentic repair task (SDK 4.100.277, 20 runs ea
 Pass rate is relative to the 30-minute budget (Fisher exact p = 0.0079). Full analysis, known weaknesses, corpus build,
 every script as run, reproduce commands and GGUF build in the model section.
 
+GGUF ladder: 16 tiers, every one **K-FAC rounded** (IQ2_XXS = QAD seeded from the K-FAC rounding), held-out top-256
+KL vs the bf16 teacher at identical bytes:
+
+| tier | size | llama-quantize + imatrix | **K-FAC** | ΔKL |
+|---|---:|---:|---:|---:|
+| Q6_K | 21.33 GiB | 0.00280 / 0.9881 | **0.00259 / 0.9887** | −7.5 % |
+| Q4_K_M | 16.14 GiB | 0.00798 / 0.9796 | **0.00660 / 0.9815** | −17.3 % |
+| IQ4_XS | 13.26 GiB | 0.01530 / 0.9715 | **0.01157 / 0.9751** | −24.4 % |
+| Q3_K_M | 12.71 GiB | 0.03656 / 0.9564 | **0.02167 / 0.9664** | −40.7 % |
+| IQ3_XXS | 11.02 GiB | 0.04100 / 0.9542 | **0.02825 / 0.9615** | −31.1 % |
+| IQ2_XXS (seeded QAD) | 9.5 GiB | 0.0675 / 0.9392 | **0.0485 / 0.9496** | −28.2 % |
+
+All 16 tiers, the per-family breakdown and the 20B v9-agentic ladder: [`omk/docs/kfac-rounding.md §6`](../omk/docs/kfac-rounding.md#6-results).
+
 ## Upstream
 
 `main` is a fast-forward mirror of `NVIDIA/Model-Optimizer`; `omk-main` (default) is upstream plus omk's additive
@@ -149,7 +171,7 @@ commits touching the ModelOpt modules `omk_qad` imports, and checks the additive
 
 ```
 omk_qad/                 the package (layout, fakequant, train, export, multi, ternary, ...) + tests + conda_env/
-omk/docs/                mode guides (qad, ternary, bf16-recovery, qad-ternary-together), install, evaluation, upstream
+omk/docs/                mode guides (qad, ternary, bf16-recovery, qad-ternary-together), kfac-rounding, install, evaluation, upstream
 omk/datasets/            source catalogue + builders (stage_assets, build_mix, extract_stage2_prompts)
 omk/models/<model>/      README (corpus, recipe, results), recipe spec, corpus/ manifests, evals/ (scripts, results)
 omk/scripts/             upstream_status.sh, he_samples.py, install-git-hooks.sh
