@@ -28,5 +28,8 @@ $ENV/bin/python -m omk_qad.multi --spec SPEC.yaml all
 ```
 
 `GGML IQ CUDA packing extension is unavailable` in a log is a failure (the trainer falls back to CPU encoding,
-~25× slower). Tests: `CUDA_VISIBLE_DEVICES= $ENV/bin/python -m pytest -o addopts="" omk_qad/tests/` (CPU suite; the
-GPU must be hidden).
+~25× slower). Tests: see **[testing.md](testing.md)** — validate a change with its impacted tests
+(`omk_qad/tests/omk_test.sh impact` / `run NAME --impact`), run suites or single tests, pause / resume named runs;
+the full 2.5 h CPU suite (`omk_test.sh run full`) is for the end of a stint, an upstream sync, or on demand.
+`-o addopts=""` is mandatory for a bare pytest call (the runner adds it). Every failure is logged **as it happens**
+(`OMK_TEST_FAILED <nodeid>` + traceback tail), so a killed run still names what failed.
