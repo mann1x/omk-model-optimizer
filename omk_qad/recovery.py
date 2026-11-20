@@ -71,6 +71,8 @@ def scope_params(model: nn.Module, scope: str, train_router: bool = False) -> li
         want = {c for c in scope.split(":", 1)[1].split(",") if c}
         router_full = "router_full" in want  # not a census class: the whole Gemma-4 router block, see below
         want.discard("router_full")
+        attn_norms = "attn_norms" in want  # not a census class either: the attention-side RMSNorm scales, see below
+        want.discard("attn_norms")
         mods = {e.module for e in classify_model(model).entries if e.cls in want}
         if "vectors" in want:
             mods.add("<1-D vectors>")
@@ -78,6 +80,8 @@ def scope_params(model: nn.Module, scope: str, train_router: bool = False) -> li
                if n.rsplit(".", 1)[0] in mods or n in mods or ("<1-D vectors>" in mods and p.ndim < 2)]
         if router_full:
             hit = sorted(set(hit) | set(router_full_params(model)))
+        if attn_norms:
+            hit = sorted(set(hit) | set(attn_norm_params(model)))
         if not hit:
             raise SystemExit(f"REFUSE: classes {sorted(want)} match no parameter")
         return hit
@@ -95,6 +99,14 @@ GEMMA4_ROUTER_FULL_RE = (r"model\.layers\.\d+\.(router\.(proj\.weight|scale|per_
                          r"|(pre_feedforward_layernorm|post_feedforward_layernorm|pre_feedforward_layernorm_2"
                          r"|post_feedforward_layernorm_1|post_feedforward_layernorm_2)\.weight)")
 ROUTER_FULL_PER_LAYER = 8
+# ``classes:...,attn_norms``: the four attention-side RMSNorm scales of a layer (bm-898 follow-up arm, owner 2026-11-20
+# "we should try with the attention": router_full moved the loss and the looping by almost nothing). q_norm / k_norm
+# set how peaked the attention logits are (one known route into repetition loops); input_layernorm and
+# post_attention_layernorm are the attention block's residual read and write gains. The attention MATRICES are already
+# in the ``attention`` class. The final ``model.norm`` and the vision norms stay out.
+GEMMA4_ATTN_NORMS_RE = (r"model\.layers\.\d+\.(self_attn\.(q_norm|k_norm)|input_layernorm|post_attention_layernorm)"
+                        r"\.weight")
+ATTN_NORMS_PER_LAYER = 4
 
 
 def fp_param_groups(fp_params: list, fp_lr: float, scale: str = "none") -> list[dict]:
@@ -129,6 +141,18 @@ def router_full_params(model: nn.Module) -> list[str]:
         raise SystemExit(f"REFUSE: router_full matched {len(hit)} tensors over {len(layers)}/{n_layers} layers, "
                          f"expected {n_layers * ROUTER_FULL_PER_LAYER} (layers x {ROUTER_FULL_PER_LAYER}: router proj "
                          "+ scale + per_expert_scale + 5 FFN-block norms); is this a Gemma-4 MoE model?")
+    return hit
+
+
+def attn_norm_params(model: nn.Module) -> list[str]:
+    """The ``attn_norms`` tensors: 4 per layer (``GEMMA4_ATTN_NORMS_RE``); refuses on any other count."""
+    hit = [n for n, _ in model.named_parameters() if re.fullmatch(GEMMA4_ATTN_NORMS_RE, n)]
+    layers = {int(re.search(r"layers\.(\d+)\.", n).group(1)) for n in hit}
+    n_layers = getattr(model.config, "num_hidden_layers", len(layers))
+    if not hit or len(layers) != n_layers or len(hit) != n_layers * ATTN_NORMS_PER_LAYER:
+        raise SystemExit(f"REFUSE: attn_norms matched {len(hit)} tensors over {len(layers)}/{n_layers} layers, "
+                         f"expected {n_layers * ATTN_NORMS_PER_LAYER} (layers x {ATTN_NORMS_PER_LAYER}: q_norm, "
+                         "k_norm, input_layernorm, post_attention_layernorm); is this a Gemma-4 text model?")
     return hit
 
 

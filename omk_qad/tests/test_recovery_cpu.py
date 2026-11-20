@@ -574,6 +574,29 @@ def test_router_full_scope_is_the_whole_router_block(g4):
     assert all(params[n].ndim == 1 for n in names if not n.endswith("proj.weight"))  # the gains train as fp params
 
 
+def test_attn_norms_scope_is_the_four_attention_side_norm_scales(g4):
+    """``classes:attn_norms`` = q_norm, k_norm, input_layernorm, post_attention_layernorm per layer, all 1-D."""
+    from omk_qad.ptq import load_text_causal_lm
+    from omk_qad.recovery import scope_params
+    from omk_qad.router_telemetry import fp_groups
+
+    m, _ = load_text_causal_lm(str(g4["student"]), "cpu", torch.float32)
+    names = scope_params(m, "classes:attn_norms")
+    assert len(names) == 4 * N_LAYERS, names
+    for suf in ("self_attn.q_norm.weight", "self_attn.k_norm.weight", "input_layernorm.weight",
+                "post_attention_layernorm.weight"):
+        assert sum(n.endswith(suf) for n in names) == N_LAYERS, suf
+    params = dict(m.named_parameters())
+    assert all(params[n].ndim == 1 for n in names)
+    assert not any("feedforward" in n or "router" in n or n == "model.norm.weight" for n in names)
+    both = scope_params(m, "classes:router_full,attn_norms")
+    assert len(both) == 12 * N_LAYERS and set(names) < set(both)
+    groups = fp_groups([(n, params[n]) for n in both if params[n].ndim == 1])
+    assert {k: len(v) for k, v in groups.items()} == {
+        "router_scale": N_LAYERS, "per_expert_scale": N_LAYERS, "ffn_norm": 5 * N_LAYERS, "qk_norm": 2 * N_LAYERS,
+        "attn_norm": 2 * N_LAYERS}
+
+
 def test_router_full_trains_with_lb_loss_and_telemetry(g4):
     """router_full + experts, --lb-weight, --router-gate: fp params move, ROUTER lines per eval, lb logged, no trip."""
     from omk_qad.ptq import load_text_causal_lm

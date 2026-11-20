@@ -254,7 +254,7 @@ def gate(stats: RouterStats, init: RouterStats, spec: tuple[float, float, float]
 
 
 def fp_groups(named: list[tuple[str, torch.Tensor]]) -> dict[str, list[torch.Tensor]]:
-    """Group the trained 1-D parameters for update/drift telemetry: router_scale, per_expert_scale, ffn_norm, other."""
+    """Group the trained 1-D parameters for update/drift telemetry (router, FFN-norm and attention-norm scales)."""
     out: dict[str, list[torch.Tensor]] = {}
     for n, p in named:
         if n.endswith("router.scale"):
@@ -263,6 +263,10 @@ def fp_groups(named: list[tuple[str, torch.Tensor]]) -> dict[str, list[torch.Ten
             g = "per_expert_scale"
         elif "feedforward_layernorm" in n:
             g = "ffn_norm"
+        elif n.endswith(("q_norm.weight", "k_norm.weight")):
+            g = "qk_norm"
+        elif n.endswith(("input_layernorm.weight", "post_attention_layernorm.weight")):
+            g = "attn_norm"
         else:
             g = "other"
         out.setdefault(g, []).append(p)
