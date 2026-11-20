@@ -97,6 +97,28 @@ GEMMA4_ROUTER_FULL_RE = (r"model\.layers\.\d+\.(router\.(proj\.weight|scale|per_
 ROUTER_FULL_PER_LAYER = 8
 
 
+def fp_param_groups(fp_params: list, fp_lr: float, scale: str = "none") -> list[dict]:
+    """AdamW param groups of the fp (1-D) parameters; ``base`` is each group's peak lr (the schedule multiplies it).
+
+    ``none``: one group at ``fp_lr``. ``rms``: one group per tensor at ``fp_lr x rms(tensor)``. Adam takes an ABSOLUTE
+    step of about lr per element whatever the gradient scale, so one lr moves a gain of 32 (Gemma-4 ``router.scale``:
+    30.5..33.75; the FFN norm scales have rms 4..33) thirty times less, in relative terms, than a gain of 1
+    (``per_expert_scale``): 100 steps of sft11r at 1e-4 drifted them 0.002 % against 0.08 % (bm-898, 2026-11-20).
+    With ``rms`` ``fp_lr`` is the RELATIVE step of every tensor. The rms is taken once, from the weights at build.
+    """
+    if scale == "none":
+        return [{"params": list(fp_params), "lr": fp_lr, "base": fp_lr}]
+    if scale != "rms":
+        raise ValueError(f"--fp-lr-scale {scale!r}: none | rms")
+    groups = []
+    for q in fp_params:
+        rms = float(q.detach().float().pow(2).mean().sqrt())
+        if not rms > 0:
+            raise SystemExit(f"REFUSE --fp-lr-scale rms: an fp parameter of shape {tuple(q.shape)} has rms {rms}")
+        groups.append({"params": [q], "lr": fp_lr * rms, "base": fp_lr * rms})
+    return groups
+
+
 def router_full_params(model: nn.Module) -> list[str]:
     """The ``router_full`` tensors: 8 per MoE layer (``GEMMA4_ROUTER_FULL_RE``); refuses on any other count."""
     names = [n for n, _ in model.named_parameters()]

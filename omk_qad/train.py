@@ -1756,7 +1756,15 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         say(f"OPTIM accum {a.accum} x bs {a.bs} = {a.accum * a.bs} rows/update, beta1 {a.beta1}, "
             f"state {a.state_dtype}")
     allow = parse_allow(a.allow_change)
-    opt = torch.optim.AdamW(fp_params, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0) if fp_params else None
+    opt = None
+    if fp_params:
+        from .recovery import fp_param_groups
+
+        fpg = fp_param_groups(fp_params, a.fp_lr, getattr(a, "fp_lr_scale", "none"))
+        opt = torch.optim.AdamW(fpg, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0)
+        base = sorted(g["base"] for g in fpg)
+        say(f"FP_LR scale {getattr(a, 'fp_lr_scale', 'none')}: {len(fpg)} groups, peak lr min {base[0]:.3g} "
+            f"median {base[len(base) // 2]:.3g} max {base[-1]:.3g}")
     # router telemetry / load-balance / collapse gate (omk_qad.router_telemetry; bm-898 sft11r)
     probe, gate_spec, drift, rstate = None, None, None, {"init": None, "last": None}
     if bf16:
@@ -1892,7 +1900,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         ctl.lr = cosine_lr(step - 1, a.steps, a.lr, a.min_lr, a.warmup) * guard.scale
         if opt is not None:
             for gq in opt.param_groups:
-                gq["lr"] = a.fp_lr * ctl.lr / a.lr
+                gq["lr"] = gq.get("base", a.fp_lr) * ctl.lr / a.lr
         loss, info, ids = 0.0, {}, []
         if drift is not None:
             drift.before()
@@ -2061,6 +2069,9 @@ def main(argv=None) -> None:
                     help="bf16 mode: storage of the trained weights, between steps (--latent-dtype is QAD only)")
     ap.add_argument("--train-scope", default="gemma4", help="bf16 mode: gemma4 | classes:<a,b,...>")
     ap.add_argument("--train-router", action="store_true", help="bf16 mode, gemma4 scope: also train router.proj")
+    ap.add_argument("--fp-lr-scale", choices=["none", "rms"], default="none",
+                    help="bf16 mode: none = every fp (1-D) tensor at --fp-lr; rms = each tensor at --fp-lr x its rms, "
+                         "so --fp-lr is the RELATIVE Adam step of every tensor (a gain of 32 moves like a gain of 1)")
     ap.add_argument("--lb-weight", type=float, default=0.0,
                     help="bf16 mode: Switch load-balance loss weight on the routers (0 = off; the second-run lever "
                          "when --router-gate stops a run)")

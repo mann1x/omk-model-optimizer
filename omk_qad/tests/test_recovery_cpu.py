@@ -609,6 +609,38 @@ def test_router_full_trains_with_lb_loss_and_telemetry(g4):
     assert all("router" in r for r in res) and res[-1]["router"]["flip_mean"] >= 0.0
 
 
+def test_fp_lr_scale_rms_gives_every_tensor_the_same_relative_step(g4):
+    """--fp-lr-scale rms: lr = fp_lr x rms per tensor, so a gain of 32 and a gain of 1 take the same RELATIVE step."""
+    from omk_qad.recovery import fp_param_groups
+
+    big, one = torch.nn.Parameter(torch.full((16,), 32.0)), torch.nn.Parameter(torch.ones(4))
+    assert fp_param_groups([big, one], 1e-4) == [{"params": [big, one], "lr": 1e-4, "base": 1e-4}]
+    groups = fp_param_groups([big, one], 1e-4, "rms")
+    assert [g["params"] for g in groups] == [[big], [one]]
+    assert groups[0]["base"] == pytest.approx(3.2e-3) and groups[1]["base"] == pytest.approx(1e-4)
+    opt = torch.optim.AdamW(groups, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0)
+    (big.sum() * 3.0 + one.sum() * 0.01).backward()  # Adam's first step is lr x sign(grad), whatever the grad scale
+    opt.step()
+    rel = [float((p.detach() - v).abs().max() / v) for p, v in ((big, 32.0), (one, 1.0))]
+    assert rel[0] == pytest.approx(1e-4, rel=1e-3) and rel[1] == pytest.approx(1e-4, rel=1e-3), rel
+    with pytest.raises(SystemExit):
+        fp_param_groups([torch.nn.Parameter(torch.zeros(3))], 1e-4, "rms")
+    out = WORK / "run_fplr_rms"
+    shutil.rmtree(out, ignore_errors=True)
+    proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+                "--out", str(out), "--steps", "3", "--eval-every", "100", "--save-every", "2", "--fp-lr", "1e-3",
+                "--fp-lr-scale", "rms", "--train-scope", "classes:router_full,routed_experts")
+    log = proc.stdout + proc.stderr
+    assert f"FP_LR scale rms: {N_LAYERS * 7} groups" in log and "QAD_DONE" in log, log[-2000:]
+    # a resume rebuilds the groups and loads the saved AdamW state: the per-tensor peak lr must come back with it
+    opt2 = torch.optim.AdamW(fp_param_groups([big, one], 1e-4, "rms"), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0)
+    for g in opt.param_groups:
+        g["lr"] = g["base"] * 0.5  # mid-schedule
+    opt2.load_state_dict(opt.state_dict())
+    assert [g["base"] for g in opt2.param_groups] == [g["base"] for g in opt.param_groups]
+    assert opt2.param_groups[0]["lr"] == pytest.approx(1.6e-3)
+
+
 def test_fp_scope_does_not_change_the_latent_gradient_at_step_1(g4):
     """Step 1 runs on the SAME weights whatever the fp scope: loss and latent grad norm must not depend on it.
 

@@ -20,14 +20,17 @@
 #   bf16 storage 0.821-0.823 (sft11, its snapshot, and this code) -- the scope and the telemetry do not move it. So the
 #   router scope is the ONLY change against sft11 when STORAGE=bf16. The fp16 run paused at step 21 lives in the
 #   untagged run dir and resumes only with STORAGE=fp16 RUN_TAG= (the trainer refuses a storage change on resume).
-# Usage: RUN_TAG=bf16st sft11r_base_mlk8noa_train.sh   (first run, bf16 storage, lb 0)
+# FPSCALE (--fp-lr-scale): rms by default (owner 2026-11-20 10:00 CET "restart with the per-group learning rate"): each
+#   scale tensor trains at 1e-4 x its rms, i.e. 1e-4 is its RELATIVE Adam step. At a flat 1e-4 the first 100 steps
+#   drifted per_expert_scale (~1.0) 0.08 % but router.scale (~32) 0.002 % and the FFN norm scales (rms 4..33) 0.013 %.
+# Usage: RUN_TAG=bf16st_rlr sft11r_base_mlk8noa_train.sh   (bf16 storage, relative fp lr, lb 0)
 #        LB=0.01 RUN_TAG=lb sft11r_base_mlk8noa_train.sh   (second run after a gate trip: its own run dir)
 set -uo pipefail
 cd /mnt/sdc/omk-model-optimizer/g4_recovery || exit 1
 PY=/mnt/sdc/omk-model-optimizer/venv/bin/python
 export PYTHONPATH=/mnt/sdc/omk-model-optimizer/g4_recovery/omk_sft11r_code CUDA_VISIBLE_DEVICES=0
 GPU=0
-LB=${LB:-0}; RUN_TAG=${RUN_TAG:-}; STORAGE=${STORAGE:-bf16}
+LB=${LB:-0}; RUN_TAG=${RUN_TAG:-}; STORAGE=${STORAGE:-bf16}; FPSCALE=${FPSCALE:-rms}
 M=/mnt/sdc/ml/v9a_base/mlk8-noa/gemma-4-20B-v9-agentic-base-mlk8-noa; CACHE=cache_teacher_r4
 RUN=runs/g4_bf16_sft11r_base_mlk8noa${RUN_TAG:+_$RUN_TAG}; R=sft11_build/render; LOG=train_sft11r_base_mlk8noa${RUN_TAG:+_$RUN_TAG}.log
 fail(){ echo "SFTR_FAIL $*" | tee -a $LOG; exit 1; }
@@ -58,10 +61,10 @@ free=$(df --output=avail -BG /mnt/sdc | tail -1 | tr -dc 0-9)
 used=$(nvidia-smi -i $GPU --query-gpu=memory.used --format=csv,noheader,nounits)
 [ "$used" -lt 2000 ] || fail "GPU$GPU not free ($used MiB used)"
 if [ -e "$RUN" ]; then echo "SFTR_RESUME $(date -u +%FT%TZ) windows $N steps $STEPS lr $LR lb $LB" | tee -a $LOG
-else echo "SFTR_START $(date -u +%FT%TZ) model $M windows $N steps $STEPS lr $LR fp-lr 1e-4 lb $LB storage $STORAGE gate 1.5,0.85,0.25 train $(echo $DATA | tr , '\n' | wc -l) eval $(echo $EVAL | tr , '\n' | wc -l)" | tee -a $LOG; fi
+else echo "SFTR_START $(date -u +%FT%TZ) model $M windows $N steps $STEPS lr $LR fp-lr 1e-4 lb $LB fp-lr-scale $FPSCALE storage $STORAGE gate 1.5,0.85,0.25 train $(echo $DATA | tr , '\n' | wc -l) eval $(echo $EVAL | tr , '\n' | wc -l)" | tee -a $LOG; fi
 $PY -m omk_qad.train --phase train --mode bf16 --model $M --cache $CACHE --out $RUN \
   --train-scope classes:attention,dense_mlp,router_full,routed_experts --bs 2 --steps $STEPS --lr $LR --fp-lr 1e-4 --warmup 10 \
-  --lb-weight $LB --router-gate 1.5,0.85,0.25 --router-telemetry on --bf16-latent $STORAGE \
+  --lb-weight $LB --router-gate 1.5,0.85,0.25 --router-telemetry on --bf16-latent $STORAGE --fp-lr-scale $FPSCALE \
   --seq 16384 --loss ce --sft-data "$DATA" --sft-eval "$EVAL" --mtp freeze --eval-every 200 \
   --save-every 100 --snapshot-every 100 --snapshot-keep 2 --guard-ratio 3 --wandb-project omk-sft-20b-base-mlk8noa \
   --wandb-name bm898-g4-98e-base-mlk8noa-sft11r${RUN_TAG:+-$RUN_TAG} >> $LOG 2>&1 < /dev/null &
