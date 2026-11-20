@@ -770,3 +770,34 @@ def test_router_gate_unit_and_trip(g4):
     assert g["reasons"] and g["gate"] == [1.001, 0.999, 1.0] and g["init"]["flip_mean"] == 0.0
     assert not (out / "stage1" / "final.pt").exists() and (out / "stage1" / "last.pt").exists()
     assert json.loads((out / "stage1" / "state.json").read_text())["status"] == "gated"
+
+
+def test_export_writes_fp_params_in_fp32_so_a_small_scale_change_survives(tmp_path):
+    """A trained scale near 32 moved by 0.01 must reach the export: bf16 spacing there is 0.25."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from omk_qad.recovery import export_bf16
+
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    scale = torch.full((8,), 32.0, dtype=torch.bfloat16)
+    w = torch.randn(4, 8).to(torch.bfloat16)
+    save_file({"model.layers.0.router.scale": scale, "model.layers.0.router.proj.weight": w,
+               "model.norm.weight": torch.ones(8, dtype=torch.bfloat16)}, src / "model.safetensors",
+              metadata={"format": "pt"})
+    moved = scale.float() + 0.01
+    assert torch.equal(moved.to(torch.bfloat16), scale)  # the premise: bf16 cannot hold the change
+    new_w = (w.float() * 1.5).to(torch.bfloat16)
+    ck = tmp_path / "ck.pt"
+    torch.save({"step": 3, "latents": {"model.layers.0.router.proj.weight": new_w},
+                "fp": {"model.layers.0.router.scale": moved}}, ck)
+    rep = export_bf16(src, str(ck), out, lambda _m: None)
+    assert rep["fp32_keys"] == ["model.layers.0.router.scale"]
+    assert rep["replaced"] == 2 and rep["unchanged_verified"] == 1
+    with safe_open(out / "model.safetensors", "pt") as f:
+        got = f.get_tensor("model.layers.0.router.scale")
+        assert got.dtype == torch.float32 and torch.equal(got, moved)
+        gw = f.get_tensor("model.layers.0.router.proj.weight")
+        assert gw.dtype == torch.bfloat16 and torch.equal(gw, new_w)
+        assert f.get_tensor("model.norm.weight").dtype == torch.bfloat16

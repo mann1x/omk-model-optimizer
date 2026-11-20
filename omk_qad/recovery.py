@@ -247,6 +247,11 @@ def _export_bf16(src, ck, ckpt, keys, mapped, trained, out: Path, say, t0) -> di
     for f in src.iterdir():  # configs, tokenizer, chat template, processor files: copied as they are
         if f.is_file() and not f.name.endswith(".safetensors"):
             shutil.copy2(f, part / f.name)
+    # The 1-D fp params (router and norm scales) are trained in fp32 and written in fp32: a scale near 32 has a bf16
+    # spacing of 0.25, so a cast to the source dtype rounds a whole run of training back to the vendor value (2 of 30
+    # router.scale tensors differed after 300 steps, 2026-11-20). The latents are bf16 or fp16 by construction and keep
+    # the source dtype.
+    fp32 = {key_for(n, keys) for n in ck["fp"]}
     replaced, shards = [], sorted(set(keys.values()))
     for shard in shards:
         with safe_open(src / shard, "pt") as f:
@@ -255,7 +260,7 @@ def _export_bf16(src, ck, ckpt, keys, mapped, trained, out: Path, say, t0) -> di
             for k in f.keys():  # noqa: SIM118 (safe_open handle, not a dict)
                 t = f.get_tensor(k)
                 if k in mapped:
-                    new = mapped[k].to(t.dtype)
+                    new = mapped[k].to(torch.float32 if k in fp32 else t.dtype)
                     if new.shape != t.shape:
                         raise SystemExit(f"export: {k} shape {tuple(new.shape)} != source {tuple(t.shape)}")
                     tensors[k] = new.contiguous()
@@ -269,7 +274,7 @@ def _export_bf16(src, ck, ckpt, keys, mapped, trained, out: Path, say, t0) -> di
     unchanged = verify_export(src, part, set(replaced))
     rep = {"source": str(src), "checkpoint": ckpt, "step": ck["step"], "replaced": len(replaced),
            "unchanged_verified": unchanged, "shards": shards, "seconds": round(time.time() - t0, 1),
-           "replaced_keys": sorted(replaced)}
+           "replaced_keys": sorted(replaced), "fp32_keys": sorted(fp32)}
     atomic_json(part / "omk_bf16_export.json", rep)
     if out.exists():
         out.rmdir()  # empty (checked above)
