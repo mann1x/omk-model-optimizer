@@ -187,3 +187,13 @@ The 26B's run of the same recipe is in [`../gemma-4-26b-a4b/kfac/`](../gemma-4-2
 - F16 and `mmproj` on the GGUF repo: the F16 is replaced by this build's; the SigLIP projector is untouched by the
   prune and the SFT (vision tower not trained), the 2026-10 `mmproj-…-F16.gguf` stays valid.
 - Vision and the Ollama `vision-`/`mtp-` tag ladder are not re-evaluated for this build.
+
+## base-mlk8-noa-sft11 — the vendor base pruned first, then the sft11 recipe once (bm-898, 2026-11-18/20)
+
+A second lineage of the same architecture: `google/gemma-4-26B-A4B-it` → `ml_k8` prune (no shared-expert upweight, 98 e) →
+the sft11 recipe once (`train/sft11_base_mlk8noa_train.sh`, record in `train/logs/`). Published privately as
+`ManniX-ITA/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11` (bf16) and `…-sft11-GGUF` (15 K-FAC tiers, AC imatrix, F16).
+Quantization as run: `quant/base_mlk8noa/` (F16 export, AC imatrix, factors + eval reference, the two ladder lanes,
+Q6_K twin), publisher `quant/kfac_publish_base20_bs2.py` (uploads, sha-verifies, squashes, reclaims; `--cards-dry` /
+`--cards` render `cards/20b-base_gguf.md` into the repo README from the live Hub listing and the twin jsons). The card
+describes this ladder on its own: there is one 20B ladder; no comparison with the sft12 build or with the F16.
