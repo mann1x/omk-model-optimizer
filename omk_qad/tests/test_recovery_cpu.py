@@ -6,6 +6,7 @@ Artifacts go to $OMK_QAD_WORK (persistent disk; /tmp is tmpfs on solidpc).
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -547,3 +548,91 @@ def test_sft_weights_scale_the_gradient_not_the_logged_loss(g4, roles_cache):
     assert any(not torch.equal(runs["w1"][1][k], runs["w3"][1][k]) for k in runs["w1"][1])  # the update is not
     bad = _run(*base, "--sft-weights", "nosuch=2", "--out", str(WORK / "run_sft_weights_bad"), check=False)
     assert bad.returncode != 0 and "is not a --sft-data source" in bad.stdout + bad.stderr
+
+
+# ----------------------------------------------------------------------------------------- router_full (bm-898 sft11r)
+ROUTER_FULL_SUFFIXES = ("router.proj.weight", "router.scale", "router.per_expert_scale",
+                        "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
+                        "pre_feedforward_layernorm_2.weight", "post_feedforward_layernorm_1.weight",
+                        "post_feedforward_layernorm_2.weight")
+
+
+def test_router_full_scope_is_the_whole_router_block(g4):
+    """``classes:router_full`` = 8 tensors per layer: router proj + its two gains + the five FFN-block norm scales."""
+    from omk_qad.ptq import load_text_causal_lm
+    from omk_qad.recovery import scope_params
+
+    m, _ = load_text_causal_lm(str(g4["student"]), "cpu", torch.float32)
+    names = scope_params(m, "classes:router_full")
+    assert len(names) == 8 * N_LAYERS, names
+    for suf in ROUTER_FULL_SUFFIXES:
+        assert sum(n.endswith(suf) for n in names) == N_LAYERS, suf
+    assert not any(("self_attn" in n or "embed" in n or "experts." in n or "input_layernorm" in n) for n in names)
+    both = scope_params(m, "classes:attention,router_full")
+    assert set(names) < set(both) and any("self_attn" in n for n in both)
+    params = dict(m.named_parameters())
+    assert all(params[n].ndim == 1 for n in names if not n.endswith("proj.weight"))  # the gains train as fp params
+
+
+def test_router_full_trains_with_lb_loss_and_telemetry(g4):
+    """router_full + experts, --lb-weight, --router-gate: fp params move, ROUTER lines per eval, lb logged, no trip."""
+    from omk_qad.ptq import load_text_causal_lm
+    from omk_qad.recovery import scope_params
+
+    out = WORK / "run_router_full"
+    shutil.rmtree(out, ignore_errors=True)
+    proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+                "--out", str(out), "--steps", "4", "--eval-every", "2", "--save-every", "100", "--fp-lr", "1e-3",
+                "--train-scope", "classes:router_full,routed_experts", "--lb-weight", "0.01",
+                "--router-gate", "3.0,0.5,1.0")
+    log = proc.stdout + proc.stderr
+    assert "ROUTER_PROBE 6 routers, lb_weight 0.01, gate 3.0,0.5,1.0" in log, log[-2000:]
+    assert "FP_GROUPS" in log and '"router_scale"' in log and '"per_expert_scale"' in log and '"ffn_norm"' in log
+    routers = [json.loads(line[7:]) for line in log.splitlines() if line.startswith("ROUTER ")]
+    assert len(routers) == 3, [line for line in log.splitlines() if "ROUTER" in line]  # init, step2, step4
+    assert routers[0]["top_n"] == 1 and set(routers[0]["layers"]) == {str(i) for i in range(N_LAYERS)}
+    assert all(0 < r["entropy_mean"] <= math.log(8) + 1e-6 for r in routers), routers
+    assert "flip_mean" in routers[-1] and routers[0].get("flip_mean", 0.0) == 0.0
+    steps = re.findall(r"step \d+ loss=.* lb ([\d.e+-]+) .*router_scale upd ([\d.e+-]+) drift ([\d.e+-]+)", log)
+    assert steps, log[-3000:]
+    assert all(float(lb) > 0 for lb, _, _ in steps) and any(float(u) > 0 for _, u, _ in steps), steps
+    assert "ROUTER_GATE_STOP" not in log and "QAD_DONE" in log
+    assert (out / "stage1" / "router_init.pt").exists()
+    ck = _ckpt(out)
+    m, _ = load_text_causal_lm(str(g4["student"]), "cpu", torch.float32)
+    want = set(scope_params(m, "classes:router_full,routed_experts"))
+    assert set(ck["latents"]) | set(ck["fp"]) == want
+    assert all(any(n.endswith(suf) for suf in ROUTER_FULL_SUFFIXES[1:]) for n in ck["fp"]), sorted(ck["fp"])[:5]
+    moved = [n for n, t in ck["fp"].items() if not torch.equal(t.float(), dict(m.named_parameters())[n])]
+    assert len(moved) == len(ck["fp"]), f"{len(moved)}/{len(ck['fp'])} fp params moved"
+    res = json.loads((out / "stage1" / "summary.json").read_text())["results"]
+    assert all("router" in r for r in res) and res[-1]["router"]["flip_mean"] >= 0.0
+
+
+def test_router_gate_unit_and_trip(g4):
+    """gate() on synthetic stats (deterministic); a wild fp LR under a tight gate stops a run with ROUTER_GATE.json."""
+    from omk_qad.router_telemetry import LayerStats, RouterStats, gate, parse_gate, top_n_of
+
+    assert top_n_of(98) == 8 and top_n_of(128) == 11 and top_n_of(8) == 1
+    assert parse_gate("") is None and parse_gate("0") is None and parse_gate("1.5,0.85,0.25") == (1.5, 0.85, 0.25)
+    with pytest.raises(SystemExit):
+        parse_gate("0.9,0.85,0.25")
+    mk = lambda top, ent: RouterStats({0: LayerStats([top, 1 - top], top, ent, None, 10)}, 1)  # noqa: E731
+    init = mk(0.20, 0.60)
+    assert gate(mk(0.25, 0.58), init, (1.5, 0.85, 0.25)) == []
+    why = gate(mk(0.31, 0.50), init, (1.5, 0.85, 0.25))
+    assert len(why) == 3 and "top-1 share 0.310 > 1.5 x init" in why[0] and "entropy 0.500 < 0.85" in why[1] \
+        and "> 0.25 (init 0.200)" in why[2], why
+    assert gate(mk(0.26, 0.60), mk(0.30, 0.60), (1.5, 0.85, 0.25)) == []  # init already above top_abs: no abs trip
+    out = WORK / "run_router_gate_trip"
+    shutil.rmtree(out, ignore_errors=True)
+    proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+                "--out", str(out), "--steps", "4", "--eval-every", "2", "--save-every", "100", "--fp-lr", "3.0",
+                "--warmup", "0", "--train-scope", "classes:router_full", "--router-gate", "1.001,0.999,1.0",
+                check=False)
+    log = proc.stdout + proc.stderr
+    assert "ROUTER_GATE_STOP step" in log, log[-3000:]
+    g = json.loads((out / "stage1" / "ROUTER_GATE.json").read_text())
+    assert g["reasons"] and g["gate"] == [1.001, 0.999, 1.0] and g["init"]["flip_mean"] == 0.0
+    assert not (out / "stage1" / "final.pt").exists() and (out / "stage1" / "last.pt").exists()
+    assert json.loads((out / "stage1" / "state.json").read_text())["status"] == "gated"

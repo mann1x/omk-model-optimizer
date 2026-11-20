@@ -69,15 +69,45 @@ def scope_params(model: nn.Module, scope: str, train_router: bool = False) -> li
         from .census import classify_model
 
         want = {c for c in scope.split(":", 1)[1].split(",") if c}
+        router_full = "router_full" in want  # not a census class: the whole Gemma-4 router block, see below
+        want.discard("router_full")
         mods = {e.module for e in classify_model(model).entries if e.cls in want}
         if "vectors" in want:
             mods.add("<1-D vectors>")
         hit = [n for n, p in model.named_parameters()
                if n.rsplit(".", 1)[0] in mods or n in mods or ("<1-D vectors>" in mods and p.ndim < 2)]
+        if router_full:
+            hit = sorted(set(hit) | set(router_full_params(model)))
         if not hit:
             raise SystemExit(f"REFUSE: classes {sorted(want)} match no parameter")
         return hit
     raise SystemExit(f"unknown --train-scope {scope!r} (gemma4 | classes:<a,b,...>)")
+
+
+# ``classes:...,router_full``: the WHOLE router block of a Gemma-4 MoE layer (bm-898 sft11r, owner 2026-11-20 "target
+# fully the router too"): the expert-score projection, the router's input gain (its RMSNorm carries no weight of its
+# own), the per-expert output gain, and the five FFN-block RMSNorm scales that set what the experts see and how the
+# dense and MoE branches mix. sft11 trained ``router.proj`` only: the census puts every 1-D tensor in ``vectors``,
+# which also holds the attention norms, the final norm and the vision norms, so it is not a usable scope for this.
+# Attention norms, ``layer_scalar`` (a buffer), embeddings / head and the vision tower stay out
+# (backup_models/docs/plans/plan_bm898_sft11_router_full.md).
+GEMMA4_ROUTER_FULL_RE = (r"model\.layers\.\d+\.(router\.(proj\.weight|scale|per_expert_scale)"
+                         r"|(pre_feedforward_layernorm|post_feedforward_layernorm|pre_feedforward_layernorm_2"
+                         r"|post_feedforward_layernorm_1|post_feedforward_layernorm_2)\.weight)")
+ROUTER_FULL_PER_LAYER = 8
+
+
+def router_full_params(model: nn.Module) -> list[str]:
+    """The ``router_full`` tensors: 8 per MoE layer (``GEMMA4_ROUTER_FULL_RE``); refuses on any other count."""
+    names = [n for n, _ in model.named_parameters()]
+    hit = [n for n in names if re.fullmatch(GEMMA4_ROUTER_FULL_RE, n)]
+    layers = {int(re.search(r"layers\.(\d+)\.", n).group(1)) for n in hit}
+    n_layers = getattr(model.config, "num_hidden_layers", len(layers))
+    if not hit or len(layers) != n_layers or len(hit) != n_layers * ROUTER_FULL_PER_LAYER:
+        raise SystemExit(f"REFUSE: router_full matched {len(hit)} tensors over {len(layers)}/{n_layers} layers, "
+                         f"expected {n_layers * ROUTER_FULL_PER_LAYER} (layers x {ROUTER_FULL_PER_LAYER}: router proj "
+                         "+ scale + per_expert_scale + 5 FFN-block norms); is this a Gemma-4 MoE model?")
+    return hit
 
 
 class FrozenHead:

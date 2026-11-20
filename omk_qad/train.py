@@ -301,9 +301,13 @@ class Telemetry:
 
     def eval(self, r: dict, step: int) -> None:
         """One evaluate() result: overall metrics plus every eval family."""
-        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "sets", "tag")}
+        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "sets", "tag", "router")}
         for fam, m in (r.get("families") or {}).items():
             flat.update({f"eval/{fam}/{k}": v for k, v in m.items()})
+        if r.get("router"):  # router_telemetry: aggregates + per layer (eval/router/L<i>/<metric>)
+            flat.update({f"eval/router/{k}": v for k, v in r["router"].items() if k != "layers"})
+            for i, m in r["router"]["layers"].items():
+                flat.update({f"eval/router/L{i}/{k}": v for k, v in m.items()})
         for nm, s in (r.get("sets") or {}).items():  # --eval-set: eval/<set>/<metric>, eval/<set>/<family>/<metric>
             flat.update({f"eval/{nm}/{k}": v for k, v in s.items() if k != "families"})
             for fam, m in (s.get("families") or {}).items():
@@ -1061,7 +1065,7 @@ def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
 
 
 def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None, aidx=None, aval=None,
-               apply: bool = True, info: dict | None = None) -> float:
+               apply: bool = True, info: dict | None = None, probe=None) -> float:
     """One micro-batch (an update when ``apply``): body forward, head + loss per chunk, head gradient, backward.
 
     The latents update inside backward (accumulating instead while ``apply`` is False).
@@ -1135,7 +1139,13 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
         z.backward(zd.grad)
     if not frozen:
         head.on_grad(wh.grad)
-    h.backward(hd.grad)
+    lb = probe.pop_lb() if probe is not None else None  # router load-balance term of this forward (router_telemetry)
+    if lb is not None and info is not None:
+        info["lb_loss"] = info.get("lb_loss", 0.0) + float(lb)
+    if lb is not None and a.lb_weight > 0:  # one backward over both roots: the body loss and the balance term
+        torch.autograd.backward([h, a.lb_weight * lb], [hd.grad, None])
+    else:
+        h.backward(hd.grad)
     for lat in latents.values():
         lat.flush()
     if fp_params and opt is not None and apply:  # opt None: gradients are left in .grad (gradient checks)
@@ -1747,6 +1757,25 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             f"state {a.state_dtype}")
     allow = parse_allow(a.allow_change)
     opt = torch.optim.AdamW(fp_params, lr=a.fp_lr, betas=(0.9, 0.95), weight_decay=0.0) if fp_params else None
+    # router telemetry / load-balance / collapse gate (omk_qad.router_telemetry; bm-898 sft11r)
+    probe, gate_spec, drift, rstate = None, None, None, {"init": None, "last": None}
+    if bf16:
+        from .router_telemetry import FpDrift, RouterProbe, fp_groups, parse_gate
+
+        fp_named = [(n, p) for n, p in student.named_parameters() if any(p is q for q in fp_params)]
+        trained_router = any(".router." in n for n in list(latents) + [n for n, _ in fp_named])
+        gate_spec = parse_gate(a.router_gate)
+        if a.router_telemetry == "on" or (a.router_telemetry == "auto" and trained_router) or a.lb_weight > 0:
+            probe = RouterProbe(student)
+            say(f"ROUTER_PROBE {len(probe.routers)} routers, lb_weight {a.lb_weight}, gate "
+                f"{a.router_gate or 'off'}, telemetry {a.router_telemetry}")
+        elif gate_spec:
+            raise SystemExit("--router-gate needs the router telemetry (--router-telemetry on)")
+        if fp_named:
+            drift = FpDrift(fp_groups(fp_named))
+            say("FP_GROUPS " + json.dumps({g: sum(p.numel() for p in ps) for g, ps in drift.groups.items()}))
+    elif a.lb_weight > 0 or a.router_gate:
+        raise SystemExit("--lb-weight / --router-gate are bf16-mode options")
     last_ck = run / "last.pt"
     origin = {"cache": a.cache, "layout": a.layout, "imatrix": a.imatrix}
     fpath = Path(a.imatrix).with_name("imatrix.folded.pt") if a.imatrix != "none" else None
@@ -1757,9 +1786,21 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     guard = Guard(a, latents, student, opt)
 
     def run_eval(tag: str) -> dict:  # an SFT run on its own held-out rows; a distillation run on the cache's
+        if probe is not None:
+            probe.begin_eval()
         if sft_ev is not None:
-            return sft_evaluate(student, head, sft_ev, a, tag, dict(ctl.stats), sets)
-        return evaluate(student, head, ev, a, tag, dict(ctl.stats), sets)
+            r = sft_evaluate(student, head, sft_ev, a, tag, dict(ctl.stats), sets)
+        else:
+            r = evaluate(student, head, ev, a, tag, dict(ctl.stats), sets)
+        if probe is not None:
+            rs = probe.end_eval(set_reference=(tag == "init"))
+            if tag == "init":
+                rstate["init"] = rs
+                torch.save({"reference": probe.reference_state(), "stats": rs}, run / "router_init.pt")
+            rstate["last"] = rs
+            r["router"] = rs.summary()
+            say("ROUTER", json.dumps(r["router"]))
+        return r
 
     if a.load and last_ck.exists() and Path(a.load).resolve() != last_ck.resolve() and "load" not in allow:
         raise SystemExit(f"RUN_REFUSED --load {a.load}: {last_ck} exists and would be overwritten by a resume from "
@@ -1772,6 +1813,15 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         origin["init_from"] = ck.get("init_from", "")
         guard.load(ck.get("guard"))
         say(f"RESUME from step {ck['step']} ({resume})")
+        if probe is not None:
+            if (run / "router_init.pt").exists():
+                ri = torch.load(run / "router_init.pt", weights_only=False)
+                probe.load_reference(ri["reference"])
+                rstate["init"] = ri["stats"]
+                say(f"ROUTER_REF loaded from {run / 'router_init.pt'}")
+            else:
+                say("ROUTER_REF missing: this run started before the router telemetry; flip rate and gate are off "
+                    "until a new run")
     else:
         if a.stage == 2:  # weights of the finished stage 1; optimizer, schedule and RNG start fresh
             src = a.init_from or str(Path(a.out) / "stage1" / "final.pt")
@@ -1844,8 +1894,12 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             for gq in opt.param_groups:
                 gq["lr"] = a.fp_lr * ctl.lr / a.lr
         loss, info, ids = 0.0, {}, []
+        if drift is not None:
+            drift.before()
         for k in range(a.accum):  # one update = accum micro-batches of bs rows; latents apply on the last
             ctl.apply = k == a.accum - 1
+            if probe is not None:
+                probe.begin_train()
             s0 = ((step - 1) * a.accum + k) * a.bs
             ids += rows.rows[s0 : s0 + a.bs]
             b = rows.batch(s0, a.bs)
@@ -1855,7 +1909,9 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
             roles = {r: None if b[r] is None else b[r].to(a.device) for r in ("role", "aidx", "aval")}
             loss += train_step(student, latents, head, fp_params, opt, x, idx, val, a, **roles,
-                               apply=ctl.apply, info=info) / a.accum
+                               apply=ctl.apply, info=info, probe=probe) / a.accum
+        if probe is not None:
+            probe.mode = "off"
         rolled = guard.observe(step, loss)
         om = opt_metrics(ctl)
         rl = info.get("row_loss") or [loss]
@@ -1865,7 +1921,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                **({"train/loop_share": info["loop_loss"] / max(1e-12, info["role_loss"]),
                    "train/loop_tokens": info["loop_tokens"], "train/lead_tokens": info["lead_tokens"]}
                   if "role_loss" in info else {}),
-               **({"train/guard_rollback": 1} if rolled else {})}
+               **({"train/guard_rollback": 1} if rolled else {}),
+               **({"train/lb_loss": info["lb_loss"] / a.accum} if "lb_loss" in info else {})}
+        if drift is not None:
+            row.update(drift.after())
         if per_src is not None and "row_loss" in info:
             row.update(per_src.row(ids, rl))
         recent.append(loss)
@@ -1879,7 +1938,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             say(f"step {step} loss={loss:.5f} lr={ctl.lr:.2e} {sps:.2f}s/step "
                 f"{mem:.1f}GiB {json.dumps(ctl.stats)} rows {ids} tokens {info.get('tokens', 0)} "
                 f"grad_norm {om.get('opt/grad_norm', 0):.4g} update_ratio {om.get('opt/update_ratio', 0):.3g}"
-                + (f" loop_share {row['train/loop_share']:.3f}" if "train/loop_share" in row else ""))
+                + (f" loop_share {row['train/loop_share']:.3f}" if "train/loop_share" in row else "")
+                + (f" lb {row['train/lb_loss']:.4f}" if "train/lb_loss" in row else "")
+                + ("".join(f" {g} upd {row[f'fp/{g}/update_ratio']:.2e} drift {row[f'fp/{g}/drift']:.3g}"
+                           for g in (drift.groups if drift is not None else ()) if f"fp/{g}/update_ratio" in row)))
             row.update({"train/s_per_step": sps, "train/peak_mem_gib": mem,
                         **{f"quant/{k}": v for k, v in ctl.stats.items()}})
             if per_src is not None and per_src.averages():
@@ -1891,6 +1953,20 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             results.append(run_eval(f"step{step}"))
             tel.eval(results[-1], step)
             atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
+            if probe is not None and gate_spec and rstate["init"] is not None:
+                from .router_telemetry import gate as router_gate
+
+                tripped = router_gate(rstate["last"], rstate["init"], gate_spec)
+                if tripped:  # routing collapse: checkpoint, record, stop (the launcher reads ROUTER_GATE.json)
+                    say(f"ROUTER_GATE_STOP step {step}: " + "; ".join(tripped))
+                    atomic_json(run / "ROUTER_GATE.json", {"step": step, "reasons": tripped, "gate": gate_spec,
+                                                            "router": results[-1].get("router"),
+                                                            "init": results[0].get("router")})
+                    checkpoint(step)
+                    st.update(status="gated", step=step)
+                    say(peak())
+                    tel.finish()
+                    return
         if a.snapshot_every and step % a.snapshot_every == 0:
             checkpoint(step, run / f"ckpt_step{step:07d}.pt")
             for old in prune_snapshots(run, a.snapshot_keep):
@@ -1985,6 +2061,15 @@ def main(argv=None) -> None:
                     help="bf16 mode: storage of the trained weights, between steps (--latent-dtype is QAD only)")
     ap.add_argument("--train-scope", default="gemma4", help="bf16 mode: gemma4 | classes:<a,b,...>")
     ap.add_argument("--train-router", action="store_true", help="bf16 mode, gemma4 scope: also train router.proj")
+    ap.add_argument("--lb-weight", type=float, default=0.0,
+                    help="bf16 mode: Switch load-balance loss weight on the routers (0 = off; the second-run lever "
+                         "when --router-gate stops a run)")
+    ap.add_argument("--router-telemetry", default="auto", choices=("auto", "on", "off"),
+                    help="per-eval routing load / entropy / top-1 flip per layer (auto: on when a router parameter "
+                         "is trained)")
+    ap.add_argument("--router-gate", default="",
+                    help="top_ratio,entropy_ratio,top_abs (e.g. 1.5,0.85,0.25): checkpoint and stop the run when a "
+                         "layer's routing concentrates vs the init eval; empty = off")
     ap.add_argument("--out-hf", default="", help="bf16 export: output HF checkpoint dir (must be new/empty)")
     ap.add_argument("--anchor", action="store_true", help="cache: add --model's top-K as the ANCHOR targets of the "
                     "anchor-role positions of an existing role cache (bf16 recovery: the original student)")
