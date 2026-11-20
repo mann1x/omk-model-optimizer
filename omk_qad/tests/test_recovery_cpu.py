@@ -609,6 +609,87 @@ def test_router_full_trains_with_lb_loss_and_telemetry(g4):
     assert all("router" in r for r in res) and res[-1]["router"]["flip_mean"] >= 0.0
 
 
+class _FakeRouter(torch.nn.Module):
+    """Router-shaped module: (probabilities [T, E], top-k weights, top-k index), with a trainable projection."""
+
+    def __init__(self, hidden: int, experts: int):
+        """Linear router over ``hidden`` channels into ``experts`` experts, top-1."""
+        super().__init__()
+        self.proj = torch.nn.Linear(hidden, experts, bias=False)
+
+    def forward(self, x):
+        """Softmax probabilities and the top-1 pick."""
+        p = torch.softmax(self.proj(x), -1)
+        w, i = p.topk(1, -1)
+        return p, w, i
+
+
+class _FakeBlock(torch.nn.Module):
+    """One MoE-ish layer: router + a dense map, run under non-reentrant gradient checkpointing like train.py."""
+
+    def __init__(self, hidden: int, experts: int):
+        """Build the router and the dense map."""
+        super().__init__()
+        self.router = _FakeRouter(hidden, experts)
+        self.mlp = torch.nn.Linear(hidden, hidden)
+
+    def _body(self, x):
+        p, w, _i = self.router(x)
+        return self.mlp(x) * w + p.sum(-1, keepdim=True) * 0  # keep the router on the graph
+
+    def forward(self, x):
+        """Checkpointed body (``use_reentrant=False``, as train.py enables it)."""
+        return torch.utils.checkpoint.checkpoint(self._body, x, use_reentrant=False)
+
+
+class _FakeMoE(torch.nn.Module):
+    """``model.layers.N.router`` tree that router_modules() recognises (it keys on ``.layers.N.router``)."""
+
+    def __init__(self, n_layers: int = 3, hidden: int = 8, experts: int = 4):
+        """Stack ``n_layers`` fake blocks under ``model``."""
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList(_FakeBlock(hidden, experts) for _ in range(n_layers))
+
+    def forward(self, x):
+        """Run the blocks."""
+        for blk in self.model.layers:
+            x = blk(x)
+        return x
+
+
+def test_router_probe_does_not_collect_during_checkpoint_recompute():
+    """pop_lb() ends the train window so the backward's checkpoint recompute passes do not refill the probe.
+
+    A term collected from a recompute pass pinned every recomputed layer's activations: +30 GiB and a CUDA OOM at
+    step 1 on the 20B student (2026-11-20).
+    """
+    import torch.utils.checkpoint
+
+    from omk_qad.router_telemetry import RouterProbe
+
+    torch.manual_seed(0)
+    model = _FakeMoE()
+    probe = RouterProbe(model)
+    calls = []
+    for i, m in probe.routers.items():
+        m.register_forward_hook(lambda _m, _i, _o, i=i: calls.append((i, probe.mode)))
+    x = torch.randn(5, 8, requires_grad=True)
+    probe.begin_train()
+    out = model(x)
+    lb = probe.pop_lb()
+    assert lb is not None and lb.requires_grad and probe.mode == "off" and probe._seen == {}
+    assert [c for c in calls if c[1] == "train"] == [(0, "train"), (1, "train"), (2, "train")]
+    torch.autograd.backward([out.sum(), 0.01 * lb], [None, None])  # the dual-root backward of train_step
+    recompute = calls[3:]
+    assert len(recompute) == 3 and all(mode == "off" for _, mode in recompute), calls  # recompute ran, hook was inert
+    assert probe._seen == {}, probe._seen  # nothing collected from the recompute pass
+    assert model.model.layers[0].router.proj.weight.grad is not None  # lb gradient reached the router
+    probe.begin_train()  # the next micro-batch re-arms the window
+    assert probe.mode == "train"
+    probe.remove()
+
+
 def test_router_gate_unit_and_trip(g4):
     """gate() on synthetic stats (deterministic); a wild fp LR under a tight gate stops a run with ROUTER_GATE.json."""
     from omk_qad.router_telemetry import LayerStats, RouterStats, gate, parse_gate, top_n_of

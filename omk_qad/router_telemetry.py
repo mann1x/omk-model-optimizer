@@ -102,7 +102,7 @@ class RouterProbe:
         self.routers = router_modules(model)
         self.mode = "off"
         self.n_experts: int | None = None
-        self._lb: dict[int, torch.Tensor] = {}
+        self._seen: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}  # train window: (probs, idx) per layer
         self._acc: dict[int, _Acc] = {}
         self.init_top1: dict[int, torch.Tensor] | None = None  # reference top-1 per layer (eval rows, in order)
         self._handles = [m.register_forward_hook(self._hook(i)) for i, m in self.routers.items()]
@@ -131,10 +131,10 @@ class RouterProbe:
             elif self.n_experts != e:
                 raise SystemExit(f"router telemetry: layer {layer} has {e} experts, layer 0 has {self.n_experts}")
             if self.mode == "train":
-                f = torch.bincount(idx.reshape(-1), minlength=e).float() / max(1, idx.numel())  # no grad
-                p = probs.float().mean(0)  # [E], with grad into proj / scale
-                term = e * (f.detach() * p).sum()
-                self._lb[layer] = self._lb[layer] + term if layer in self._lb else term
+                # References only -- NO autograd op in here. The router runs inside a gradient-checkpoint frame, and
+                # non-reentrant checkpointing requires the backward's recompute pass (hook inert, mode "off") to save
+                # exactly the tensors the original forward saved; the balance arithmetic happens in pop_lb(), outside.
+                self._seen.setdefault(layer, []).append((probs, idx))
             else:  # eval
                 with torch.no_grad():
                     acc = self._acc.setdefault(layer, _Acc())
@@ -149,15 +149,31 @@ class RouterProbe:
     # ------------------------------------------------------------------ train mode
     def begin_train(self) -> None:
         """Collect load-balance terms on the next forwards."""
-        self._lb = {}
+        self._seen = {}
         self.mode = "train"
 
     def pop_lb(self) -> torch.Tensor | None:
-        """Mean load-balance term over the layers seen since ``begin_train`` (None when no router ran)."""
-        if not self._lb:
+        """Mean load-balance term over the layers seen since ``begin_train`` (None when no router ran).
+
+        Popping ENDS the collection window (mode -> ``off``). It has to: under gradient checkpointing the backward
+        re-runs every layer's forward, the hook fires again, and a term collected from that recompute pass would hold
+        the recomputed activations of the whole layer alive until the next ``begin_train`` -- on the 20B student that
+        was +30 GiB and a CUDA OOM at step 1 (2026-11-20). Call ``begin_train`` again before the next forward.
+        """
+        self.mode = "off"
+        seen, self._seen = self._seen, {}
+        if not seen:
             return None
-        terms = list(self._lb.values())
-        self._lb = {}
+        terms = []
+        for pairs in seen.values():  # one term per layer; a layer seen twice in the window sums
+            t = None
+            for probs, idx in pairs:
+                e = probs.shape[1]
+                f = torch.bincount(idx.reshape(-1), minlength=e).float() / max(1, idx.numel())  # no grad
+                p = probs.float().mean(0)  # [E], with grad into proj / scale
+                term = e * (f * p).sum()
+                t = term if t is None else t + term
+            terms.append(t)
         return torch.stack(terms).mean()
 
     # ------------------------------------------------------------------ eval mode
