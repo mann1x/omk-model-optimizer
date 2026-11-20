@@ -609,6 +609,27 @@ def test_router_full_trains_with_lb_loss_and_telemetry(g4):
     assert all("router" in r for r in res) and res[-1]["router"]["flip_mean"] >= 0.0
 
 
+def test_fp_scope_does_not_change_the_latent_gradient_at_step_1(g4):
+    """Step 1 runs on the SAME weights whatever the fp scope: loss and latent grad norm must not depend on it.
+
+    sft11r (router_full) logged a latent grad norm 3.8x / 11x sft11's (router) on the same rows (2026-11-20).
+    """
+    seen = {}
+    for name, scope in (("proj", "classes:router,routed_experts"), ("full", "classes:router_full,routed_experts")):
+        out = WORK / f"run_fpscope_{name}"
+        shutil.rmtree(out, ignore_errors=True)
+        proc = _run("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(g4["cache_teacher"]),
+                    "--out", str(out), "--steps", "1", "--eval-every", "100", "--save-every", "100",
+                    "--fp-lr", "1e-3", "--train-scope", scope)
+        log = proc.stdout + proc.stderr
+        m = re.search(r"step 1 loss=([\d.e+-]+) .* grad_norm ([\d.e+-]+) ", log)
+        assert m, log[-2000:]
+        seen[name] = (float(m.group(1)), float(m.group(2)))
+    (l0, g0), (l1, g1) = seen["proj"], seen["full"]
+    assert abs(l0 - l1) <= 1e-4 * abs(l0), seen
+    assert abs(g0 - g1) <= 1e-2 * g0, seen
+
+
 class _FakeRouter(torch.nn.Module):
     """Router-shaped module: (probabilities [T, E], top-k weights, top-k index), with a trainable projection."""
 
