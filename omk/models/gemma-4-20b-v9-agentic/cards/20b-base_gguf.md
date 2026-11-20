@@ -1,7 +1,7 @@
 ---
 license: apache-2.0
 base_model:
-- ManniX-ITA/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11
+- ManniX-ITA/gemma-4-20B-v9-agentic
 base_model_relation: quantized
 library_name: gguf
 pipeline_tag: text-generation
@@ -36,7 +36,7 @@ tags:
 - tool-calling
 - reasoning
 - omk-model-optimizer
-model_name: gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-GGUF
+model_name: gemma-4-20B-v9-agentic-GGUF
 author: ManniX-ITA
 architecture: Gemma4
 parameters: 20.45B
@@ -70,10 +70,12 @@ features:
 - tool-calling
 ---
 
-# gemma-4-20B-v9-agentic-base-mlk8-noa-sft11 — GGUF (K-FAC quantizations)
+# gemma-4-20B-v9-agentic — GGUF (K-FAC quantizations)
+
+> **Internal build `base-mlk8-noa-sft11`, under evaluation — not released.** It replaces the earlier sft11+sft12 build of this model in this repo; the owner is not satisfied with its stability (loops / non-convergence under anti-repetition sampling) and a further SFT round is planned.
 
 GGUF quantizations of
-[ManniX-ITA/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11](https://huggingface.co/ManniX-ITA/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11):
+[ManniX-ITA/gemma-4-20B-v9-agentic](https://huggingface.co/ManniX-ITA/gemma-4-20B-v9-agentic):
 [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) pruned to **98 of its 128 experts per
 layer** with the v9-agentic `ml_k8` competence map (no shared-expert upweight), then given **one pass of the sft11
 recipe** — the on-policy, loop-free agentic recovery SFT of
@@ -116,7 +118,7 @@ Toolchain: [omk-model-optimizer](https://github.com/mann1x/omk-model-optimizer)
 and [omnimergekit](https://github.com/mann1x/omnimergekit) `scripts/quantize_gguf.py`; llama.cpp **b12386** for every
 step.
 
-1. **F16** — `gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf`, converted from the bf16 safetensors (658 tensors,
+1. **F16** — `gemma-4-20B-v9-agentic-F16.gguf`, converted from the bf16 safetensors (658 tensors,
    `eos = 106` `<turn|>`, the official Gemma 4 chat template embedded, 18,683 B, sha256 `ae53464b…`). Text model only:
    no MTP head, no vision tower.
 2. **imatrix** — [`imatrix.dat`](./imatrix.dat) (sha256 `52b65c66…`, 88.5 MB, GGUF-format imatrix under the `.dat`
@@ -148,7 +150,7 @@ F16's top 256 tokens, on the held-out assistant positions (lower is better; 0 = 
 positions where both pick the same token. `ΔKL` = the K-FAC file's KL relative to its stock twin at identical size.
 `bpw` = 8 × bytes ÷ the GGUF's tensor element count. sha256 is the file's; the full value is in each `.gguf.sha256`.
 
-**Other files.** `gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf` — the unquantised conversion the ladder starts
+**Other files.** `gemma-4-20B-v9-agentic-F16.gguf` — the unquantised conversion the ladder starts
 from (39.79 GB, sha256 `8f984405…`). `imatrix.dat` — the importance matrix above, for audit and reproduction.
 There is no vision projector in this repo: neither the prune nor the SFT touches the vision tower, so the Gemma 4
 26B-A4B-it projector is the matching one; vision was not tested on this build.
@@ -156,7 +158,7 @@ There is no vision projector in this repo: neither the prune nor the SFT touches
 ## How to use
 
 ```bash
-llama-server -m gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-Q4_K_M.gguf -c 32768 -ngl 99 --jinja -fa on \
+llama-server -m gemma-4-20B-v9-agentic-Q4_K_M.gguf -c 32768 -ngl 99 --jinja -fa on \
     --chat-template-kwargs '{"enable_thinking": true}' \
     --reasoning-budget 8192 \
     --reasoning-budget-message $'\n\nI have used my thinking budget. I must stop analysing now and act on what I have: make the tool call, or give a short final answer if no call is needed.\nI\'ll be more terse and concise now and maybe I need to consider a different approach.\n'

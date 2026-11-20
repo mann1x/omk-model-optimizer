@@ -44,17 +44,21 @@ from huggingface_hub import HfApi, hf_hub_download
 RUNS = Path("/mnt/sdc/omk-model-optimizer/runs")
 CARDS = RUNS / "cards"
 LADDERS = {
-    "20b-base": dict(repo="ManniX-ITA/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-GGUF",
-                     prefix="gemma-4-20B-v9-agentic-base-mlk8-noa-sft11",
+    # 2026-11-20 07:00 CET: the build lives in the model's own repos (owner: one 20B model, builds replace each other;
+    # the *-base-mlk8-noa-sft11 repos were my error and were folded into these names, files renamed on the Hub).
+    # Hub filenames = repo name minus; the local ladder outputs and .published_hf markers still carry the long build
+    # name, so a re-render of the card needs the marker names mapped (long -> short) before manifest() is trusted.
+    "20b-base": dict(repo="ManniX-ITA/gemma-4-20B-v9-agentic-GGUF",
+                     prefix="gemma-4-20B-v9-agentic",
                      ladder=RUNS / "g4_20b_base_kfac/ladder",
                      imatrix=Path("/mnt/sdc/ml/v9a_base/mlk8-noa-sft11/gguf/imatrix_ac.dat"), imatrix_name="imatrix.dat",
                      base=Path("/mnt/sdc/ml/v9a_base/mlk8-noa-sft11/gguf/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf"),
-                     extra={"gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf":
+                     extra={"gemma-4-20B-v9-agentic-F16.gguf":
                             Path("/mnt/sdc/ml/v9a_base/mlk8-noa-sft11/gguf/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf")},
                      keep={"imatrix.dat", "imatrix.dat.sha256", "README.md", ".gitattributes",
-                           "gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf",
-                           "gemma-4-20B-v9-agentic-base-mlk8-noa-sft11-F16.gguf.sha256"},
-                     attn_from="Q8_0", weights_repo="ManniX-ITA/gemma-4-20B-v9-agentic-base-mlk8-noa-sft11", weights_card=None,
+                           "gemma-4-20B-v9-agentic-F16.gguf",
+                           "gemma-4-20B-v9-agentic-F16.gguf.sha256"},
+                     attn_from="Q8_0", weights_repo="ManniX-ITA/gemma-4-20B-v9-agentic", weights_card=None,
                      qad_tier=None),  # no QAD export planned for this ladder: the card gets no IQ2_XXS line
 }
 DRY = "--cards-dry" in sys.argv  # render the card to <CARDS>/.<which>_gguf.rendered.md and upload nothing
