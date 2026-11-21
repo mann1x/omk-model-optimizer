@@ -9,6 +9,10 @@ Roles outside ``--keep-roles`` become 0 (context: read, never scored); a window 
 rollouts (role 3 = unlikelihood of the repeated token), not the rollouts' own text as cross-entropy targets
 (those runs are the looping model's output, failed ones included).
 
+``--loop-head N``: only the first N tokens of each loop span (a run of role 3) stay loop, the rest of the span
+becomes context: the loss sits on the turn into the loop. Deep in a loop any model continues it by copying its own
+context (bm-898: p(repeat) 0.997 on the pruned 20B), and unlikelihood there trains against copying in general.
+
 ``--eval-out``: the windows of ``--eval-sessions`` whole sessions (the id up to the first ``/``; drawn with
 ``--seed`` among sessions that keep a window) go there instead: a held-out split with no session on both sides.
 Each output gets the ``.stats.json`` the trainer checks (window count, sha256).
@@ -23,11 +27,21 @@ from pathlib import Path
 N_ROLES = 5
 
 
-def refilter(rows, keep: set[int], min_tokens: dict[int, int]):
+def loop_head(role: list[int], n: int) -> list[int]:
+    """Role 3 only on the first ``n`` tokens of each run of 3; the rest of the run becomes 0."""
+    out, run = list(role), 0
+    for i, x in enumerate(role):
+        run = run + 1 if x == 3 else 0
+        if run > n:
+            out[i] = 0
+    return out
+
+
+def refilter(rows, keep: set[int], min_tokens: dict[int, int], head: int = 0):
     """(kept rows with roles outside ``keep`` zeroed, tokens_by_role of the kept rows, windows dropped)."""
     out, tot, dropped = [], [0] * N_ROLES, 0
     for r in rows:
-        role = [x if x in keep else 0 for x in r["role"]]
+        role = [x if x in keep else 0 for x in (loop_head(r["role"], head) if head else r["role"])]
         cnt = [0] * N_ROLES
         for x in role:
             cnt[x] += 1
@@ -74,6 +88,8 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="output .roles.jsonl")
     ap.add_argument("--keep-roles", required=True, help="comma list of roles to keep, e.g. 3,4")
     ap.add_argument("--min-tokens", default="", help="comma list ROLE:N, drop windows with fewer than N tokens of ROLE")
+    ap.add_argument("--loop-head", type=int, default=0, help="keep only the first N tokens of each loop span as "
+                    "loop (0 = whole spans)")
     ap.add_argument("--eval-out", help="held-out .roles.jsonl of --eval-sessions whole sessions")
     ap.add_argument("--eval-sessions", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
@@ -91,7 +107,7 @@ def main() -> None:
     want = json.loads(side.read_text()).get("windows") if side.exists() else None
     if want is not None and want != len(rows):
         raise SystemExit(f"{a.inp}: {len(rows)} rows, its {side.name} says {want} (a torn or replaced file)")
-    kept, _, dropped = refilter(rows, keep, mins)
+    kept, _, dropped = refilter(rows, keep, mins, a.loop_head)
     extra = {"source": a.inp, "source_sha256": hashlib.sha256(raw).hexdigest(), "source_windows": len(rows),
              "dropped": dropped, "args": vars(a)}
     if a.eval_out:

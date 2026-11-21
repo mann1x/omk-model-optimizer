@@ -891,6 +891,12 @@ def test_role_filter_keeps_loop_roles_and_splits_whole_sessions(tmp_path):
     assert st["sha256"] == __import__("hashlib").sha256(out.read_bytes()).hexdigest()
     again = _run(*cmd, check=False)
     assert again.returncode != 0 and "refusing to overwrite" in again.stdout + again.stderr
+    from omk_qad.role_filter import loop_head
+
+    assert loop_head([0, 3, 3, 3, 1, 3, 4, 3, 3], 2) == [0, 3, 3, 0, 1, 3, 4, 3, 3]  # per span, others untouched
+    head = tmp_path / "head.roles.jsonl"
+    _run("omk_qad.role_filter", "--in", str(src), "--keep-roles", "3", "--loop-head", "1", "--out", str(head))
+    assert all(json.loads(ln)["role"].count(3) == 1 for ln in head.read_text().splitlines())
 
 
 def test_sft_run_with_a_loop_source_reports_loop_share_and_loop_eval(g4, roles_cache):
