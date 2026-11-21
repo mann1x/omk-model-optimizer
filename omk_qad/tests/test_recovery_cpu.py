@@ -848,6 +848,26 @@ def test_sft_loop_positions_take_unlikelihood_and_lead_in_is_unscored():
     assert g[x_next[3]] > 0 and (g.sum().abs() < 1e-5)  # descent lowers the repeated token's logit
 
 
+def test_unlikelihood_keeps_its_gradient_on_a_certain_repeat():
+    """A loop is where p(repeat) ~ 1: the loss must be the logit margin there, not a clamp with a zero gradient."""
+    from omk_qad.train import unlikelihood
+
+    lg = torch.zeros(1, 64)
+    lg[0, 7] = 40.0  # p(7) = 1 - 63 e^-40: 1 - p underflows in fp32, the clamped form gives 13.8 and no gradient
+    x = torch.tensor([7])
+    lg.requires_grad_()
+    ul = unlikelihood(lg, x)
+    torch.testing.assert_close(ul, torch.tensor([40.0 - math.log(63)]), rtol=1e-5, atol=1e-5)
+    g = torch.autograd.grad(ul.sum(), lg)[0][0]
+    assert abs(float(g[7]) - 1.0) < 1e-5 and abs(float(g.sum())) < 1e-5 and (g[:7] < 0).all()
+    naive = -torch.log((1 - F.softmax(lg.detach(), -1)[0, 7]).clamp_min(1e-6))
+    assert abs(float(naive) - 13.8155) < 1e-3  # what the old form reported for the same position
+    mid = torch.randn(4, 64)
+    xm = torch.randint(0, 64, (4,))
+    torch.testing.assert_close(unlikelihood(mid, xm), -torch.log(1 - F.softmax(mid, -1).gather(-1, xm[:, None])[:, 0]),
+                               rtol=1e-4, atol=1e-5)
+
+
 def test_role_filter_keeps_loop_roles_and_splits_whole_sessions(tmp_path):
     """role_filter: other roles become context, thin windows drop, the eval split shares no session with train."""
     src = tmp_path / "pool.roles.jsonl"

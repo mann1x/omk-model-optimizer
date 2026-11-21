@@ -924,16 +924,28 @@ def repeat_prob(lg, x_next) -> torch.Tensor:
     return F.log_softmax(lg.float(), -1).gather(-1, x_next[:, None]).squeeze(-1).exp()
 
 
+def unlikelihood(lg, x_next) -> torch.Tensor:
+    """-log(1 - p(x_next)) per position, exact at p -> 1: logsumexp(all logits) - logsumexp(all but x_next).
+
+    The naive ``-log((1 - p).clamp_min(1e-6))`` (``role_loss``, the distillation path) saturates at 13.8 with a zero
+    gradient once p > 1 - 1e-6, which is where a loop sits (bm-898: the pruned 20B gives the repeated token p 0.997 on
+    average, top-1 on 99.8 % of 132k loop positions, mean clamped loss 12.7). Here the loss is the logit margin of the
+    repeated token over the rest and its gradient on that logit is p: it never vanishes on a certain repeat.
+    """
+    lg = lg.float()
+    rest = lg.scatter(-1, x_next[:, None], float("-inf"))
+    return torch.logsumexp(lg, -1) - torch.logsumexp(rest, -1)
+
+
 def sft_token_loss(lg, x_next, r, a) -> torch.Tensor:
     """``--loss ce`` per-token loss: next-token CE, or on a loop-role (3) position the repeated token's unlikelihood.
 
-    A loop position is never a CE target; its loss is ``--ul-weight`` * -log(1 - p(x_next)).
+    A loop position is never a CE target; its loss is ``--ul-weight`` * -log(1 - p(x_next)) (``unlikelihood``).
     """
     ce = F.cross_entropy(lg.float(), x_next, reduction="none")
     if not (r == 3).any():
         return ce
-    ul = getattr(a, "ul_weight", 1.0) * -torch.log((1 - repeat_prob(lg, x_next)).clamp_min(1e-6))
-    return torch.where(r == 3, ul, ce)
+    return torch.where(r == 3, getattr(a, "ul_weight", 1.0) * unlikelihood(lg, x_next), ce)
 
 
 @torch.no_grad()
@@ -996,7 +1008,7 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
                 if ml.any():
                     pr = repeat_prob(lg, xn)[ml]
                     s = lacc.setdefault(ev.source[r], [0.0, 0.0, 0, 0])
-                    s[0] += (-torch.log((1 - pr).clamp_min(1e-6))).sum().item()
+                    s[0] += unlikelihood(lg, xn)[ml].sum().item()
                     s[1] += pr.sum().item()
                     s[2] += int((lg.float().argmax(-1) == xn)[ml].sum())
                     s[3] += int(ml.sum())
