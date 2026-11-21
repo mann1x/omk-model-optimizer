@@ -18,15 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from omk_qad.tests.test_qad_cpu import (  # noqa: F401
-    LLAMA_CPP,
-    TRAIN,
-    WORK,
-    _args,
-    _flat,
-    _run,
-    setup,
-)
+from omk_qad.tests.test_qad_cpu import LLAMA_CPP, TRAIN, WORK, _args, _flat, _run, setup  # noqa: F401
 
 QTYPES = ("IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_S")
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

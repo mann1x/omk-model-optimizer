@@ -10,9 +10,7 @@ import pytest
 import torch
 
 from omk_qad import kquant
-from omk_qad.tests.test_qad_cpu import (
-    setup,  # noqa: F401  (the tiny teachers + caches fixture of the QAD smoke)
-)
+from omk_qad.tests.test_qad_cpu import setup  # noqa: F401  (the tiny teachers + caches fixture of the QAD smoke)
 
 LLAMA = next((p for p in (os.environ.get("OMK_LLAMA_CPP"), "/opt/llama.cpp", "/mnt/sdc/ml/llama.cpp-b12386")
               if p and (Path(p) / "build/bin/libggml-base.so").is_file()), None)

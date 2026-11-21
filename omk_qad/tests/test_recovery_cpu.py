@@ -824,3 +824,92 @@ def test_export_writes_fp_params_in_fp32_so_a_small_scale_change_survives(tmp_pa
         gw = f.get_tensor("model.layers.0.router.proj.weight")
         assert gw.dtype == torch.bfloat16 and torch.equal(gw, new_w)
         assert f.get_tensor("model.norm.weight").dtype == torch.bfloat16
+
+
+# ------------------------------------------------------------------------- loop unlikelihood under --loss ce (bm-898)
+def test_sft_loop_positions_take_unlikelihood_and_lead_in_is_unscored():
+    """--loss ce: role 3 = ul_weight * -log(1 - p(repeat)) weighted by --loop-weight, never CE; role 4 weighs 0."""
+    import argparse
+
+    from omk_qad.train import sft_role_weight, sft_token_loss
+
+    torch.manual_seed(0)
+    lg, x_next = torch.randn(5, 32), torch.randint(0, 32, (5,))
+    r = torch.tensor([0, 1, 2, 3, 4])
+    ns = argparse.Namespace(loss="ce", ul_weight=0.5, loop_weight=4.0)
+    assert sft_role_weight(r, ns).tolist() == [0.0, 1.0, 1.0, 4.0, 0.0]
+    ce = F.cross_entropy(lg, x_next, reduction="none")
+    per = sft_token_loss(lg, x_next, r, ns)
+    p = F.softmax(lg, -1)[3, x_next[3]]
+    torch.testing.assert_close(per[3], 0.5 * -torch.log(1 - p), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(per[[0, 1, 2, 4]], ce[[0, 1, 2, 4]])
+    assert torch.equal(sft_token_loss(lg, x_next, torch.tensor([0, 1, 2, 1, 1]), ns), ce)  # no loop role: plain CE
+    g = torch.autograd.grad(sft_token_loss(lg.requires_grad_(), x_next, r, ns)[3], lg)[0][3]
+    assert g[x_next[3]] > 0 and (g.sum().abs() < 1e-5)  # descent lowers the repeated token's logit
+
+
+def test_role_filter_keeps_loop_roles_and_splits_whole_sessions(tmp_path):
+    """role_filter: other roles become context, thin windows drop, the eval split shares no session with train."""
+    src = tmp_path / "pool.roles.jsonl"
+    rows = []
+    for s in range(4):
+        for w in range(2):
+            role = [0, 1, 1, 2, 3, 3, 3, 4] if (s, w) != (3, 1) else [0, 1, 1, 2, 3, 0, 0, 4]
+            rows.append({"id": f"sess{s}/req{w}.json", "ids": list(range(8)), "role": role})
+    src.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    src.with_suffix(".stats.json").write_text(json.dumps({"windows": len(rows)}))
+    out, ev = tmp_path / "loops.train.roles.jsonl", tmp_path / "loops.eval.roles.jsonl"
+    cmd = ("omk_qad.role_filter", "--in", str(src), "--keep-roles", "3,4", "--min-tokens", "3:2", "--out", str(out),
+           "--eval-out", str(ev), "--eval-sessions", "1", "--seed", "0")
+    _run(*cmd)
+    tr, he = ([json.loads(ln) for ln in f.read_text().splitlines()] for f in (out, ev))
+    assert len(tr) + len(he) == 7  # the one window with a single loop token is dropped
+    assert all(set(r["role"]) <= {0, 3, 4} and r["role"].count(3) >= 2 for r in tr + he)
+    assert not {r["id"].split("/")[0] for r in tr} & {r["id"].split("/")[0] for r in he} and he
+    st = json.loads(out.with_suffix(".stats.json").read_text())
+    assert st["windows"] == len(tr) and st["tokens_by_role"][1] == 0 and st["dropped"] == 1 and st["complete"]
+    assert st["sha256"] == __import__("hashlib").sha256(out.read_bytes()).hexdigest()
+    again = _run(*cmd, check=False)
+    assert again.returncode != 0 and "refusing to overwrite" in again.stdout + again.stderr
+
+
+def test_sft_run_with_a_loop_source_reports_loop_share_and_loop_eval(g4, roles_cache):
+    """--loss ce with a loop-only source beside the SFT rows: trains, logs loop_share, evals ul / p_rep per source."""
+    rfile = WORK / "conv.roles.jsonl"
+    rows = [json.loads(ln) for ln in rfile.read_text().splitlines()]
+    for r in rows:  # mark the first scored positions of every window as a loop with a lead-in
+        sc = [i for i, x in enumerate(r["role"]) if x > 0]
+        for i in sc[:2]:
+            r["role"][i] = 4
+        for i in sc[2:8]:
+            r["role"][i] = 3
+    pool = WORK / "loopsrc.roles.jsonl"
+    pool.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    pool.with_suffix(".stats.json").write_text(json.dumps({"windows": len(rows)}))
+    lfile, efile = WORK / "loops.roles.jsonl", WORK / "conv_eval.roles.jsonl"
+    for f in (lfile, lfile.with_suffix(".stats.json")):
+        f.unlink(missing_ok=True)
+    _run("omk_qad.role_filter", "--in", str(pool), "--keep-roles", "3,4", "--min-tokens", "3:1", "--out", str(lfile))
+    efile.write_bytes(rfile.read_bytes())
+    efile.with_suffix(".stats.json").write_bytes(rfile.with_suffix(".stats.json").read_bytes())
+    lev = WORK / "loops_eval.roles.jsonl"  # held-out stand-in, as conv_eval (an eval file may not be a train file)
+    lev.write_bytes(lfile.read_bytes())
+    lev.with_suffix(".stats.json").write_bytes(lfile.with_suffix(".stats.json").read_bytes())
+    out = WORK / "run_sft_loops"
+    shutil.rmtree(out, ignore_errors=True)
+    proc = _run("omk_qad.train", *TRAIN, "--loss", "ce", "--mtp", "freeze", "--sft-data", f"{rfile},{lfile}",
+                "--sft-eval", f"{efile},{lev}", "--loop-weight", "3", "--ul-weight", "1", "--model",
+                str(g4["student"]), "--cache", str(roles_cache), "--out", str(out), "--steps", "4", "--eval-every", "4",
+                check=False)
+    assert proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    text = (out / "stage1" / "log.txt").read_text()
+    evals = [json.loads(ln.split("EVAL ", 1)[1]) for ln in text.splitlines() if ln.startswith("EVAL ")]
+    assert len(evals) == 2
+    n_loop = json.loads(lfile.with_suffix(".stats.json").read_text())["tokens_by_role"][3]
+    for e in evals:
+        lf, cf = e["families"]["loops_eval"], e["families"]["conv_eval"]
+        assert "nll" not in lf and lf["loop"] == n_loop > 0 and 0 < lf["p_rep"] < 1 and lf["ul"] > 0
+        assert e["loop"]["tokens"] == n_loop + cf.get("loop", 0)  # the fixture conversations carry loop spans too
+        assert abs(e["nll_mean"] - cf["nll"]) < 1e-9 and e["scored"] == cf["scored"]  # loop positions are not CE
+    shares = [float(ln.split("loop_share ")[1].split()[0]) for ln in text.splitlines() if "loop_share " in ln]
+    assert shares and all(0 <= s <= 1 for s in shares) and any(s > 0 for s in shares), text[-1500:]

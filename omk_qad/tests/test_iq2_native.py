@@ -11,19 +11,8 @@ import numpy as np
 import pytest
 import torch
 
-from omk_qad.tests.test_native_quants import (  # noqa: F401
-    CUDA,
-    LLAMA_CPP,
-    _flat,
-    _gguf,
-    _inputs,
-    _mod,
-    lib,
-    setup,
-)
-from omk_qad.tests.test_native_quants import (
-    test_train_export_ships_the_trained_blocks as _train_export,
-)
+from omk_qad.tests.test_native_quants import CUDA, LLAMA_CPP, _flat, _gguf, _inputs, _mod, lib, setup  # noqa: F401
+from omk_qad.tests.test_native_quants import test_train_export_ships_the_trained_blocks as _train_export
 
 QTYPES = ("IQ2_XXS", "IQ2_XS", "IQ2_S")
 

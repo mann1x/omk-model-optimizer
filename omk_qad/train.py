@@ -48,15 +48,7 @@ from .losses import jaccard_topk_rest, kl_topk_rest, rkl_topk_rest
 from .ptq import load_text_causal_lm
 from .recovery import softcap, softcap_of
 from .runctl import Control as RunControl
-from .runctl import (
-    RunLock,
-    State,
-    atomic_json,
-    atomic_torch_save,
-    check_identity,
-    file_id,
-    parse_allow,
-)
+from .runctl import RunLock, State, atomic_json, atomic_torch_save, check_identity, file_id, parse_allow
 
 LOG = [None]
 
@@ -301,7 +293,8 @@ class Telemetry:
 
     def eval(self, r: dict, step: int) -> None:
         """One evaluate() result: overall metrics plus every eval family."""
-        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "sets", "tag", "router")}
+        flat = {f"eval/{k}": v for k, v in r.items() if k not in ("families", "sets", "tag", "router", "loop")}
+        flat.update({f"eval/loop/{k}": v for k, v in (r.get("loop") or {}).items()})  # --loss ce: loop positions
         for fam, m in (r.get("families") or {}).items():
             flat.update({f"eval/{fam}/{k}": v for k, v in m.items()})
         if r.get("router"):  # router_telemetry: aggregates + per layer (eval/router/L<i>/<metric>)
@@ -917,6 +910,32 @@ def role_weight(role: torch.Tensor, a) -> torch.Tensor:
     return torch.where(role >= 3, w * getattr(a, "loop_weight", 1.0), w)
 
 
+def sft_role_weight(role: torch.Tensor, a) -> torch.Tensor:
+    """``--loss ce`` position weight: 1 on targets (1, 2), ``--loop-weight`` on loop (3) positions, 0 elsewhere.
+
+    Lead-in (4) is 0: SFT has no teacher, so the text that walked into a loop has no target, and it is not one itself.
+    """
+    w = ((role > 0) & (role != 4)).float()
+    return torch.where(role == 3, w * getattr(a, "loop_weight", 1.0), w)
+
+
+def repeat_prob(lg, x_next) -> torch.Tensor:
+    """p(x_next) per position: on a loop-role position, the probability of the repeated token the rollout produced."""
+    return F.log_softmax(lg.float(), -1).gather(-1, x_next[:, None]).squeeze(-1).exp()
+
+
+def sft_token_loss(lg, x_next, r, a) -> torch.Tensor:
+    """``--loss ce`` per-token loss: next-token CE, or on a loop-role (3) position the repeated token's unlikelihood.
+
+    A loop position is never a CE target; its loss is ``--ul-weight`` * -log(1 - p(x_next)).
+    """
+    ce = F.cross_entropy(lg.float(), x_next, reduction="none")
+    if not (r == 3).any():
+        return ce
+    ul = getattr(a, "ul_weight", 1.0) * -torch.log((1 - repeat_prob(lg, x_next)).clamp_min(1e-6))
+    return torch.where(r == 3, ul, ce)
+
+
 @torch.no_grad()
 def evaluate(student, head, ev, a, tag, extra=None, sets=None) -> dict:
     """Jaccard / KL(top-K) / top-1 / ppl of the student against the cached teacher on the eval rows.
@@ -942,11 +961,17 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
     ``nll`` / ``ppl`` pool every scored token; ``nll_mean`` weighs each source equally (the held-out mix differs from
     the trained one); ``families`` has each source's own. ``sets`` (``--eval-set``): teacher-KL role sets, a
     stage-2 distillation diagnostic reported beside it, only when named.
+
+    Loop-role (3) positions are not CE targets (as in training): a source that has them also reports ``loop`` (their
+    count), ``ul`` (mean -log(1 - p) of the repeated token, unweighted), ``p_rep`` (its mean probability) and
+    ``rep_top1`` (share of loop positions where it is the argmax); the record carries the pooled ``loop`` block.
+    Lead-in (4) positions are not scored. A source with loop positions only has no ``nll``.
     """
     student.eval()
     cuda = a.device != "cpu"
     wh = head.served()
     acc: dict = {}  # source -> [nll sum, scored tokens]
+    lacc: dict = {}  # source -> [unlikelihood sum, p(repeat) sum, repeat-is-top1 count, loop tokens]
     # bm-889 sft4: rows per forward keep sft3's eval attention load (4 x 16k^2): 4 at 16k, 1 at 32k (4 at 32k ran OOM)
     nb = max(1, int(4 * (16384 / ev.x.shape[1]) ** 2))
     for i0 in range(0, len(ev), nb):
@@ -956,20 +981,36 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
         for i, r in enumerate(sel):
             for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
                 c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
-                m = (ev.role[r, c0 + 1 : c1 + 1] > 0).to(a.device)  # the predicted token's role, as in training
-                if not m.any():
+                rr = ev.role[r, c0 + 1 : c1 + 1].to(a.device)  # the predicted token's role, as in training
+                m, ml = (rr == 1) | (rr == 2), rr == 3
+                if not (m.any() or ml.any()):
                     continue
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                     lg = softcap(F.linear(h[i, c0:c1], wh), getattr(a, "softcap", None))
-                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none")[m]
-                s = acc.setdefault(ev.source[r], [0.0, 0])
-                s[0] += ce.sum().item()
-                s[1] += int(m.sum())
+                xn = x[i, c0 + 1 : c1 + 1]
+                if m.any():
+                    ce = F.cross_entropy(lg.float(), xn, reduction="none")[m]
+                    s = acc.setdefault(ev.source[r], [0.0, 0])
+                    s[0] += ce.sum().item()
+                    s[1] += int(m.sum())
+                if ml.any():
+                    pr = repeat_prob(lg, xn)[ml]
+                    s = lacc.setdefault(ev.source[r], [0.0, 0.0, 0, 0])
+                    s[0] += (-torch.log((1 - pr).clamp_min(1e-6))).sum().item()
+                    s[1] += pr.sum().item()
+                    s[2] += int((lg.float().argmax(-1) == xn)[ml].sum())
+                    s[3] += int(ml.sum())
     n = sum(c for _, c in acc.values())
     nll = sum(v for v, _ in acc.values()) / max(1, n)
     fam = {k: {"nll": v / c, "ppl": math.exp(v / c), "scored": c} for k, (v, c) in acc.items()}
     mean = sum(f["nll"] for f in fam.values()) / max(1, len(fam))
+    for k, (u, pq, t1, c) in lacc.items():
+        fam.setdefault(k, {}).update(ul=u / c, p_rep=pq / c, rep_top1=t1 / c, loop=c)
     res = {"tag": tag, "nll": nll, "ppl": math.exp(nll), "nll_mean": mean, "scored": n, "families": fam}
+    if lacc:
+        nl = sum(v[3] for v in lacc.values())
+        res["loop"] = {"ul": sum(v[0] for v in lacc.values()) / nl, "p_rep": sum(v[1] for v in lacc.values()) / nl,
+                       "rep_top1": sum(v[2] for v in lacc.values()) / nl, "tokens": nl}
     if sets:
         res["sets"] = {nm: _score(student, head, s, a) for nm, s in sets.items()}
     student.train()
@@ -1084,7 +1125,7 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     frozen = getattr(head, "frozen", False)  # bf16 mode: a head outside the scope gets no weight gradient
     head.add_use()
     wh = head.served() if frozen else head.served().requires_grad_()
-    wt = None if role is None else role_weight(role[:, 1:], a)
+    wt = None if role is None else (sft_role_weight if a.loss == "ce" else role_weight)(role[:, 1:], a)
     n_tok = x.shape[0] * (x.shape[1] - 1) if role is None else max(1e-6, float(wt.sum()))
     tot, lsum = 0.0, 0.0
     rsum = [0.0] * x.shape[0]  # per row: its loss summed over scored positions (telemetry)
@@ -1097,14 +1138,17 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
                 lg = softcap(F.linear(hd[i, c0:c1], wh), getattr(a, "softcap", None))
             if role is not None:
                 r, w = role[i, c0 + 1 : c1 + 1].long(), wt[i, c0:c1]
-                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * w
-                if a.loss == "ce":  # SFT: every scored position is plain next-token CE (no teacher targets)
-                    loss = ce.sum() / n_tok
+                if a.loss == "ce":  # SFT (no teacher targets): next-token CE, unlikelihood on loop positions
+                    per = sft_token_loss(lg, x[i, c0 + 1 : c1 + 1], r, a) * w
+                    loss = per.sum() / n_tok
+                    if info is not None and (r == 3).any():
+                        lsum += float(per[r == 3].sum()) / n_tok
                     sc = (getattr(a, "_row_scale", None) or [1.0] * x.shape[0])[i]  # --sft-weights (sft7)
                     (loss * sc).backward() if sc != 1.0 else loss.backward()
                     tot += loss.item()  # the logged loss and the guard stay unweighted
                     rsum[i] += loss.item() * n_tok
                     continue
+                ce = F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none") * w
                 per = role_loss(lg, x[i, c0 + 1 : c1 + 1], r, idx[i, c0:c1], val[i, c0:c1],
                                 None if aidx is None else aidx[i, c0:c1], None if aval is None else aval[i, c0:c1], a)
                 per = per * w + a.ce_weight * ce
@@ -2088,7 +2132,8 @@ def main(argv=None) -> None:
     ap.add_argument("--anchor-as-teacher", action="store_true",
                     help="train: distil anchor-role positions (2) from the teacher like role 1 (QAD of the model a "
                          "recovery SFT produced, on that SFT's role corpus); no --anchor cache pass needed")
-    ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens")
+    ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens "
+                    "(--loss ce: the unlikelihood replaces the CE there; lead-in positions are not scored)")
     ap.add_argument("--loop-weight", type=float, default=1.0, help="train: weight of loop (3) and lead-in (4) "
                     "positions in the weighted-mean loss (train/loop_share logs the realised share)")
     ap.add_argument("--model", required=True, help="HF model dir (weights) of the teacher / student base")
