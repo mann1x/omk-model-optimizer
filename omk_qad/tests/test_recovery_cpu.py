@@ -897,6 +897,12 @@ def test_role_filter_keeps_loop_roles_and_splits_whole_sessions(tmp_path):
     head = tmp_path / "head.roles.jsonl"
     _run("omk_qad.role_filter", "--in", str(src), "--keep-roles", "3", "--loop-head", "1", "--out", str(head))
     assert all(json.loads(ln)["role"].count(3) == 1 for ln in head.read_text().splitlines())
+    samp = [tmp_path / f"s{i}.roles.jsonl" for i in range(2)]
+    for f in samp:  # a seeded subset, every role kept, the same rows on a rerun
+        _run("omk_qad.role_filter", "--in", str(src), "--keep-roles", "1,2,3,4", "--sample", "3", "--seed", "5",
+             "--out", str(f))
+    assert samp[0].read_bytes() == samp[1].read_bytes() and len(samp[0].read_text().splitlines()) == 3
+    assert json.loads(samp[0].read_text().splitlines()[0])["role"] in [r["role"] for r in rows]
 
 
 def test_sft_run_with_a_loop_source_reports_loop_share_and_loop_eval(g4, roles_cache):

@@ -13,6 +13,9 @@ rollouts (role 3 = unlikelihood of the repeated token), not the rollouts' own te
 becomes context: the loss sits on the turn into the loop. Deep in a loop any model continues it by copying its own
 context (bm-898: p(repeat) 0.997 on the pruned 20B), and unlikelihood there trains against copying in general.
 
+``--sample N``: keep N of the surviving windows, drawn with ``--seed`` (file order kept): a replay subset of an SFT
+source for a short second stage.
+
 ``--eval-out``: the windows of ``--eval-sessions`` whole sessions (the id up to the first ``/``; drawn with
 ``--seed`` among sessions that keep a window) go there instead: a held-out split with no session on both sides.
 Each output gets the ``.stats.json`` the trainer checks (window count, sha256).
@@ -90,6 +93,7 @@ def main() -> None:
     ap.add_argument("--min-tokens", default="", help="comma list ROLE:N, drop windows with fewer than N tokens of ROLE")
     ap.add_argument("--loop-head", type=int, default=0, help="keep only the first N tokens of each loop span as "
                     "loop (0 = whole spans)")
+    ap.add_argument("--sample", type=int, default=0, help="keep N of the surviving windows, drawn with --seed")
     ap.add_argument("--eval-out", help="held-out .roles.jsonl of --eval-sessions whole sessions")
     ap.add_argument("--eval-sessions", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
@@ -108,6 +112,11 @@ def main() -> None:
     if want is not None and want != len(rows):
         raise SystemExit(f"{a.inp}: {len(rows)} rows, its {side.name} says {want} (a torn or replaced file)")
     kept, _, dropped = refilter(rows, keep, mins, a.loop_head)
+    if a.sample:
+        if a.sample > len(kept):
+            raise SystemExit(f"--sample {a.sample}: only {len(kept)} windows survive the filter")
+        pick = set(random.Random(a.seed).sample(range(len(kept)), a.sample))
+        kept = [r for i, r in enumerate(kept) if i in pick]
     extra = {"source": a.inp, "source_sha256": hashlib.sha256(raw).hexdigest(), "source_windows": len(rows),
              "dropped": dropped, "args": vars(a)}
     if a.eval_out:
