@@ -870,37 +870,54 @@ def test_unlikelihood_keeps_its_gradient_on_a_certain_repeat():
 
 # ------------------------------------------------------------------- --token-penalty rules under --loss ce (bm-898)
 def test_token_penalty_adds_set_unlikelihood_only_where_the_rule_applies():
-    """at=SET: weight * -log(1 - p(set)) on top of the CE at target positions in SET with a listed role, nowhere else."""
+    """at=SET: weight * -log(1 - p(set)) on top of the CE where the target is in SET with a listed role, only."""
     import argparse
 
-    from omk_qad.train import parse_token_penalty, sft_token_loss
+    from omk_qad.train import (
+        parse_token_penalty,
+        pop_token_penalty_acc,
+        set_token_penalties,
+        sft_token_loss,
+    )
 
     torch.manual_seed(0)
     lg = torch.randn(6, 32)
     x_next = torch.tensor([5, 5, 5, 9, 5, 5])
     r = torch.tensor([1, 2, 0, 1, 3, 1])
     rule = parse_token_penalty("name=closer;at=5;tokens=20,21,22;weight=2", None)
-    ns = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0, _token_penalties=[rule])
+    ns = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0,
+                            token_penalty=["name=closer;at=5;tokens=20,21,22"])
+    set_token_penalties([rule])
     ce = F.cross_entropy(lg, x_next, reduction="none")
     per = sft_token_loss(lg, x_next, r, ns)
+    json.dumps(vars(ns))  # the args stay JSON-clean: logged, hashed into the run identity, saved in checkpoints
+    assert set(vars(ns)) == {"loss", "ul_weight", "loop_weight", "token_penalty"}
+    acc = pop_token_penalty_acc()
+    assert pop_token_penalty_acc() == {}  # popping resets
     pset = F.softmax(lg, -1)[:, [20, 21, 22]].sum(-1)
     for i in (0, 1, 5):  # target 5, role 1/2: CE + 2 * -log(1 - p(set))
         torch.testing.assert_close(per[i], ce[i] + 2 * -torch.log(1 - pset[i]), rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(per[[2, 3]], ce[[2, 3]])  # role 0 / target not in 'at': untouched
-    assert ns._tp_acc["closer"][0] == 3
-    torch.testing.assert_close(torch.tensor(ns._tp_acc["closer"][1]), pset[[0, 1, 5]].sum(), rtol=1e-5, atol=1e-6)
+    assert acc["closer"][0] == 3
+    torch.testing.assert_close(torch.tensor(acc["closer"][1]), pset[[0, 1, 5]].sum(), rtol=1e-5, atol=1e-6)
     lgg = lg.clone().requires_grad_()
     g = torch.autograd.grad(sft_token_loss(lgg, x_next, r, ns)[0], lgg)[0][0]
-    assert (g[[20, 21, 22]] > F.softmax(lg, -1)[0, [20, 21, 22]]).all()  # the set is pushed down harder than by CE alone
+    assert (g[[20, 21, 22]] > F.softmax(lg, -1)[0, [20, 21, 22]]).all()  # pushed down harder than by the CE alone
+    set_token_penalties([])
     off = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0)
-    assert torch.equal(sft_token_loss(lg, x_next, r[[0, 1, 2, 3, 0, 1]], off), ce)  # no rule: plain CE
+    assert torch.equal(sft_token_loss(lg, x_next, r[[0, 1, 2, 1, 0, 1]], off), ce)  # no rule: plain CE
 
 
 def test_token_penalty_any_never_penalises_the_target_and_parses_sets(tmp_path):
     """at=any: a position whose target is in the set keeps that token out of the penalised mass; SET forms resolve."""
     import argparse
 
-    from omk_qad.train import parse_token_penalty, parse_token_set, sft_token_loss
+    from omk_qad.train import (
+        parse_token_penalty,
+        parse_token_set,
+        set_token_penalties,
+        sft_token_loss,
+    )
 
     vocab = {"</": 7, "</thought": 8, "<channel|>": 3, "a": 1, "```": 4, "x```y": 5}
     assert parse_token_set("prefix:</", vocab) == [7, 8]
@@ -917,8 +934,12 @@ def test_token_penalty_any_never_penalises_the_target_and_parses_sets(tmp_path):
     x_next = torch.tensor([4, 2, 5])
     r = torch.tensor([2, 2, 1])
     rule = parse_token_penalty("name=argfence;roles=2;tokens=4,5;weight=0.5", None)
-    ns = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0, _token_penalties=[rule])
-    per, ce = sft_token_loss(lg, x_next, r, ns), F.cross_entropy(lg, x_next, reduction="none")
+    ns = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0)
+    set_token_penalties([rule])
+    try:
+        per, ce = sft_token_loss(lg, x_next, r, ns), F.cross_entropy(lg, x_next, reduction="none")
+    finally:
+        set_token_penalties([])
     p = F.softmax(lg, -1)
     torch.testing.assert_close(per[0], ce[0] + 0.5 * -torch.log(1 - p[0, 5]), rtol=1e-5, atol=1e-6)  # 4 is the target
     torch.testing.assert_close(per[1], ce[1] + 0.5 * -torch.log(1 - p[1, [4, 5]].sum()), rtol=1e-5, atol=1e-6)

@@ -971,14 +971,32 @@ def parse_token_penalty(spec: str, vocab: dict | None) -> dict:
             "roles": tuple(int(x) for x in kv.get("roles", "1,2").split(",")), "weight": float(kv.get("weight", "1"))}
 
 
+# --token-penalty: the parsed rules and per-rule telemetry, kept OFF the args namespace
+_TP = {"rules": [], "acc": {}}
+# (vars(a) is logged as JSON, hashed into the run identity and saved in every checkpoint: tensors or per-step
+# counters there crash the log and would make a resume see a changed identity).
+
+
+def set_token_penalties(rules: list) -> None:
+    """Install the parsed ``--token-penalty`` rules (``parse_token_penalty``) for this process; [] turns them off."""
+    _TP["rules"], _TP["acc"] = list(rules), {}
+
+
+def pop_token_penalty_acc() -> dict:
+    """Per-rule telemetry accumulated since the last call: {name: [positions, sum p(set), sum penalty]}."""
+    acc, _TP["acc"] = _TP["acc"], {}
+    return acc
+
+
 def token_penalties(lg, x_next, r, a) -> torch.Tensor | None:
     """Sum of the ``--token-penalty`` rules per position, or None when no rule applies in this chunk.
 
     A rule applies where the target's role is in its ``roles`` and (unless ``at=any``) the target token is in its ``at``
     set, and adds ``weight`` * -log(1 - p(its tokens)) to that position's loss; the position's own target is never
-    penalised (removed from the set there). Telemetry per rule (positions, sum p(set), sum penalty) -> ``a._tp_acc``.
+    penalised (removed from the set there). Per-rule telemetry (positions, sum p(set), sum penalty):
+    ``pop_token_penalty_acc``.
     """
-    rules = getattr(a, "_token_penalties", None)
+    rules = _TP["rules"]
     if not rules:
         return None
     out = None
@@ -997,7 +1015,7 @@ def token_penalties(lg, x_next, r, a) -> torch.Tensor | None:
         if hit.any():  # keep the target itself out of the penalised mass
             rest[hit] = rest[hit].scatter(-1, tgt[hit][:, None], lg_m[hit].gather(-1, tgt[hit][:, None]))
         pen = torch.logsumexp(lg_m, -1) - torch.logsumexp(rest, -1)
-        acc = a.__dict__.setdefault("_tp_acc", {}).setdefault(rule["name"], [0, 0.0, 0.0])
+        acc = _TP["acc"].setdefault(rule["name"], [0, 0.0, 0.0])
         with torch.no_grad():
             acc[0] += int(m.sum())
             acc[1] += float((1 - torch.exp(-pen)).sum())
@@ -1297,7 +1315,7 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
             for k, q in (("role_loss", sum(rsum) / n_tok), ("loop_loss", lsum),
                          ("loop_tokens", int((rt == 3).sum())), ("lead_tokens", int((rt == 4).sum()))):
                 info[k] = info.get(k, 0) + q
-            for nm, acc in (a.__dict__.pop("_tp_acc", None) or {}).items():  # --token-penalty telemetry
+            for nm, acc in pop_token_penalty_acc().items():  # --token-penalty telemetry
                 t = info.setdefault("token_penalty", {}).setdefault(nm, [0, 0.0, 0.0])
                 for j in range(3):
                     t[j] += acc[j]
@@ -2370,8 +2388,8 @@ def main(argv=None) -> None:
         if any(k in r for r in a.token_penalty for k in ("prefix:", "contains:", "text:")):
             from transformers import AutoTokenizer
             vocab = AutoTokenizer.from_pretrained(getattr(a, "tokenizer", None) or a.model).get_vocab()
-        a._token_penalties = [parse_token_penalty(r, vocab) for r in a.token_penalty]
-        for rule in a._token_penalties:
+        set_token_penalties([parse_token_penalty(r, vocab) for r in a.token_penalty])
+        for rule in _TP["rules"]:
             at = "any" if rule["at"] is None else rule["at"].tolist()[:8]
             print(f"token penalty {rule['name']}: weight {rule['weight']} roles {rule['roles']} at {at} on "
                   f"{len(rule['neg'])} tokens {rule['neg'].tolist()[:12]}{' ...' if len(rule['neg']) > 12 else ''}")
