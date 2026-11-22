@@ -868,6 +868,63 @@ def test_unlikelihood_keeps_its_gradient_on_a_certain_repeat():
                                rtol=1e-4, atol=1e-5)
 
 
+# ------------------------------------------------------------------- --token-penalty rules under --loss ce (bm-898)
+def test_token_penalty_adds_set_unlikelihood_only_where_the_rule_applies():
+    """at=SET: weight * -log(1 - p(set)) on top of the CE at target positions in SET with a listed role, nowhere else."""
+    import argparse
+
+    from omk_qad.train import parse_token_penalty, sft_token_loss
+
+    torch.manual_seed(0)
+    lg = torch.randn(6, 32)
+    x_next = torch.tensor([5, 5, 5, 9, 5, 5])
+    r = torch.tensor([1, 2, 0, 1, 3, 1])
+    rule = parse_token_penalty("name=closer;at=5;tokens=20,21,22;weight=2", None)
+    ns = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0, _token_penalties=[rule])
+    ce = F.cross_entropy(lg, x_next, reduction="none")
+    per = sft_token_loss(lg, x_next, r, ns)
+    pset = F.softmax(lg, -1)[:, [20, 21, 22]].sum(-1)
+    for i in (0, 1, 5):  # target 5, role 1/2: CE + 2 * -log(1 - p(set))
+        torch.testing.assert_close(per[i], ce[i] + 2 * -torch.log(1 - pset[i]), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(per[[2, 3]], ce[[2, 3]])  # role 0 / target not in 'at': untouched
+    assert ns._tp_acc["closer"][0] == 3
+    torch.testing.assert_close(torch.tensor(ns._tp_acc["closer"][1]), pset[[0, 1, 5]].sum(), rtol=1e-5, atol=1e-6)
+    lgg = lg.clone().requires_grad_()
+    g = torch.autograd.grad(sft_token_loss(lgg, x_next, r, ns)[0], lgg)[0][0]
+    assert (g[[20, 21, 22]] > F.softmax(lg, -1)[0, [20, 21, 22]]).all()  # the set is pushed down harder than by CE alone
+    off = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0)
+    assert torch.equal(sft_token_loss(lg, x_next, r[[0, 1, 2, 3, 0, 1]], off), ce)  # no rule: plain CE
+
+
+def test_token_penalty_any_never_penalises_the_target_and_parses_sets(tmp_path):
+    """at=any: a position whose target is in the set keeps that token out of the penalised mass; SET forms resolve."""
+    import argparse
+
+    from omk_qad.train import parse_token_penalty, parse_token_set, sft_token_loss
+
+    vocab = {"</": 7, "</thought": 8, "<channel|>": 3, "a": 1, "```": 4, "x```y": 5}
+    assert parse_token_set("prefix:</", vocab) == [7, 8]
+    assert parse_token_set("contains:```", vocab) == [4, 5]
+    assert parse_token_set("text:a", vocab) == [1]
+    (tmp_path / "ids.txt").write_text("9\n2,4\n")
+    assert parse_token_set("@" + str(tmp_path / "ids.txt"), None) == [2, 4, 9]
+    with pytest.raises(SystemExit):
+        parse_token_penalty("tokens=prefix:</", None)  # a vocabulary match without a tokenizer
+    with pytest.raises(SystemExit):
+        parse_token_penalty("tokens=1;bogus=2", None)
+    torch.manual_seed(1)
+    lg = torch.randn(3, 16)
+    x_next = torch.tensor([4, 2, 5])
+    r = torch.tensor([2, 2, 1])
+    rule = parse_token_penalty("name=argfence;roles=2;tokens=4,5;weight=0.5", None)
+    ns = argparse.Namespace(loss="ce", ul_weight=1.0, loop_weight=1.0, _token_penalties=[rule])
+    per, ce = sft_token_loss(lg, x_next, r, ns), F.cross_entropy(lg, x_next, reduction="none")
+    p = F.softmax(lg, -1)
+    torch.testing.assert_close(per[0], ce[0] + 0.5 * -torch.log(1 - p[0, 5]), rtol=1e-5, atol=1e-6)  # 4 is the target
+    torch.testing.assert_close(per[1], ce[1] + 0.5 * -torch.log(1 - p[1, [4, 5]].sum()), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(per[2], ce[2])  # role 1 not in roles=2
+
+
 def test_role_filter_keeps_loop_roles_and_splits_whole_sessions(tmp_path):
     """role_filter: other roles become context, thin windows drop, the eval split shares no session with train."""
     src = tmp_path / "pool.roles.jsonl"

@@ -937,15 +937,87 @@ def unlikelihood(lg, x_next) -> torch.Tensor:
     return torch.logsumexp(lg, -1) - torch.logsumexp(rest, -1)
 
 
+def parse_token_set(spec: str, vocab: dict | None) -> list[int]:
+    """Token ids of one ``--token-penalty`` set.
+
+    ``1,2,3`` | ``@FILE`` (ids, comma/newline separated) | ``prefix:STR`` / ``contains:STR`` / ``text:STR`` (tokenizer
+    vocabulary pieces starting with / containing / equal to STR; needs ``vocab``).
+    """
+    if spec.startswith("@"):
+        spec = Path(spec[1:]).read_text().replace("\n", ",")
+    for kind in ("prefix:", "contains:", "text:"):
+        if spec.startswith(kind):
+            if vocab is None:
+                raise SystemExit(f"--token-penalty {spec!r}: a vocabulary match needs the model's tokenizer")
+            v = spec[len(kind):]
+            f = {"prefix:": str.startswith, "contains:": str.__contains__, "text:": str.__eq__}[kind]
+            return sorted({i for t, i in vocab.items() if f(t, v)})
+    return sorted({int(t) for t in spec.split(",") if t.strip()})
+
+
+def parse_token_penalty(spec: str, vocab: dict | None) -> dict:
+    """One ``--token-penalty`` rule: ``name=N;tokens=SET;at=SET|any;roles=1,2;weight=W`` (see the option's help)."""
+    kv = dict(part.split("=", 1) for part in spec.split(";") if part.strip())
+    bad = set(kv) - {"name", "tokens", "at", "roles", "weight"}
+    if bad or "tokens" not in kv:
+        raise SystemExit(f"--token-penalty {spec!r}: keys name, tokens (required), at, roles, weight; got {sorted(kv)}")
+    neg = parse_token_set(kv["tokens"], vocab)
+    at = kv.get("at", "any")
+    at_ids = None if at == "any" else parse_token_set(at, vocab)
+    if not neg or (at_ids is not None and not at_ids):
+        raise SystemExit(f"--token-penalty {spec!r}: the token set or the 'at' set is empty")
+    return {"name": kv.get("name", f"rule{len(neg)}"), "neg": torch.tensor(neg, dtype=torch.long),
+            "at": None if at_ids is None else torch.tensor(at_ids, dtype=torch.long),
+            "roles": tuple(int(x) for x in kv.get("roles", "1,2").split(",")), "weight": float(kv.get("weight", "1"))}
+
+
+def token_penalties(lg, x_next, r, a) -> torch.Tensor | None:
+    """Sum of the ``--token-penalty`` rules per position, or None when no rule applies in this chunk.
+
+    A rule applies where the target's role is in its ``roles`` and (unless ``at=any``) the target token is in its ``at``
+    set, and adds ``weight`` * -log(1 - p(its tokens)) to that position's loss; the position's own target is never
+    penalised (removed from the set there). Telemetry per rule (positions, sum p(set), sum penalty) -> ``a._tp_acc``.
+    """
+    rules = getattr(a, "_token_penalties", None)
+    if not rules:
+        return None
+    out = None
+    for rule in rules:
+        m = torch.zeros_like(x_next, dtype=torch.bool)
+        for ro in rule["roles"]:
+            m |= r == ro
+        if rule["at"] is not None:
+            m &= torch.isin(x_next, rule["at"].to(x_next.device))
+        if not m.any():
+            continue
+        lg_m, tgt = lg[m].float(), x_next[m]
+        neg = rule["neg"].to(lg.device)
+        rest = lg_m.index_fill(-1, neg, float("-inf"))
+        hit = torch.isin(tgt, neg)
+        if hit.any():  # keep the target itself out of the penalised mass
+            rest[hit] = rest[hit].scatter(-1, tgt[hit][:, None], lg_m[hit].gather(-1, tgt[hit][:, None]))
+        pen = torch.logsumexp(lg_m, -1) - torch.logsumexp(rest, -1)
+        acc = a.__dict__.setdefault("_tp_acc", {}).setdefault(rule["name"], [0, 0.0, 0.0])
+        with torch.no_grad():
+            acc[0] += int(m.sum())
+            acc[1] += float((1 - torch.exp(-pen)).sum())
+            acc[2] += float(pen.sum())
+        add = torch.zeros(x_next.shape, dtype=pen.dtype, device=pen.device)
+        add[m] = rule["weight"] * pen
+        out = add if out is None else out + add
+    return out
+
+
 def sft_token_loss(lg, x_next, r, a) -> torch.Tensor:
     """``--loss ce`` per-token loss: next-token CE, or on a loop-role (3) position the repeated token's unlikelihood.
 
     A loop position is never a CE target; its loss is ``--ul-weight`` * -log(1 - p(x_next)) (``unlikelihood``).
     """
     ce = F.cross_entropy(lg.float(), x_next, reduction="none")
-    if not (r == 3).any():
-        return ce
-    return torch.where(r == 3, getattr(a, "ul_weight", 1.0) * unlikelihood(lg, x_next), ce)
+    if (r == 3).any():
+        ce = torch.where(r == 3, getattr(a, "ul_weight", 1.0) * unlikelihood(lg, x_next), ce)
+    tp = token_penalties(lg, x_next, r, a)
+    return ce if tp is None else ce + tp
 
 
 @torch.no_grad()
@@ -1225,6 +1297,10 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
             for k, q in (("role_loss", sum(rsum) / n_tok), ("loop_loss", lsum),
                          ("loop_tokens", int((rt == 3).sum())), ("lead_tokens", int((rt == 4).sum()))):
                 info[k] = info.get(k, 0) + q
+            for nm, acc in (a.__dict__.pop("_tp_acc", None) or {}).items():  # --token-penalty telemetry
+                t = info.setdefault("token_penalty", {}).setdefault(nm, [0, 0.0, 0.0])
+                for j in range(3):
+                    t[j] += acc[j]
         info.setdefault("row_loss", []).extend(r / max(1e-6, n) for r, n in zip(rsum, per_row, strict=True))
     return tot
 
@@ -1985,6 +2061,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                **({"train/loop_share": info["loop_loss"] / max(1e-12, info["role_loss"]),
                    "train/loop_tokens": info["loop_tokens"], "train/lead_tokens": info["lead_tokens"]}
                   if "role_loss" in info else {}),
+               **{f"train/tp_{nm}_{k}": v for nm, (n, ps, ul) in (info.get("token_penalty") or {}).items()
+                  for k, v in (("n", n), ("p", ps / max(1, n)), ("loss", ul / max(1, n)))},
                **({"train/guard_rollback": 1} if rolled else {}),
                **({"train/lb_loss": info["lb_loss"] / a.accum} if "lb_loss" in info else {})}
         if drift is not None:
@@ -2003,6 +2081,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 f"{mem:.1f}GiB {json.dumps(ctl.stats)} rows {ids} tokens {info.get('tokens', 0)} "
                 f"grad_norm {om.get('opt/grad_norm', 0):.4g} update_ratio {om.get('opt/update_ratio', 0):.3g}"
                 + (f" loop_share {row['train/loop_share']:.3f}" if "train/loop_share" in row else "")
+                + "".join(f" tp_{nm} n {n} p {ps / max(1, n):.5f}"
+                          for nm, (n, ps, _ul) in (info.get("token_penalty") or {}).items())
                 + (f" lb {row['train/lb_loss']:.4f}" if "train/lb_loss" in row else "")
                 + ("".join(f" {g} upd {row[f'fp/{g}/update_ratio']:.2e} drift {row[f'fp/{g}/drift']:.3g}"
                            for g in (drift.groups if drift is not None else ()) if f"fp/{g}/update_ratio" in row)))
@@ -2146,6 +2226,16 @@ def main(argv=None) -> None:
                          "recovery SFT produced, on that SFT's role corpus); no --anchor cache pass needed")
     ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens "
                     "(--loss ce: the unlikelihood replaces the CE there; lead-in positions are not scored)")
+    ap.add_argument("--token-penalty", action="append", default=[], metavar="RULE",
+                    help="train (--loss ce), repeatable: push a SET of tokens down where they should not come, on "
+                    "top of the CE: weight * -log(1 - p(set)). "
+                    "RULE = 'name=N;tokens=SET;at=SET|any;roles=1,2;weight=W'. "
+                    "SET = ids '954,1454' | '@FILE' | 'prefix:STR' / 'contains:STR' / 'text:STR' (tokenizer pieces). "
+                    "'at' = the TARGET tokens where the rule applies (default any scored position); roles default 1,2; "
+                    "the target itself is never penalised. E.g. bm-898 `</` at reasoning ends: "
+                    "'name=closer;at=101;tokens=contains:</;weight=1'; fences inside code arguments: "
+                    "'name=argfence;roles=2;tokens=contains:```;weight=0.5'. "
+                    "Logged per rule as train/tp_<name>_{n,p,loss}")
     ap.add_argument("--loop-weight", type=float, default=1.0, help="train: weight of loop (3) and lead-in (4) "
                     "positions in the weighted-mean loss (train/loop_share logs the realised share)")
     ap.add_argument("--model", required=True, help="HF model dir (weights) of the teacher / student base")
@@ -2273,6 +2363,18 @@ def main(argv=None) -> None:
     ap.add_argument("--load", default="", help="train: resume from this full checkpoint (default: <run>/last.pt "
                     "if present); export: checkpoint whose weights to export")
     a = ap.parse_args(argv)
+    if a.token_penalty:
+        if a.loss != "ce":
+            raise SystemExit("--token-penalty needs --loss ce")
+        vocab = None
+        if any(k in r for r in a.token_penalty for k in ("prefix:", "contains:", "text:")):
+            from transformers import AutoTokenizer
+            vocab = AutoTokenizer.from_pretrained(getattr(a, "tokenizer", None) or a.model).get_vocab()
+        a._token_penalties = [parse_token_penalty(r, vocab) for r in a.token_penalty]
+        for rule in a._token_penalties:
+            at = "any" if rule["at"] is None else rule["at"].tolist()[:8]
+            print(f"token penalty {rule['name']}: weight {rule['weight']} roles {rule['roles']} at {at} on "
+                  f"{len(rule['neg'])} tokens {rule['neg'].tolist()[:12]}{' ...' if len(rule['neg']) > 12 else ''}")
     from .imatrix import set_convention
 
     set_convention(a.imatrix_convention)
