@@ -550,6 +550,25 @@ def test_sft_weights_scale_the_gradient_not_the_logged_loss(g4, roles_cache):
     assert bad.returncode != 0 and "is not a --sft-data source" in bad.stdout + bad.stderr
 
 
+def test_decay_start_holds_peak_then_cosines_to_min():
+    """--decay-start N (bm-898 a2h): peak through step N, then cosine to exactly min_lr at the last step.
+
+    decay_start=0 is the old plain cosine, bit for bit.
+    """
+    import math
+
+    from omk_qad.fakequant import cosine_lr
+
+    total, lr, mn, wu, n = 107, 4.74e-6, 4.74e-7, 3, 80
+    sched = [cosine_lr(s, total, lr, mn, wu, n) for s in range(total)]
+    assert sched[:wu] == [lr * (s + 1) / wu for s in range(wu)]
+    assert all(x == lr for x in sched[wu:n])  # 1-based steps wu+1 .. N
+    assert sched[n] < lr and math.isclose(sched[-1], mn, rel_tol=0, abs_tol=1e-18)
+    assert all(a >= b for a, b in zip(sched[n - 1 :], sched[n:]))
+    old = [mn + 0.5 * (lr - mn) * (1 + math.cos(math.pi * min(1.0, (s - wu) / (total - wu)))) for s in range(wu, total)]
+    assert [cosine_lr(s, total, lr, mn, wu) for s in range(wu, total)] == old
+
+
 def test_row_w_scales_like_a_source_weight(g4, roles_cache):
     """A row's "w" (bm-898 a2h) scales its loss for the gradient exactly as --sft-weights does; w <= 0 is refused."""
     rfile = WORK / "conv.roles.jsonl"

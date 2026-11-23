@@ -744,9 +744,18 @@ def load_adafactor_state(latents: dict[str, Latent], state: dict) -> None:
             lat.m = m[0].to(lat.param.device)
 
 
-def cosine_lr(step: int, total: int, lr: float, min_lr: float, warmup: int) -> float:
-    """Linear warmup then cosine from ``lr`` to ``min_lr`` over ``total`` steps (Bolt: 1e-5 -> 1e-7)."""
+def cosine_lr(step: int, total: int, lr: float, min_lr: float, warmup: int, decay_start: int = 0) -> float:
+    """Linear warmup then cosine from ``lr`` to ``min_lr`` over ``total`` steps (Bolt: 1e-5 -> 1e-7).
+
+    ``step`` is 0-based. ``decay_start`` N > 0 (bm-898 a2h, warmup-stable-decay): the rate holds at ``lr`` through
+    1-based step N and the cosine runs from step N+1 to exactly ``min_lr`` at the last step. 0 = the plain cosine.
+    """
     if step < warmup:
         return lr * (step + 1) / warmup
+    if decay_start > 0:
+        if step < decay_start:
+            return lr
+        frac = min(1.0, (step - decay_start + 1) / max(1, total - decay_start))
+        return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * frac))
     frac = min(1.0, (step - warmup) / max(1, total - warmup))
     return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * frac))

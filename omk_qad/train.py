@@ -1862,6 +1862,10 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     meta = json.load(open(os.path.join(a.cache, "cache.json")))
     sh = meta["shard"]
     last = a.stop_at or a.steps
+    if a.decay_start:  # bm-898 a2h: warmup-stable-decay
+        if not a.warmup <= a.decay_start < a.steps:
+            raise SystemExit(f"--decay-start {a.decay_start} must lie in [--warmup {a.warmup}, --steps {a.steps})")
+        say(f"LR_SCHEDULE lr {a.lr} through step {a.decay_start}, cosine to {a.min_lr} at step {a.steps}")
     sft = sft_files(a)
     sft_ev, src_w, row_w = None, {}, False
     # bm-889 sft4: --loss ce takes no targets from the cache, so its windows are as long as the corpus made them (every
@@ -2065,7 +2069,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     student.train()
     for step in range(start, last + 1):
         ctl.step = step
-        ctl.lr = cosine_lr(step - 1, a.steps, a.lr, a.min_lr, a.warmup) * guard.scale
+        ctl.lr = cosine_lr(step - 1, a.steps, a.lr, a.min_lr, a.warmup, a.decay_start) * guard.scale
         if opt is not None:
             for gq in opt.param_groups:
                 gq["lr"] = gq.get("base", a.fp_lr) * ctl.lr / a.lr
@@ -2330,6 +2334,7 @@ def main(argv=None) -> None:
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-5, help="Bolt QAD peak LR")
     ap.add_argument("--min-lr", type=float, default=1e-7)
+    ap.add_argument("--decay-start", type=int, default=0, help="hold --lr through this step, then cosine to --min-lr at the last step (warmup-stable-decay, bm-898 a2h); 0 = cosine from the end of warmup")
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--fp-lr", type=float, default=1e-5)
     ap.add_argument("--beta2", type=float, default=0.999)
