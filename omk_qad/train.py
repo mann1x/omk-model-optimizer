@@ -123,10 +123,12 @@ def _sft_window(path: str) -> int:
     raise SystemExit(f"{path}: no rows")
 
 
-def _role_rows(path: str, seq: int, passes: list):
+def _role_rows(path: str, seq: int, passes: list, weights: list | None = None):
     """Endless stream of (ids, role) rows of a ``.roles.jsonl`` source (omk_qad.rollouts windows, ``seq`` long).
 
     The first pass is checked against the builder's ``.stats.json`` window count: a short (torn) file is refused.
+    ``weights`` (bm-898 a2h): when given, each yielded row's optional ``"w"`` field (its loss weight, default 1.0)
+    is appended to it first; a weight that is not > 0 is refused.
     """
     side = Path(path).with_suffix(".stats.json")
     want = json.loads(side.read_text()).get("windows") if side.exists() else None
@@ -141,6 +143,11 @@ def _role_rows(path: str, seq: int, passes: list):
                 if len(row["ids"]) != seq or len(row["role"]) != seq:
                     raise SystemExit(f"{path}: a row of {len(row['ids'])} tokens, the cache runs --seq {seq}")
                 n += 1
+                if weights is not None:
+                    w = float(row.get("w", 1.0))
+                    if not w > 0:
+                        raise SystemExit(f"{path}: row {n} has w={row.get('w')!r}, a row weight must be > 0")
+                    weights.append(w)
                 yield torch.tensor(row["ids"]), torch.tensor(row["role"], dtype=torch.int8)
         passes.append(path)
         if n == 0:
@@ -1764,15 +1771,17 @@ class SftRows:
         ``epochs`` > 1 (bm-889 sft10, --sft-epochs): the order is ``epochs`` passes over every row, one after the
         other, each its own permutation (pass e seeded ``seed + e``; pass 0 is exactly the single-pass order).
         """
-        xs, rs, self.source = [], [], []
+        xs, rs, self.source, self.w = [], [], [], []
         for f, name in zip(files, source_names(files), strict=True):
             done: list = []
-            for x, r in _role_rows(f, seq, done):
+            wf: list = []
+            for x, r in _role_rows(f, seq, done, wf):
                 if done:
                     break
                 xs.append(x.to(torch.int32))
                 rs.append(r)
                 self.source.append(name)
+                self.w.append(wf[-1])  # the row's own "w" (default 1.0), bm-898 a2h
         if not xs:
             raise SystemExit("--sft-data: no rows")
         self.x, self.role = torch.stack(xs), torch.stack(rs)
@@ -1786,6 +1795,10 @@ class SftRows:
     def __len__(self) -> int:
         """Number of rows."""
         return len(self.rows)
+
+    def weighted(self) -> bool:
+        """True when any row carries a ``"w"`` other than 1.0 (per-row loss weights, bm-898 a2h)."""
+        return any(w != 1.0 for w in self.w)
 
     def batch(self, s0: int, bs: int) -> dict:
         """Rows ``s0 .. s0+bs`` of the order (as ``CacheRows.batch``, teacher keys None)."""
@@ -1850,7 +1863,7 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     sh = meta["shard"]
     last = a.stop_at or a.steps
     sft = sft_files(a)
-    sft_ev, src_w = None, {}
+    sft_ev, src_w, row_w = None, {}, False
     # bm-889 sft4: --loss ce takes no targets from the cache, so its windows are as long as the corpus made them (every
     # row is checked against it); the cache's own eval rows and eval sets keep their length. Distillation keeps the
     # cache's seq. (Sizing by --seq instead broke callers that render short windows without passing --seq.)
@@ -1859,6 +1872,11 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         say(f"SFT_SEQ {sft_seq} (from {sft[0]})" if a.loss == "ce" else f"SFT_SEQ {sft_seq} (the cache's)")
         rows = SftRows(sft, sft_seq, a.data_order, a.seed, a.sft_epochs)
         src_w = sft_weights(a, sft)
+        row_w = rows.weighted()
+        if row_w:  # bm-898 a2h: a row's "w" scales its gradient (times its --sft-weights source weight)
+            if a.loss != "ce":
+                raise SystemExit("--sft-data rows carry \"w\" loss weights: only --loss ce uses them")
+            say(f"ROW_WEIGHTS {json.dumps(sorted(collections.Counter(rows.w).items()))} (weight, rows)")
         if len(rows) < last * a.bs * a.accum:
             raise SystemExit(f"--sft-data holds {len(rows)} rows, the run needs {last * a.bs * a.accum}")
         sft_ev = SftRows(sft_eval_files(a, sft), sft_seq, "cache", a.seed)
@@ -2061,8 +2079,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             s0 = ((step - 1) * a.accum + k) * a.bs
             ids += rows.rows[s0 : s0 + a.bs]
             b = rows.batch(s0, a.bs)
-            if src_w:
-                a._row_scale = [src_w.get(rows.source[j], 1.0) for j in rows.rows[s0 : s0 + a.bs]]
+            if src_w or row_w:
+                a._row_scale = [src_w.get(rows.source[j], 1.0) * rows.w[j] for j in rows.rows[s0 : s0 + a.bs]]
             x = b["x"].long().to(a.device)
             idx, val = (None, None) if b["idx"] is None else (b["idx"].to(a.device), b["val"].to(a.device))
             roles = {r: None if b[r] is None else b[r].to(a.device) for r in ("role", "aidx", "aval")}

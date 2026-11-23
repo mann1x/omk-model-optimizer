@@ -550,6 +550,36 @@ def test_sft_weights_scale_the_gradient_not_the_logged_loss(g4, roles_cache):
     assert bad.returncode != 0 and "is not a --sft-data source" in bad.stdout + bad.stderr
 
 
+def test_row_w_scales_like_a_source_weight(g4, roles_cache):
+    """A row's "w" (bm-898 a2h) scales its loss for the gradient exactly as --sft-weights does; w <= 0 is refused."""
+    rfile = WORK / "conv.roles.jsonl"
+    efile = WORK / "conv_eval.roles.jsonl"
+    efile.write_bytes(rfile.read_bytes())
+    efile.with_suffix(".stats.json").write_bytes(rfile.with_suffix(".stats.json").read_bytes())
+    rows = [json.loads(ln) for ln in rfile.read_text().splitlines() if ln.strip()]
+    for name, w in (("conv_w3", 3.0), ("conv_w1", 1.0), ("conv_w0", 0.0)):
+        f = WORK / f"{name}.roles.jsonl"
+        f.write_text("".join(json.dumps({**r, "w": w}) + "\n" for r in rows))
+        f.with_suffix(".stats.json").write_bytes(rfile.with_suffix(".stats.json").read_bytes())
+    base = ("omk_qad.train", *TRAIN, "--model", str(g4["student"]), "--cache", str(roles_cache), "--steps", "1",
+            "--loss", "ce", "--mtp", "freeze", "--sft-eval", str(efile), "--eval-every", "1")
+    runs = {}
+    for name, data, extra in (("src3", "conv", ("--sft-weights", "conv=3")), ("row3", "conv_w3", ()),
+                              ("plain", "conv", ()), ("row1", "conv_w1", ())):
+        out = WORK / f"run_row_w_{name}"
+        shutil.rmtree(out, ignore_errors=True)
+        _run(*base, "--sft-data", str(WORK / f"{data}.roles.jsonl"), *extra, "--out", str(out))
+        text = (out / "stage1" / "log.txt").read_text()
+        runs[name] = (_ckpt(out)["latents"], text)
+    assert "ROW_WEIGHTS [[3.0, " in runs["row3"][1] and "ROW_WEIGHTS" not in runs["row1"][1]
+    for x, y in (("src3", "row3"), ("plain", "row1")):
+        assert all(torch.equal(runs[x][0][k], runs[y][0][k]) for k in runs[x][0]), (x, y)
+    assert any(not torch.equal(runs["plain"][0][k], runs["row3"][0][k]) for k in runs["plain"][0])
+    bad = _run(*base, "--sft-data", str(WORK / "conv_w0.roles.jsonl"), "--out", str(WORK / "run_row_w_bad"),
+               check=False)
+    assert bad.returncode != 0 and "a row weight must be > 0" in bad.stdout + bad.stderr
+
+
 # ----------------------------------------------------------------------------------------- router_full (bm-898 sft11r)
 ROUTER_FULL_SUFFIXES = ("router.proj.weight", "router.scale", "router.per_expert_scale",
                         "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
