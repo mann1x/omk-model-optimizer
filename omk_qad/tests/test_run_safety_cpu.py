@@ -96,3 +96,37 @@ def test_train_lock_and_resume_identity(setup):  # noqa: F811
     assert json.loads((out / "stage1" / "state.json").read_text())["status"] == "done"
     hist = json.loads((out / "stage1" / "identity.json").read_text())["history"]
     assert hist and "lr" in hist[-1]["changed"]
+
+
+def test_checkpoint_is_saved_before_the_eval(setup):  # noqa: F811
+    """bug-996 (owner 2026-11-24): an eval that dies must not take the steps since the last periodic save with it.
+
+    3 steps, --save-every 2, eval at step 3 forced to fail: last.pt must hold step 3 (before the fix: step 2), and the
+    relaunch resumes from step 3, runs the step-3 eval it missed and finishes.
+    """
+    model, lay = setup["moe"]
+    out = WORK / "run_save_before_eval"
+    if out.exists():
+        shutil.rmtree(out)  # test scratch of this test only
+    p = _train(model, lay, setup["cache"], out, "--save-every", "2", check=False,
+               env={**CPU_ENV, "OMK_QAD_FAIL_EVAL_AT": "step3"})
+    log = p.stdout + p.stderr
+    assert p.returncode != 0 and "injected eval failure at step3" in log, log[-3000:]
+    assert "CHECKPOINT step 3 ->" in log, log[-3000:]
+    assert json.loads((out / "stage1" / "last.json").read_text())["step"] == 3
+    p = _train(model, lay, setup["cache"], out, "--save-every", "2")
+    assert "RESUME from step 3" in p.stdout + p.stderr
+    assert json.loads((out / "stage1" / "state.json").read_text())["status"] == "done"
+
+
+def test_resume_ignores_per_step_scratch_on_the_args():
+    """bug-995: a checkpoint's args carry a._row_scale (per-step scratch); a fresh parse has none -> not a change."""
+    from argparse import Namespace
+
+    from omk_qad.train import check_resume_args
+
+    check_resume_args({"lr": 1e-5, "_row_scale": [1.0, 1.0]}, Namespace(lr=1e-5), {}, "last.pt")
+    import pytest
+
+    with pytest.raises(SystemExit, match="RUN_REFUSED"):
+        check_resume_args({"lr": 1e-5}, Namespace(lr=2e-5), {}, "last.pt")

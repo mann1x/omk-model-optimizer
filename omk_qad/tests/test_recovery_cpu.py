@@ -1072,3 +1072,28 @@ def test_sft_run_with_a_loop_source_reports_loop_share_and_loop_eval(g4, roles_c
         assert abs(e["nll_mean"] - cf["nll"]) < 1e-9 and e["scored"] == cf["scored"]  # loop positions are not CE
     shares = [float(ln.split("loop_share ")[1].split()[0]) for ln in text.splitlines() if "loop_share " in ln]
     assert shares and all(0 <= s <= 1 for s in shares) and any(s > 0 for s in shares), text[-1500:]
+
+
+def test_router_flip_reference_accepts_appended_eval_rows():
+    """bug-996: eval rows APPENDED on resume -> flip on the reference prefix; fewer tokens -> refused."""
+    import pytest
+    import torch
+
+    from omk_qad.router_telemetry import RouterProbe, _Acc
+
+    probe = object.__new__(RouterProbe)  # the accounting only: no model hooks needed
+    probe.n_experts, probe.init_top1, probe.mode = 4, None, "eval"
+
+    def fill(top1):
+        acc = _Acc(counts=torch.bincount(top1.long(), minlength=4), top1=[top1.to(torch.int16)], ent=0.0,
+                   tokens=top1.numel())
+        probe._acc = {0: acc}
+
+    ref = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+    fill(ref)
+    assert probe.end_eval(set_reference=True).layers[0].flip == 0.0
+    fill(torch.cat([torch.tensor([0, 1, 2, 3, 0, 1, 2, 0]), torch.tensor([3, 3, 3, 3])]))  # 1 flip + 4 appended
+    assert probe.end_eval().layers[0].flip == pytest.approx(1 / 8)
+    fill(ref[:6])
+    with pytest.raises(SystemExit, match="removed or changed"):
+        probe.end_eval()

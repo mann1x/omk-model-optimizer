@@ -48,7 +48,15 @@ from .losses import jaccard_topk_rest, kl_topk_rest, rkl_topk_rest
 from .ptq import load_text_causal_lm
 from .recovery import softcap, softcap_of
 from .runctl import Control as RunControl
-from .runctl import RunLock, State, atomic_json, atomic_torch_save, check_identity, file_id, parse_allow
+from .runctl import (
+    RunLock,
+    State,
+    atomic_json,
+    atomic_torch_save,
+    check_identity,
+    file_id,
+    parse_allow,
+)
 
 LOG = [None]
 
@@ -1559,7 +1567,8 @@ def check_resume_args(saved: dict, a, allow: dict, src: str) -> None:
     """Refuse to resume a checkpoint written with different run-critical args (legacy runs have no identity.json)."""
     cur = vars(a)
     diff = {k: (saved.get(k), cur.get(k)) for k in sorted(set(saved) | set(cur))
-            if k not in RUNTIME_ARGS and saved.get(k) != cur.get(k) and k in saved}
+            if k not in RUNTIME_ARGS and not k.startswith("_") and saved.get(k) != cur.get(k) and k in saved}
+    # "_"-prefixed keys are per-step scratch the loop keeps on the namespace (a._row_scale, bug-995), not settings
     bad = {k: v for k, v in diff.items() if k not in allow or (allow[k] is not None and str(v[1]) != allow[k])}
     if bad:
         raise SystemExit(f"RUN_REFUSED resume from {src}: written with different settings ("
@@ -2133,7 +2142,16 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
                 say(f"SRCLOSS step {step} fixmix {'-' if fm is None else f'{fm:.4f}'} "
                     + json.dumps({k: round(v, 4) for k, v in per_src.averages().items()}))
         tel.log(row, step)
+        saved_at = None
+        if (step % a.eval_every == 0 or step == last) and not guard.bad:
+            # owner 2026-11-24 (bug-996): save BEFORE the eval. An eval that dies (OOM, a telemetry refusal, a bad eval
+            # row) must not take the steps since the last periodic save with it; the save after the eval is skipped.
+            checkpoint(step)
+            t_save = time.time()
+            saved_at = step
         if step % a.eval_every == 0 or step == last:
+            if os.environ.get("OMK_QAD_FAIL_EVAL_AT") == f"step{step}":  # fault injection for the tests only
+                raise SystemExit(f"OMK_QAD_FAIL_EVAL_AT: injected eval failure at step{step}")
             results.append(run_eval(f"step{step}"))
             tel.eval(results[-1], step)
             atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
@@ -2168,8 +2186,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
         if guard.bad and not why:  # never roll the saved state forward onto a step the guard suspects
             continue
         finishing = step == a.steps and not why  # final.pt is written right after the loop: no second copy
-        if not finishing and (why or rolled or step % a.save_every == 0 or step == last
-                              or time.time() - t_save > a.save_minutes * 60):
+        if not finishing and saved_at != step and (why or rolled or step % a.save_every == 0 or step == last
+                                                   or time.time() - t_save > a.save_minutes * 60):
             checkpoint(step)
             t_save = time.time()
         if why:
@@ -2179,7 +2197,13 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
             say(peak())
             tel.finish()
             return
-    if step == a.steps and step >= start:
+    resumed_at_end = start == a.steps + 1 and step == a.steps  # last.pt is the pre-eval save of the final step
+    if resumed_at_end and not any(r.get("tag") == f"step{step}" for r in results):
+        say(f"RESUME at the final step {step}: its eval did not finish before, running it now")
+        results.append(run_eval(f"step{step}"))
+        tel.eval(results[-1], step)
+        atomic_json(run / "summary.json", {"args": vars(a), "origin": origin, "results": results})
+    if step == a.steps and (step >= start or resumed_at_end):
         save_state(final, step, latents, student, opt, a, ctl, results, origin)
         for f in (last_ck, last_ck.with_suffix(".json")):  # a finished stage never resumes (final.pt is immutable)
             f.unlink(missing_ok=True)
@@ -2334,7 +2358,9 @@ def main(argv=None) -> None:
     ap.add_argument("--bs", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-5, help="Bolt QAD peak LR")
     ap.add_argument("--min-lr", type=float, default=1e-7)
-    ap.add_argument("--decay-start", type=int, default=0, help="hold --lr through this step, then cosine to --min-lr at the last step (warmup-stable-decay, bm-898 a2h); 0 = cosine from the end of warmup")
+    ap.add_argument("--decay-start", type=int, default=0,
+                    help="hold --lr through this step, then cosine to --min-lr at the last step "
+                         "(warmup-stable-decay, bm-898 a2h); 0 = cosine from the end of warmup")
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--fp-lr", type=float, default=1e-5)
     ap.add_argument("--beta2", type=float, default=0.999)

@@ -200,10 +200,17 @@ class RouterProbe:
             flip = None
             if self.init_top1 is not None and i in self.init_top1:
                 ref = self.init_top1[i]
-                if ref.numel() != t1.numel():
+                if t1.numel() < ref.numel():
                     raise SystemExit(f"router telemetry: layer {i} saw {t1.numel()} eval tokens, the reference has "
-                                     f"{ref.numel()} (the eval rows changed)")
-                flip = float((ref != t1).float().mean())
+                                     f"{ref.numel()} (eval rows were removed or changed)")
+                if t1.numel() > ref.numel() and i == min(self._acc):
+                    # bm-898 2026-11-24 (bug-996): eval files APPENDED on resume (sft_eval is a runtime
+                    # arg). Eval rows are fixed-length and evaluated in file order, so the first
+                    # ref.numel() tokens are the reference rows: the flip is measured on them only.
+                    print(f"router telemetry: {t1.numel() - ref.numel()} eval tokens beyond the {ref.numel()} "
+                          "reference tokens (eval rows added on resume); flip measured on the reference rows",
+                          flush=True)
+                flip = float((ref != t1[: ref.numel()]).float().mean())
             layers[i] = LayerStats(load=load, top_share=share, entropy=acc.ent / max(1, acc.tokens), flip=flip,
                                    tokens=acc.tokens)
         if set_reference or self.init_top1 is None:
