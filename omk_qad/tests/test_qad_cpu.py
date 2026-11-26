@@ -325,6 +325,84 @@ def test_train_export_verify_load(setup):
     assert proc.returncode == 0 and "Final estimate" in proc.stdout + proc.stderr, proc.stderr[-2000:]
 
 
+def test_imatrix_gguf_roundtrip_and_combine(setup):
+    """A GGUF imatrix maps back to HF names through the layout; combining sums sum(x^2) and counts (bm-897)."""
+    from omk_qad.imatrix import combine, from_gguf, load, per_gguf
+
+    _, lay = setup["moe"]
+    layout = torch.load(lay, weights_only=False)
+    pt = load(setup["cache"] / "imatrix.pt")
+    back = from_gguf(setup["cache"] / "imatrix.gguf", layout, LLAMA_CPP)
+    want = set(per_gguf(pt["entries"], layout))  # the HF entries the GGUF carries
+    srcs = {layout["targets"][g]["src"] for g in want}
+    assert set(back["entries"]) == srcs and back["unmapped"] == 0
+    permuted = 0
+    for n in srcs:
+        e, b = pt["entries"][n], back["entries"][n]
+        assert torch.equal(e["counts"], b["counts"]), n
+        assert torch.allclose(e["sums"], b["sums"], rtol=1e-6, atol=0), n  # float32 in the GGUF
+        permuted += any(layout["targets"][g]["colperm"] is not None for g in layout["by_param"][n])
+    # an imatrix combined with itself (once as .pt, once as GGUF): exactly twice the counts, twice the sums
+    out = WORK / "imatrix_combined_self"
+    if out.exists():
+        import shutil
+
+        shutil.rmtree(out)
+    combine([setup["cache"] / "imatrix.pt", setup["cache"] / "imatrix.gguf"], layout, out, LLAMA_CPP)
+    c = load(out / "imatrix.pt")
+    assert len(c["combined_from"]) == 2 and (out / "imatrix.gguf").exists()
+    for n in srcs:
+        assert torch.equal(c["entries"][n]["counts"], 2 * pt["entries"][n]["counts"]), n
+        assert torch.allclose(c["entries"][n]["sums"], 2 * pt["entries"][n]["sums"], rtol=1e-6, atol=0), n
+    # entries only the .pt has (no GGUF target) carry that input alone
+    for n in set(pt["entries"]) - srcs:
+        assert torch.equal(c["entries"][n]["counts"], pt["entries"][n]["counts"]), n
+    with pytest.raises(SystemExit, match="at least two"):
+        combine([setup["cache"] / "imatrix.pt"], layout, out, LLAMA_CPP)
+
+
+def test_train_imatrix_combine(setup):
+    """--imatrix-combine: training and export use <out>/imatrix.combined; a rerun reuses it, other inputs refuse."""
+    import shutil
+
+    model, lay = setup["moe"]
+    run, gg = WORK / "run_moe_imcomb", WORK / "qad_moe_imcomb.gguf"
+    if run.exists():
+        shutil.rmtree(run)
+    gguf_imat = str(setup["cache"] / "imatrix.gguf")
+    common = (*TRAIN, "--model", str(model), "--layout", str(lay), "--cache", str(setup["cache"]), "--out", str(run))
+    out = _run("omk_qad.train", *common, "--steps", "1", "--eval-every", "1", "--save-every", "1",
+               "--imatrix-combine", gguf_imat)
+    comb = run / "imatrix.combined" / "imatrix.pt"
+    assert "IMATRIX_COMBINE" in (run / "stage1" / "log.txt").read_text() + out and comb.exists()
+    assert torch.load(run / "stage1" / "final.pt", weights_only=False)["imatrix"] == str(comb)
+    first = comb.stat().st_mtime_ns
+    # a changed input refuses (never overwrites the combined imatrix); a new branch shares <out>/imatrix.combined
+    other = WORK / "imatrix_other.pt"
+    rec = torch.load(setup["cache"] / "imatrix.pt", weights_only=False)
+    for e in rec["entries"].values():
+        e["counts"] = e["counts"] + 1
+    torch.save(rec, other)
+    proc = subprocess.run([sys.executable, "-m", "omk_qad.train", *common, "--steps", "1", "--stage", "2",
+                           "--branch", "b2", "--imatrix-combine", str(other)],
+                          capture_output=True, text=True, env=CPU_ENV, check=False)
+    assert proc.returncode != 0 and "combined from other imatrices" in proc.stdout + proc.stderr
+    assert comb.stat().st_mtime_ns == first
+    # the same inputs: a stage-2 branch reuses it
+    out = _run("omk_qad.train", *common, "--steps", "1", "--eval-every", "1", "--save-every", "1", "--stage", "2",
+               "--branch", "same", "--imatrix-combine", gguf_imat)
+    assert "IMATRIX_COMBINE reusing" in (run / "stage2" / "same" / "log.txt").read_text() + out
+    assert comb.stat().st_mtime_ns == first
+    _run("omk_qad.train", "--phase", "export", "--model", str(model), "--layout", str(lay), "--device", "cpu",
+         "--load", str(run / "stage1" / "final.pt"), "--gguf", str(gg), "--latent-dtype", "fp16",
+         "--latent-min", "65536")
+    rep = json.loads(gg.with_suffix(".export.json").read_text())
+    assert rep["verify_failures"] == [] and rep["with_imatrix"] > 0
+    assert torch.equal(torch.load(gg.with_suffix(".imatrix.pt"), weights_only=False)["entries"][
+        next(iter(rec["entries"]))]["counts"], torch.load(comb, weights_only=False)["entries"][
+        next(iter(rec["entries"]))]["counts"])
+
+
 def _flat(payload) -> np.ndarray:
     arr = payload.detach().cpu().numpy() if isinstance(payload, torch.Tensor) else payload
     return np.ascontiguousarray(arr, dtype=np.uint8).reshape(-1)

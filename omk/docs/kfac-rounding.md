@@ -145,13 +145,59 @@ The commands below are the ones the two published ladders ran (bs2, one RTX PRO 
 - the model as an HF checkpoint (for the factors) **and** as its unquantised GGUF (BF16 for a bf16 checkpoint): the
   GGUF is `W0` of every tensor the rounder re-rounds, so it must be the export of the checkpoint the factors were
   collected on (`kfac_validate --hf` compares layer 0 bit for bit);
-- an imatrix for that GGUF (any `llama-imatrix` output; the 20B used the AtomicChat corpus imatrix with
-  `--parse-special`, the 26B its QAD cache's own corpus imatrix);
+- an imatrix for that GGUF: see [4.0.1 Which imatrix](#401-which-imatrix) (the 20B ladder used the AtomicChat corpus
+  imatrix, the 26B ladder its QAD cache's imatrix; equivalent from Q4_K_M up, AC + cache combined best at low bits);
 - a set of tokenised windows with role masks (an `omk_qad` teacher cache, [qad.md](qad.md)): the factors are
   collected on its training windows, the twin score on its held-out rows. A sibling model with the same tokenizer can
   lend its cache (the 20B v9-agentic used the 26B agentic cache: the labels are sampled from the model under
   `--model`, so only the token streams are borrowed);
 - disk: factors 59–77 GB per model, each tier ~2 × its GGUF size while the twin exists, plus the archive.
+
+#### 4.0.1 Which imatrix
+
+The rounder needs an imatrix twice: the stock `llama-quantize` tier it starts from is built with it (every tensor
+K-FAC does not re-round, attention and embeddings included, stays as that file has it), and the encoders weight their
+scale search with it. Two sources exist, and **the factor collection does not produce one** (`omk_qad.kfac` writes
+only `A`, `G`, `n`):
+
+| | AtomicChat (AC) imatrix | QAD-cache imatrix |
+|---|---|---|
+| made by | `llama-imatrix` on the unquantised GGUF (omnimergekit `quantize_gguf.py --imatrix-only`, `--parse-special`) | the QAD teacher cache (`omk_qad.train --phase cache`), first `--imatrix-seqs` training windows (default 256) |
+| data | the [AtomicChat calib-corpora](https://huggingface.co/datasets/AtomicChat/calib-corpora) recipe for the model, chat-templated | the model's own training corpus (for Gemma-4 agentic: the sft11 windows) |
+| volume | 9,590 chunks × 512 tokens = 4.91 M tokens, every position | 258 windows × 16,384 tokens = 4.23 M tokens, every position |
+| time (bs2, RTX PRO 6000) | **1 h 30 min** (20B, 2026-11-19) + the F16 export | ~**28 min** of the cache run (26B: 250 windows at 1,647 s); the whole cache takes 3 h 25 min (26B) / 3 h 47 min (20B) and is needed anyway by a QAD and as the factors' windows |
+| required when | the model has **no QAD cache of its own** (K-FAC only, or factors collected on a sibling's cache, as the 20B ladder) | the tier is **QAD-trained** (IQ2_XXS): the QAD export refuses any imatrix other than the one training used, so the PTQ reference, the K-FAC seed and the QAD share the cache imatrix |
+
+**Measured (2026-11-26).** 26B agentic, the published F16 GGUF and both published imatrices from the HF repo
+(`imatrix.dat` = AC `609a0a04…`, `imatrix.gguf` = cache `80e56b9b…`), plus the two combined by llama.cpp
+(`llama-imatrix -m F16.gguf --in-file imatrix.dat --in-file imatrix.gguf -o both.gguf`: no prompt, so it only sums
+`Σx²` and the counts, a token-weighted mean, 54 % AC / 46 % cache). `llama-quantize` b12386 with the Gemma-4 attention
+rule, the arms differing only in the imatrix, scored on the twin reference (top-256 KL / top-1, 44 held-out rows of
+the cache corpus):
+
+| tier | cache imatrix | AC imatrix | both combined |
+|---|---|---|---|
+| Q4_K_M | 0.00808 / 0.9793 | 0.00809 / 0.9793 | 0.00807 / 0.9794 |
+| IQ3_XXS | 0.04122 / 0.9545 | 0.04009 / 0.9543 (−2.7 %) | **0.03949 / 0.9546** (−4.2 %) |
+
+- From Q4_K_M up the choice does not matter (all three within 0.3 %; per family the arms trade places).
+- At low bits the AC imatrix beats the cache one by 2.7 % KL even on the cache's own corpus, and the combination is
+  best (−4.2 % vs cache, −1.5 % vs AC): two different corpora and context lengths (512-token general chunks, 16k-token
+  agentic windows) cover more of the activation distribution than either.
+- The effect is an order of magnitude below K-FAC's: at IQ3_XXS K-FAC rounding takes the stock 0.0410 to 0.0283
+  (−31 %, §6.1); the imatrix choice moves the stock file by 3–4 %.
+
+Rule: compute the AC imatrix for every model (1 h 30 min); when the model also has a QAD cache, quantize with the
+two combined. A QAD-trained tier (IQ2_XXS) must share one imatrix between the PTQ reference, the seed, the trainer and
+the export (the export refuses any other). `omk_qad.train --imatrix-combine AC.gguf` does the combining itself: it
+sums the given imatrices (an `imatrix.pt` or any llama.cpp GGUF imatrix, mapped back to HF names through the layout)
+into the run's `--imatrix` (default: the cache's), writes `<out>/imatrix.combined/{imatrix.pt,imatrix.gguf}` once,
+and training, every later stage and the export use it; the `imatrix.gguf` there feeds `llama-quantize` and
+`kfac_round` for the stock and K-FAC tiers of the same ladder. Checked on the 26B: bit-identical (every count and
+Σx²) to `llama-imatrix --in-file imatrix.dat --in-file imatrix.gguf`.
+The published 26B ladder used the cache imatrix alone; its tiers from IQ4_XS down would gain ~3–4 % KL with the
+combined one. Script: [`models/gemma-4-26b-a4b/kfac/ab_imatrix_26b.sh`](../models/gemma-4-26b-a4b/kfac/ab_imatrix_26b.sh)
+(`TIERS=…`; `ARMS=both` builds the combined imatrix).
 
 ### 4.1 Collect the factors (once per model, 75 min – 2¼ h, 59–77 GB)
 

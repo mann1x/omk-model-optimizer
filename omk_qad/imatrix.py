@@ -204,7 +204,7 @@ def per_gguf(imat: dict, layout: dict) -> dict[str, tuple[np.ndarray, np.ndarray
 
 
 def save(imat: dict, layout: dict | None, out_dir: Path, datasets: list[str], chunk_size: int, chunks: int,
-         llama_cpp: Path) -> list[Path]:
+         llama_cpp: Path, extra: dict | None = None) -> list[Path]:
     """Write ``imatrix.pt`` and (with a layout) llama.cpp's ``imatrix.gguf`` into ``out_dir``.
 
     Both atomically, the GGUF first: ``imatrix.pt`` is the completion marker callers test for.
@@ -232,8 +232,8 @@ def save(imat: dict, layout: dict | None, out_dir: Path, datasets: list[str], ch
         w.close()
         os.replace(part, out_dir / "imatrix.gguf")
         paths.append(out_dir / "imatrix.gguf")
-    atomic_torch_save({"entries": imat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks},
-                      paths[0])
+    atomic_torch_save({"entries": imat, "datasets": datasets, "chunk_size": chunk_size, "chunk_count": chunks,
+                       **(extra or {})}, paths[0])
     return paths
 
 
@@ -242,6 +242,115 @@ def load(path: Path) -> dict:
     rec = torch.load(path, map_location="cpu", weights_only=False)
     rec["path"] = str(path)
     return rec
+
+
+def from_gguf(path: Path, layout: dict, llama_cpp: Path) -> dict:
+    """A llama.cpp GGUF imatrix as an ``imatrix.pt`` record (by HF parameter name, through the layout).
+
+    The inverse of ``per_gguf``: each target's columns go back through its column permutation; targets that share
+    a source (fused gate/up halves, a tied head) saw the same input and must agree. Tensors the layout does not map
+    to a source are skipped (counted in ``unmapped``).
+    """
+    from .gguf_export import _import_llama_cpp
+
+    gguf = _import_llama_cpp(Path(llama_cpp))[0]
+    r = gguf.GGUFReader(str(path))
+    gtype = r.fields["general.type"].contents() if "general.type" in r.fields else None
+    if gtype != "imatrix":
+        raise SystemExit(f"{path}: not a GGUF imatrix (general.type {gtype!r})")
+    ten = {t.name: t for t in r.tensors}
+    entries: dict[str, dict] = {}
+    mapped = set()
+    for g, t in sorted(layout["targets"].items()):
+        p = t["src"]
+        if p is None or f"{g}.in_sum2" not in ten:
+            continue
+        c = np.asarray(ten[f"{g}.counts"].data, dtype=np.float64).reshape(-1)
+        sm = np.asarray(ten[f"{g}.in_sum2"].data, dtype=np.float64).reshape(c.shape[0], -1)
+        if t["colperm"] is not None:
+            back = np.empty_like(sm)
+            back[:, t["colperm"].long().numpy()] = sm
+            sm = back
+        e = {"sums": torch.from_numpy(sm), "counts": torch.from_numpy(np.rint(c).astype(np.int64))}
+        mapped |= {f"{g}.in_sum2", f"{g}.counts"}
+        if p in entries:
+            o = entries[p]
+            if o["sums"].shape != e["sums"].shape or not torch.equal(o["counts"], e["counts"]) or not torch.allclose(
+                    o["sums"], e["sums"], rtol=1e-5, atol=0):
+                raise SystemExit(f"{path}: {g} disagrees with another target of {p} (same input, different stats)")
+            continue
+        entries[p] = e
+    if not entries:
+        raise SystemExit(f"{path}: no tensor maps to this layout (another model's imatrix?)")
+
+    def kv(k, default):
+        return r.fields[k].contents() if k in r.fields else default
+
+    return {"entries": entries, "datasets": list(kv("imatrix.datasets", [])),
+            "chunk_size": int(kv("imatrix.chunk_size", 0)), "chunk_count": int(kv("imatrix.chunk_count", 0)),
+            "path": str(path), "unmapped": len({k for k in ten if k.endswith(".in_sum2")} - mapped)}
+
+
+def load_any(path: Path, layout: dict, llama_cpp: Path) -> dict:
+    """``imatrix.pt`` (by HF name) or a llama.cpp GGUF imatrix (by GGUF name, mapped through the layout)."""
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic == b"GGUF":
+        return from_gguf(Path(path), layout, llama_cpp)
+    if Path(path).suffix == ".dat":
+        raise SystemExit(f"{path}: legacy imatrix .dat; convert it with llama-imatrix --in-file {path} -o X.gguf")
+    return load(Path(path))
+
+
+def combine(paths: list[Path], layout: dict, out_dir: Path, llama_cpp: Path, log=print) -> Path:
+    """Sum several imatrices into ``out_dir`` (``imatrix.pt`` + ``imatrix.gguf``): sum(x^2) and counts add.
+
+    The same as ``llama-imatrix --in-file A --in-file B`` without a prompt: a token-weighted mean of E[x^2]. Each
+    input is ``imatrix.pt`` or a GGUF imatrix (e.g. an AtomicChat ``imatrix.dat`` in GGUF format, or a cache's
+    ``imatrix.gguf``). The record keeps every input's file identity (``combined_from``).
+    """
+    from .runctl import file_id
+
+    if len(paths) < 2:
+        raise SystemExit("imatrix combine: needs at least two imatrices")
+    recs = [load_any(Path(p), layout, llama_cpp) for p in paths]
+    entries: dict[str, dict] = {}
+    for r in recs:
+        for n, e in r["entries"].items():
+            if n not in entries:
+                entries[n] = {"sums": e["sums"].double().clone(), "counts": e["counts"].long().clone()}
+            elif entries[n]["sums"].shape != e["sums"].shape:
+                raise SystemExit(f"imatrix combine: {n} is {tuple(e['sums'].shape)} in {r['path']}, "
+                                 f"{tuple(entries[n]['sums'].shape)} before (different models?)")
+            else:
+                entries[n]["sums"] += e["sums"].double()
+                entries[n]["counts"] += e["counts"].long()
+    # the token share of each input, on the most-seen dense tensor (counts = the tokens that reached it)
+    dense = [n for n in entries if entries[n]["counts"].numel() == 1 and all(n in r["entries"] for r in recs)]
+    ref = max(dense, key=lambda n: int(entries[n]["counts"].sum())) if dense else None
+    sources = []
+    for r in recs:
+        tok = int(r["entries"][ref]["counts"].sum()) if ref else None
+        sources.append({"path": r["path"], "file": file_id(r["path"]), "entries": len(r["entries"]),
+                        "tokens": tok, "chunk_size": r.get("chunk_size"), "chunk_count": r.get("chunk_count"),
+                        "datasets": list(r.get("datasets") or [])})
+        log(f"IMATRIX_COMBINE input {r['path']}: {len(r['entries'])} entries, {tok} tokens"
+            + (f", {r['unmapped']} GGUF tensors not in this layout" if r.get("unmapped") else ""))
+    only = {r["path"]: len(set(entries) - set(r["entries"])) for r in recs}
+    for pth, k in only.items():
+        if k:
+            log(f"IMATRIX_COMBINE {pth} lacks {k} of {len(entries)} entries: those carry the other inputs only")
+    sizes = {s["chunk_size"] for s in sources}
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save(entries, layout, out_dir, datasets=[d for s in sources for d in s["datasets"]],
+         chunk_size=sizes.pop() if len(sizes) == 1 else 0,  # 0 = mixed: per input in combined_from
+         chunks=sum(int(s["chunk_count"] or 0) for s in sources), llama_cpp=llama_cpp,
+         extra={"combined_from": sources})
+    tot = sum(s["tokens"] or 0 for s in sources)
+    log(f"IMATRIX_COMBINE {out_dir / 'imatrix.pt'}: {len(entries)} entries, token shares "
+        + " / ".join(f"{(s['tokens'] or 0) / max(tot, 1):.0%}" for s in sources))
+    return out_dir / "imatrix.pt"
 
 
 def folded_candidates(layout: dict) -> tuple[dict[str, torch.Tensor | None], int | None]:

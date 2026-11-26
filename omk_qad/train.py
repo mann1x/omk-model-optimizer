@@ -1563,6 +1563,41 @@ def train_identity(a) -> dict:
     return ident
 
 
+def combined_imatrix(a, say) -> str:
+    """``--imatrix-combine``: --imatrix (after auto) summed with the given imatrices, once per run directory.
+
+    Written to ``<out>/imatrix.combined/`` (imatrix.pt + imatrix.gguf, the latter for llama-quantize / K-FAC);
+    a later stage or resume reuses it only when every input is still the same file, and never overwrites it.
+    """
+    from .imatrix import combine
+    from .runctl import file_id
+
+    if a.mode == "bf16":
+        raise SystemExit("--imatrix-combine: bf16 mode encodes nothing (no imatrix)")
+    if a.imatrix == "none":
+        raise SystemExit("--imatrix-combine needs a base imatrix (--imatrix PATH, or auto with <cache>/imatrix.pt)")
+    inputs = [a.imatrix, *a.imatrix_combine]
+    out = Path(a.out) / "imatrix.combined"
+    pt = out / "imatrix.pt"
+    if pt.exists():
+        have = [s["file"] for s in torch.load(pt, map_location="cpu", weights_only=False)["combined_from"]]
+        want = [file_id(x) for x in inputs]
+        if have != want:
+            raise SystemExit(f"{pt} was combined from other imatrices than {inputs}; move it away to recombine")
+        say(f"IMATRIX_COMBINE reusing {pt} ({len(inputs)} inputs, same files)")
+    else:
+        layout = torch.load(a.layout, weights_only=False)
+        lc = Path(getattr(a, "llama_cpp", None) or layout["llama_cpp"])
+        combine([Path(x) for x in inputs], layout, out, lc, log=say)
+    fold = Path(a.imatrix).with_name("imatrix.folded.pt")
+    if fold.exists() and not (out / "imatrix.folded.pt").exists():  # ternary students: the rotated-basis statistic
+        import shutil  # exists only for the torch-collected imatrix; a GGUF imatrix cannot provide it
+
+        shutil.copyfile(fold, out / "imatrix.folded.pt")
+        say(f"IMATRIX_COMBINE folded statistic (ternary students) is {fold}'s alone, not combined")
+    return str(pt)
+
+
 def check_resume_args(saved: dict, a, allow: dict, src: str) -> None:
     """Refuse to resume a checkpoint written with different run-critical args (legacy runs have no identity.json)."""
     cur = vars(a)
@@ -1920,6 +1955,8 @@ def _phase_train(a, run: Path, st: State, control: RunControl) -> None:
     if a.imatrix == "auto":  # bf16 mode encodes nothing: no imatrix
         a.imatrix = str(Path(a.cache) / "imatrix.pt") if (Path(a.cache) / "imatrix.pt").exists() and not bf16 \
             else "none"
+    if getattr(a, "imatrix_combine", None):
+        a.imatrix = combined_imatrix(a, say)
     if (run / "last.pt").exists() and not (run / "identity.json").exists():
         say("identity.json created for an existing run: earlier segments are checked by their saved args only")
     check_identity(run / "identity.json", train_identity(a), parse_allow(a.allow_change), what=f"train {run}",
@@ -2228,6 +2265,9 @@ def phase_export(a) -> None:
         return
     from .qad_export import export_gguf
 
+    if getattr(a, "imatrix_combine", None):
+        raise SystemExit("--imatrix-combine is a train option: export uses the imatrix the run trained with "
+                         "(--imatrix auto), or pass the combined imatrix.pt itself as --imatrix")
     layout = torch.load(a.layout, weights_only=False)
     if a.load:  # the imatrix training encoded with is part of the run: export must use the same one
         trained_with = torch.load(a.load, map_location="cpu", weights_only=False).get("imatrix", "none") or "none"
@@ -2339,6 +2379,11 @@ def main(argv=None) -> None:
                     "collected on (0 = none); saved as <cache>/imatrix.pt (+ imatrix.gguf with --layout)")
     ap.add_argument("--imatrix", default="auto", help="train: imatrix.pt weighting the encoders (auto = "
                     "<cache>/imatrix.pt if present; none = off); export: auto = the one the run trained with")
+    ap.add_argument("--imatrix-combine", nargs="+", metavar="IMATRIX", default=None,
+                    help="train: more imatrices (imatrix.pt or llama.cpp GGUF imatrix, e.g. the AtomicChat "
+                         "imatrix.dat) summed with --imatrix -- sum(x^2) and counts add, as llama-imatrix --in-file "
+                         "A --in-file B -- into <out>/imatrix.combined/{imatrix.pt,imatrix.gguf}, which training "
+                         "and the export then use. Needs --layout (GGUF names map back through it)")
     ap.add_argument("--imatrix-convention", choices=["modelopt", "msq"], default="modelopt",
                     help="importance the ModelOpt IQ1/IQ2/Q8_0 encoders take from E[x^2]: modelopt = sqrt floored at "
                          "1e-4 of its mean (ModelOpt's choice); msq = E[x^2] itself, llama-quantize's convention "
