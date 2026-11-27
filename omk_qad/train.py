@@ -1082,6 +1082,7 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
     Loop-role (3) positions are not CE targets (as in training): a source that has them also reports ``loop`` (their
     count), ``ul`` (mean -log(1 - p) of the repeated token, unweighted), ``p_rep`` (its mean probability) and
     ``rep_top1`` (share of loop positions where it is the argmax); the record carries the pooled ``loop`` block.
+    ``ent`` / ``ent_loop``: mean predictive entropy (nats) over a source's scored / loop positions.
     Lead-in (4) positions are not scored. A source with loop positions only has no ``nll``.
     """
     student.eval()
@@ -1089,6 +1090,7 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
     wh = head.served()
     acc: dict = {}  # source -> [nll sum, scored tokens]
     lacc: dict = {}  # source -> [unlikelihood sum, p(repeat) sum, repeat-is-top1 count, loop tokens]
+    eacc: dict = {}  # source -> [entropy sum over scored (1/2) positions, entropy sum over loop (3) positions]
     # bm-889 sft4: rows per forward keep sft3's eval attention load (4 x 16k^2): 4 at 16k, 1 at 32k (4 at 32k ran OOM)
     nb = max(1, int(4 * (16384 / ev.x.shape[1]) ** 2))
     for i0 in range(0, len(ev), nb):
@@ -1105,12 +1107,19 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
                     lg = softcap(F.linear(h[i, c0:c1], wh), getattr(a, "softcap", None))
                 xn = x[i, c0 + 1 : c1 + 1]
+                ent = torch.zeros(lg.shape[0], device=lg.device)  # predictive entropy at scored + loop positions only
+                lsm = F.log_softmax(lg[m | ml].float(), -1)  # council f851 probe: falls if the head sharpens
+                ent[m | ml] = -(lsm.exp() * lsm).sum(-1)
+                del lsm
                 if m.any():
                     ce = F.cross_entropy(lg.float(), xn, reduction="none")[m]
                     s = acc.setdefault(ev.source[r], [0.0, 0])
                     s[0] += ce.sum().item()
                     s[1] += int(m.sum())
+                    e = eacc.setdefault(ev.source[r], [0.0, 0.0])
+                    e[0] += ent[m].sum().item()
                 if ml.any():
+                    eacc.setdefault(ev.source[r], [0.0, 0.0])[1] += ent[ml].sum().item()
                     pr = repeat_prob(lg, xn)[ml]
                     s = lacc.setdefault(ev.source[r], [0.0, 0.0, 0, 0])
                     s[0] += unlikelihood(lg, xn)[ml].sum().item()
@@ -1123,6 +1132,11 @@ def sft_evaluate(student, head, ev: "SftRows", a, tag, extra=None, sets=None) ->
     mean = sum(f["nll"] for f in fam.values()) / max(1, len(fam))
     for k, (u, pq, t1, c) in lacc.items():
         fam.setdefault(k, {}).update(ul=u / c, p_rep=pq / c, rep_top1=t1 / c, loop=c)
+    for k, (es, el) in eacc.items():
+        if k in acc:
+            fam[k]["ent"] = es / acc[k][1]
+        if k in lacc:
+            fam[k]["ent_loop"] = el / lacc[k][3]
     res = {"tag": tag, "nll": nll, "ppl": math.exp(nll), "nll_mean": mean, "scored": n, "families": fam}
     if lacc:
         nl = sum(v[3] for v in lacc.values())
@@ -1222,6 +1236,63 @@ def role_loss(lg, x_next, r, idx, val, aidx, aval, a) -> torch.Tensor:
     return per
 
 
+def pref_pair_step(hd, wh, x, role, a, cuda: bool) -> dict:
+    """``--pref-beta`` (bm-898 sft13s, council csl-2026-11-27-1207-f851): a SimPO-style pair loss on one micro-batch.
+
+    The micro-batch must be exactly one loop row (role-3 span, the repeated tokens the rollout produced) and one
+    positive row (roles 1/2, the same-prefix continuation). With per-token mean log-probs lp_pos / lp_neg over
+    those spans the loss is ``softplus(-z)``, ``z = beta * (lp_pos - lp_neg - gamma)``: no UL, no CE beside it.
+    Once the margin is met the gradient goes to 0 (sigmoid), where CE / unlikelihood never stop pulling.
+
+    Two passes over the head: the means without a graph, then each span's per-token surrogate
+    ``-+ beta * sigmoid(-z) / n * sum(log p)`` backward, whose gradient equals the exact one of the loss. Returns the
+    loss and its parts (telemetry); the gradient lands in ``hd.grad`` / ``wh.grad`` like the CE path.
+    """
+    if getattr(a, "token_penalty", None):
+        raise ValueError("--pref-beta does not combine with --token-penalty (the pair loss is the only loss)")
+    if any(v != 1.0 for v in (getattr(a, "_row_scale", None) or [])):
+        raise ValueError("--pref-beta does not combine with --sft-weights / per-row weights")
+    rt = role[:, 1:]
+    has3 = (rt == 3).any(1).tolist()
+    has12 = ((rt == 1) | (rt == 2)).any(1).tolist()
+    neg = [i for i in range(x.shape[0]) if has3[i]]
+    pos = [i for i in range(x.shape[0]) if not has3[i] and has12[i]]
+    if x.shape[0] != 2 or len(neg) != 1 or len(pos) != 1:
+        raise ValueError(f"--pref-beta: a micro-batch must be one loop row + one positive row (--bs 2, pair-ordered "
+                         f"data), got {x.shape[0]} rows, loop rows {neg}, positive rows {pos}")
+    spans = ((pos[0], lambda r: (r == 1) | (r == 2)), (neg[0], lambda r: r == 3))
+
+    def chunks(i, sel):
+        for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
+            c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
+            m = sel(role[i, c0 + 1 : c1 + 1].long())
+            if m.any():
+                yield c0, c1, m
+
+    def logp(i, c0, c1, m):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cuda):
+            lg = softcap(F.linear(hd[i, c0:c1], wh), getattr(a, "softcap", None))
+        return -F.cross_entropy(lg.float(), x[i, c0 + 1 : c1 + 1], reduction="none")[m]
+
+    means = []
+    with torch.no_grad():
+        for i, sel in spans:
+            s, n = 0.0, 0
+            for c0, c1, m in chunks(i, sel):
+                s += float(logp(i, c0, c1, m).sum())
+                n += int(m.sum())
+            means.append((s / n, n))
+    (lpp, npos), (lpn, nneg) = means
+    z = a.pref_beta * (lpp - lpn - a.pref_gamma)
+    coef = a.pref_beta * float(torch.sigmoid(torch.tensor(-z, dtype=torch.float64)))
+    for (i, sel), sign, n in zip(spans, (-1.0, 1.0), (npos, nneg), strict=True):
+        for c0, c1, m in chunks(i, sel):
+            (sign * coef / n * logp(i, c0, c1, m).sum()).backward()
+    loss = float(F.softplus(torch.tensor(-z, dtype=torch.float64)))
+    return {"loss": loss, "lp_pos": lpp, "lp_neg": lpn, "z": z, "coef": coef, "pos": pos[0], "neg": neg[0],
+            "pos_tokens": npos, "neg_tokens": nneg}
+
+
 def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None, aidx=None, aval=None,
                apply: bool = True, info: dict | None = None, probe=None) -> float:
     """One micro-batch (an update when ``apply``): body forward, head + loss per chunk, head gradient, backward.
@@ -1246,7 +1317,17 @@ def train_step(student, latents, head, fp_params, opt, x, idx, val, a, role=None
     n_tok = x.shape[0] * (x.shape[1] - 1) if role is None else max(1e-6, float(wt.sum()))
     tot, lsum = 0.0, 0.0
     rsum = [0.0] * x.shape[0]  # per row: its loss summed over scored positions (telemetry)
-    for i in range(x.shape[0]):
+    pref = a.loss == "ce" and role is not None and getattr(a, "pref_beta", 0.0) > 0
+    if pref:  # --pref-beta: the pair loss replaces the per-token loop below
+        pr = pref_pair_step(hd, wh, x, role, a, cuda)
+        tot = pr["loss"]
+        for i, lp in ((pr["pos"], pr["lp_pos"]), (pr["neg"], pr["lp_neg"])):
+            rsum[i] = -lp * float(wt[i].sum())  # row_loss = the row's mean NLL over its span
+        say(f"PREF loss {pr['loss']:.5f} lp_pos {pr['lp_pos']:.4f} lp_neg {pr['lp_neg']:.4f} z {pr['z']:.4f} "
+            f"coef {pr['coef']:.4f} pos_tokens {pr['pos_tokens']} neg_tokens {pr['neg_tokens']}")
+        if info is not None:
+            info["pref"] = pr
+    for i in range(0 if pref else x.shape[0]):
         for c0 in range(0, x.shape[1] - 1, a.loss_chunk):
             c1 = min(c0 + a.loss_chunk, x.shape[1] - 1)
             if role is not None and not (role[i, c0 + 1 : c1 + 1] > 0).any():
@@ -2330,6 +2411,10 @@ def main(argv=None) -> None:
                          "recovery SFT produced, on that SFT's role corpus); no --anchor cache pass needed")
     ap.add_argument("--ul-weight", type=float, default=1.0, help="train: unlikelihood weight on loop-role tokens "
                     "(--loss ce: the unlikelihood replaces the CE there; lead-in positions are not scored)")
+    ap.add_argument("--pref-beta", type=float, default=0.0, help="train (--loss ce): > 0 = SimPO-style pair loss "
+                    "softplus(-beta*(mean logp_pos - mean logp_loop - gamma)) on micro-batches of one loop row + one "
+                    "positive row (--bs 2, pair-ordered data); replaces CE/unlikelihood (bm-898 sft13s)")
+    ap.add_argument("--pref-gamma", type=float, default=0.5, help="train: --pref-beta margin, nats per token")
     ap.add_argument("--token-penalty", action="append", default=[], metavar="RULE",
                     help="train (--loss ce), repeatable: push a SET of tokens down where they should not come, on "
                     "top of the CE: weight * -log(1 - p(set)). "

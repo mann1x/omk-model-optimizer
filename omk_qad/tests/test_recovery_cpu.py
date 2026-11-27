@@ -1097,3 +1097,79 @@ def test_router_flip_reference_accepts_appended_eval_rows():
     fill(ref[:6])
     with pytest.raises(SystemExit, match="removed or changed"):
         probe.end_eval()
+
+
+# ------------------------------------------------------------------------- --pref-beta SimPO pair loss (bm-898 sft13s)
+def _pref_case(seed=0, beta=2.0, gamma=0.5):
+    import argparse
+
+    torch.manual_seed(seed)
+    T, H, V = 11, 8, 17
+    hd = torch.randn(2, T, H, requires_grad=True)
+    wh = torch.randn(V, H, requires_grad=True)
+    x = torch.randint(0, V, (2, T + 1))
+    role = torch.zeros(2, T + 1, dtype=torch.long)
+    role[0, 3:6], role[0, 6:9] = 4, 3  # loop row: lead-in (unscored) then the loop span
+    role[1, 2:5], role[1, 5:10] = 1, 2  # positive row
+    a = argparse.Namespace(loss="ce", loss_chunk=3, softcap=None, pref_beta=beta, pref_gamma=gamma, token_penalty=[])
+    return hd, wh, x, role, a
+
+
+def test_pref_pair_step_gradient_is_the_exact_simpo_gradient():
+    from omk_qad.train import pref_pair_step
+
+    hd, wh, x, role, a = _pref_case()
+    out = pref_pair_step(hd, wh, x, role, a, cuda=False)
+    g_hd, g_wh = hd.grad.clone(), wh.grad.clone()
+    hd.grad = wh.grad = None
+    lp = -F.cross_entropy(F.linear(hd, wh).reshape(-1, wh.shape[0]), x[:, 1:].reshape(-1), reduction="none").view(2, -1)
+    r = role[:, 1:]
+    lp_neg = lp[0][r[0] == 3].mean()
+    lp_pos = lp[1][(r[1] == 1) | (r[1] == 2)].mean()
+    z = a.pref_beta * (lp_pos - lp_neg - a.pref_gamma)
+    loss = F.softplus(-z)
+    loss.backward()
+    assert abs(out["loss"] - loss.item()) < 1e-5
+    assert abs(out["lp_pos"] - lp_pos.item()) < 1e-5 and abs(out["lp_neg"] - lp_neg.item()) < 1e-5
+    assert out["pos"] == 1 and out["neg"] == 0 and out["neg_tokens"] == 3 and out["pos_tokens"] == 8
+    torch.testing.assert_close(g_hd, hd.grad, rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(g_wh, wh.grad, rtol=1e-4, atol=1e-6)
+    assert hd.grad[0][r[0] == 4].abs().sum() == 0  # lead-in gets no gradient
+
+
+def test_pref_pair_step_identical_spans_sit_at_minus_logsigmoid_of_minus_beta_gamma():
+    from omk_qad.train import pref_pair_step
+
+    hd, wh, x, role, a = _pref_case()
+    with torch.no_grad():  # the positive row = the loop row, scored on the same positions
+        hd[1], x[1] = hd[0], x[0]
+    role[1] = torch.where(role[0] == 3, 1, 0)
+    out = pref_pair_step(hd, wh, x, role, a, cuda=False)
+    assert abs(out["z"] + a.pref_beta * a.pref_gamma) < 1e-6
+    assert abs(out["loss"] - math.log1p(math.exp(a.pref_beta * a.pref_gamma))) < 1e-6
+    # equal and opposite pulls on the same logits: the head gradient cancels
+    torch.testing.assert_close(wh.grad, torch.zeros_like(wh.grad), rtol=0, atol=1e-6)
+
+
+def test_pref_pair_step_gradient_vanishes_once_the_margin_is_met():
+    from omk_qad.train import pref_pair_step
+
+    hd, wh, x, role, a = _pref_case(beta=2.0, gamma=-50.0)  # margin trivially met: z ~ +100
+    out = pref_pair_step(hd, wh, x, role, a, cuda=False)
+    assert out["coef"] < 1e-30 and out["loss"] < 1e-30
+    assert hd.grad.abs().max() < 1e-30
+
+
+def test_pref_pair_step_refuses_a_batch_that_is_not_one_pair():
+    import pytest
+
+    from omk_qad.train import pref_pair_step
+
+    hd, wh, x, role, a = _pref_case()
+    role[1, 7] = 3  # both rows carry a loop span
+    with pytest.raises(ValueError, match="one loop row"):
+        pref_pair_step(hd, wh, x, role, a, cuda=False)
+    hd, wh, x, role, a = _pref_case()
+    a.token_penalty = ["name=c;at=1;tokens=1;weight=1"]
+    with pytest.raises(ValueError, match="token-penalty"):
+        pref_pair_step(hd, wh, x, role, a, cuda=False)
