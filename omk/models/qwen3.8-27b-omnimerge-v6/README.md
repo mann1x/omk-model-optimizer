@@ -100,6 +100,7 @@ to round-to-nearest. The ladder is in progress (22 tiers); rows are added as eac
 | IQ4_NL | 15.12 | 0.00496 / 0.9769 | **0.00423 / 0.9791** | −14.8 % | 0.584x | 53 min |
 | Q4_K_S | 14.75 | 0.00481 / 0.9776 | **0.00425 / 0.9791** | −11.7 % | 0.608x | 54 min |
 | IQ4_XS | 14.48 | 0.00504 / 0.9767 | **0.00431 / 0.9791** | −14.5 % | 0.581x | 53 min |
+| Q3_K_XL | 13.80 | 0.01599 / 0.9606 | **0.01192 / 0.9659** | −25.5 % | 0.534x | 54 min |
 
 The gain grows as the bit width falls: at Q8_0 the quantization error is already near the scorer's floor, at Q4_K_M
 K-FAC removes an eighth of it.
