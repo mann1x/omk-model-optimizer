@@ -10,6 +10,9 @@ test (same bytes, same rows, same kernels), it removes 6 % (Q8_0) to 41 % (Q3_K_
 file size, 17 % at Q4_K_M and 24 % at IQ4_XS. The same machinery produces the **seed of a QAD run**: the 2-bit
 IQ2_XXS tiers start from the K-FAC rounding instead of round-to-nearest and train from there.
 
+New to the pipeline? [§9](#9-the-quantization-workflow-end-to-end) explains every stage (imatrix, QAD cache, factors,
+rounding, QAD): what it needs, what it produces, why, its limits, and what a new model needs.
+
 Used for every tier of [ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF](https://huggingface.co/ManniX-ITA/gemma-4-26B-A4B-agentic-GGUF)
 and [ManniX-ITA/gemma-4-20B-v9-agentic-GGUF](https://huggingface.co/ManniX-ITA/gemma-4-20B-v9-agentic-GGUF)
 (IQ2_XXS = the seeded QAD). Model folders with every script as run:
@@ -19,7 +22,7 @@ and [ManniX-ITA/gemma-4-20B-v9-agentic-GGUF](https://huggingface.co/ManniX-ITA/g
 Contents: [1. What K-FAC is](#1-what-k-fac-is) · [2. Where it comes from: OBS, OBQ, GPTQ](#2-where-it-comes-from-obs-obq-gptq-and-what-this-adds) ·
 [3. How the pieces fit](#3-how-the-pieces-fit) · [4. How to build a K-FAC ladder](#4-how-to-build-a-k-fac-ladder-step-by-step) ·
 [5. Seeding a QAD](#5-seeding-a-qad-the-iq2_xxs-tiers) · [6. Results](#6-results) · [7. Limits and what the probes taught](#7-limits-and-what-the-probes-taught) ·
-[8. References](#8-references).
+[8. References](#8-references) · [9. The quantization workflow end to end](#9-the-quantization-workflow-end-to-end).
 
 ## 1. What K-FAC is
 
@@ -596,3 +599,286 @@ ladder writes the same split).
   with llama.cpp's own encoders and in collecting per-expert factors of a MoE.
 
 All cited papers are kept in [`docs/papers/`](../../docs/papers/README.md).
+
+## 9. The quantization workflow end to end
+
+This section explains the whole pipeline in one place: what each artifact is, what it is made from, what it feeds,
+why it exists, where it stops working, and what has to be redone for a new model. The commands are in §4 and §5,
+and the measured numbers are in §4.0.1 and §6.
+
+```
+corpus (11 families) ── render with the model's template ──► windows + role masks
+                                                                   │
+HF checkpoint ──────────────┬──► QAD cache ──► teacher top-64 · eval rows · cache imatrix
+                            │         │
+                            │         └──► K-FAC factors (A, G, n per layer)
+                            │
+BF16 GGUF (convert) ────────┼──► AC imatrix (llama-imatrix, AtomicChat corpus) ─┐
+                            │                                                    ├─► combined imatrix
+                            │                               cache imatrix ───────┘          │
+                            ▼                                                               ▼
+                 llama-quantize ──► ptq.gguf (the stock twin: floor + byte template) ◄──────┘
+                            │
+       factors + ptq.gguf ──► kfac_round ──► kfac.gguf (same bytes, MLP re-rounded) ──► twin score ──► publish
+                            │
+                            └──► latents ──► seeded QAD (IQ2_XXS) ──► export ──► twin score ──► publish
+```
+
+### 9.1 The imatrix: what it is, how it is used, where it stops
+
+**What it is.** For every quantized weight tensor, `llama-imatrix` runs the unquantized model over a calibration
+text and records the sum of squared input activations per input column, plus a token count. Fused MoE experts get
+one vector per expert. The ratio is `E[x²]` per column: how strongly each input column is driven on typical text.
+
+**How it is used.** `llama-quantize` encodes each block of 32 or 256 weights. It picks the block scale, and for IQ
+types the codebook entry, that minimises `Σ_col imatrix[col] · Δ²`. A column that carries large activations gets a
+small error, and a column that is nearly silent absorbs a larger one. `kfac_round` uses the same weighting inside
+its encoders (§4.3). Every tensor K-FAC does not re-round keeps the imatrix-weighted rounding of the stock twin:
+attention, the linear-attention / SSM projections of a hybrid, the embeddings and the MTP head.
+
+**Where it stops.**
+- **Diagonal.** It sees each column's energy but not the correlations between columns, the off-diagonal of
+  `A = E[a aᵀ]`. Two correlated columns whose errors could cancel are treated as independent.
+- **Input side only.** It says nothing about which output rows matter to the loss; that is `G = E[g gᵀ]`. A row
+  whose output the next layers ignore is protected as much as one the logits depend on.
+- **No error feedback.** Each block is rounded on its own, so an error already made in one column is never
+  compensated in the next. GPTQ does exactly this compensation (§2).
+- **Only as good as its corpus.**
+  - It averages over the calibration text: its length (512-token chunks vs 16k windows), its templates, and
+    whether specials were parsed (`--parse-special`; without it the chat-template tokens are tokenized as text).
+  - A rarely routed expert gets few samples.
+  - The §4.0.1 test shows what this costs. Two different corpora combined beat either alone by 1.5–4 % KL at 3
+    bits, and the difference vanishes from Q4_K_M up.
+- **Tied to the llama.cpp build.** Entries are keyed by GGUF tensor name, and names change when llama.cpp fuses
+  tensors.
+  - v6 example: an imatrix written by an older build had `attn_qkv` + `attn_gate` and `ssm_beta` + `ssm_alpha` as
+    separate tensors. b12386 fuses each pair. Each pair projects the same input, so its statistics are bit-equal and
+    are re-saved under the fused name (`v6_imatrix_remap.py`).
+  - A coverage check then proves every quantizable decoder weight has an entry (`v6_imatrix_check.py`).
+  - Without the remap, `llama-quantize` quantizes the fused tensors **without** an imatrix. The only sign is a
+    `did not find weights` line per tensor, buried in a long log.
+
+### 9.2 The stages: inputs, outputs, how they work, limits
+
+| stage | needs | produces | wall time (bs2, one RTX PRO 6000) |
+|---|---|---|---|
+| render | the corpus families (template-free conversations), the model's tokenizer + chat template | packed windows with role masks (assistant tokens = scored), train/eval split per family | 7 min (v6) |
+| BF16 GGUF | the HF checkpoint, the llama.cpp build of the ladder | `W0` for every quantized tensor | 4 min (v6) |
+| AC imatrix | the BF16 GGUF, the AtomicChat calib corpus for the model | `imatrix.dat` | 1 h 30 min (20B) – 4 h 23 min (v6 27B) |
+| QAD cache | HF checkpoint (teacher), layout, rendered windows, eval families | teacher top-64 per scored position, eval rows (4 per family), cache imatrix (first 256 windows) | 82 min (v6, 768 × 16k) – 3 h 47 min (20B) |
+| factors | HF checkpoint, cache windows | `layer_NN.pt`: `A`, `G`, `n` per MLP tensor (per expert for MoE) | 75 min – 3 h, 59–115 GB |
+| quantization (per tier) | BF16 GGUF, combined imatrix, factors, the stock twin | `kfac.gguf` (same layout and size as the twin), report, optional latents | 45–80 min per tier |
+| QAD (per format) | layout, cache, imatrix, seed latents | a trained GGUF of that one layout | 600 steps × 35–39 s = 6–6.5 h (seeded) |
+
+**QAD cache.**
+- **What it does.** The teacher (the full-precision model) runs once over every training window and every eval row.
+- **What it keeps.**
+  - The teacher's top-64 logits at every scored position: the distillation targets.
+  - The eval rows with their targets: the twin score's reference.
+  - The cache imatrix, collected on the first 256 windows.
+- **Why it exists.** Without it a QAD would run the teacher at every step, and every tier would need its own
+  reference forward. With it, the teacher's cost is paid once and shared by the QAD, the factors (which reuse its
+  windows), the twin score and the imatrix.
+- **Limits.**
+  - Top-64 only: the tail mass is folded into one bucket.
+  - Fixed windows: the context distribution is the corpus, not the model's own sampling.
+  - The torch teacher must fit on the GPU. `--teacher-gguf` lifts that, but that path has no imatrix.
+  - Disk grows with windows × positions × K.
+
+**Factors.**
+- **What they hold.** Per MLP tensor: `A = E[a aᵀ]`, the covariance of its input activations; `G = E[g gᵀ]`, the
+  covariance of the loss gradient at its output; and `n`, the token count per expert.
+- **How they are collected.** `omk_qad.kfac` runs forward + backward over 512 cache windows cropped to their densest
+  2,048 tokens, with hooks on every MLP linear.
+  - The backward uses labels **sampled from the model**: the Fisher, not the corpus's empirical gradient. So the
+    curvature is the model's own, whoever wrote the assistant turns.
+  - Accumulators are fp32. A dense gate/up/down trio of the 27B is 3 × 17,408² × 4 B ≈ 3.6 GiB per layer, and a
+    128-expert Gemma layer ≈ 5.4 GB. That sets how many layers fit in one pass (`--layers-per-pass`).
+- **Why it works.** `ΔL ≈ ½ tr(Δ A Δᵀ G)` per layer: a rounding error is judged by where it lands in both input and
+  output space. The imatrix is the diagonal of `A` alone (§1–§2).
+- **Limits.**
+  - Kronecker independence of `a` and `g`.
+  - Layers treated as independent: no cross-layer error build-up.
+  - Curvature taken at `W0`, so valid while `Δ` is small: good at 4–8 bits, weak at 2.
+  - MLP only: attention, linear attention, embeddings and the MTP head carry no factors.
+  - Experts with `n = 0` keep the stock rounding.
+  - Attention-sink positions must be cut from `G` (§7).
+
+**Quantization (`kfac_round`).**
+- **How it works.**
+  - It starts from the stock twin as a byte template.
+  - It re-rounds each MLP tensor with GPTQ error feedback on `A`, at the encoder's own block granularity, with the
+    real llama.cpp encoders.
+  - It checks for every tensor that its RTN codes are byte-identical to `llama-quantize`'s.
+- **Why the output runs anywhere.** Only payload bytes change: same types, sizes and metadata. It runs on stock
+  llama.cpp and ollama.
+- **Limits.**
+  - The quadratic model: at 2 bits the rounding alone leaves 0.05–0.07 KL.
+  - MLP only.
+  - Valid only when the log ends with `KFACR_DONE`.
+
+**QAD.**
+- **How it works.**
+  - Every weight the GGUF stores quantized is an fp16 latent.
+  - Each forward pass sees it fake-quantized in the exact GGUF type, and the encoders are re-run at every refresh.
+  - The loss is KL to the cached teacher top-64. Gradients flow through the quantizer straight-through.
+- **What it buys.** It recovers what a rounding cannot, because the remaining weights move to compensate the
+  quantization of the others: training, not rounding.
+- **Limits.**
+  - GPU hours per **format**: one run trains one layout.
+  - It needs the cache.
+  - It can overfit the cache corpus.
+  - The export refuses any imatrix other than the one training used, so PTQ reference, seed, trainer and export
+    share one.
+  - Worth its cost only where rounding is not enough (IQ2_XXS).
+
+### 9.3 Why the factors pay off twice
+
+**Every tier from one collection.**
+- The factors are collected once per model, in 75 min – 3 h.
+- After that, a tier costs one stock `llama-quantize` plus one rounding plus one twin score: 56–58 min on v6, 45–80
+  min on the Gemma ladders.
+- The alternative for the same quality would be a per-format QAD, which costs a cache, then 1,500 steps × 39 s ≈ 16 h at the 26B's step time
+  of training, then an export, for each format. That is roughly 15–20 h per tier.
+- For a 22-tier ladder: ~1 day of GPU instead of ~2 weeks.
+- No tier needs training data of its own, and every tier keeps the stock file's layout, so nothing downstream
+  (llama.cpp, ollama, the HF card) changes.
+
+**A QAD that starts where an unseeded one ends.** On the 26B (§6.1):
+- the K-FAC rounding of the IQ2_XXS layout already removes 17 % of the RTN error, before any training;
+- 600 seeded steps (6.5 h) reach 0.0485;
+- an unseeded QAD of the same cache plateaus at ~0.062 after its 1,500 steps (16 h).
+
+The seed saves 60 % of the training **and** ends 22 % lower. It does so because training starts inside the basin
+the curvature points to, instead of spending its first thousand steps getting there.
+
+### 9.4 The AtomicChat imatrix: why it is needed, and the combined imatrix
+
+The factor collection writes no imatrix (§4.0.1). Every K-FAC tier still needs one, for three reasons:
+1. the stock twin is built with it, and it is both the floor and the byte template;
+2. every tensor K-FAC does not touch keeps that rounding;
+3. the encoders weight their scale search with it.
+
+A model has a cache imatrix only if it has a QAD cache of its own. The 20B ladder borrowed the 26B's cache windows,
+so its only imatrix was the AtomicChat one (AC). The AC corpus (`AtomicChat/calib-corpora`, per model) is general,
+chat-templated text in 512-token chunks, rendered with `--parse-special` so the template tokens are real tokens.
+
+The test in §4.0.1 put cache, AC and the two combined side by side on the 26B, with everything else fixed:
+- from Q4_K_M up the three are within 0.3 %;
+- at IQ3_XXS, AC beats the cache imatrix by 2.7 % even on the cache's own corpus, and the combination is best
+  (−4.2 % vs cache, −1.5 % vs AC);
+- the reason is that two corpora with different context lengths cover more of the activation distribution than
+  either alone.
+
+The combination is a token-weighted sum, computed by `llama-imatrix --in-file AC --in-file cache` or by
+`omk_qad.train --imatrix-combine` (bit-identical). The rule since then is:
+- compute the AC imatrix for every model;
+- quantize with the combined imatrix whenever a cache exists, as v6 does;
+- a QAD-trained tier uses that same combined file in all four of its stages.
+
+The imatrix effect (3–4 % at 3 bits) is an order of magnitude below K-FAC's (31 % at IQ3_XXS). Get it right, but it
+is not where the gain comes from.
+
+### 9.5 What else matters
+
+- **One llama.cpp build for the whole ladder.** The encoders are byte-checked against that build's `llama-quantize`,
+  the imatrix names follow its tensor names, and the twin scorer (`llama_topk`) links it.
+- **`W0` must be the checkpoint the factors saw.** The BF16 GGUF must be the export of the HF checkpoint the factors
+  and the cache were made from. `kfac_validate --hf` compares layer 0 bit for bit. A base-GGUF gate (BF16 GGUF vs
+  the HF teacher on the eval rows, KL ≈ 0) proves the conversion before any tier is built.
+- **The twin score is the only verdict.** Same bytes, same rows, same kernels, assistant positions only (see the
+  per-family tables in §6.1 and §6.3). The surrogate ranks arms; it never decides a release. `klk` values compare
+  only within one model and one reference style (torch teacher vs own-GGUF top-K).
+- **Every long stage pauses and resumes.** The cache pauses between shards, the factors between passes, the rounder
+  between layers, the QAD at step boundaries. Outputs appear only when complete, so a crash costs one unit, not the
+  stage.
+- **Sentinels, not exit codes.**
+  - `KFAC_CHECK OK` / `KFAC_DONE`, `KFACR_DONE`, `ENCODER_MATCH`, `LT_TWIN`, `SEED_LATENTS`.
+  - A `kfac.gguf` without `KFACR_DONE` is partly the stock file.
+
+### 9.6 What to customize, consider, replay, filter and validate for a new model
+
+| aspect | what to do | v6 / Gemma example |
+|---|---|---|
+| architecture | MoE: per-expert factors, `--down-g diag`; dense or hybrid: `--dense`. Linear attention and SSM stay at the stock rounding | Gemma 26B: 128 experts + dense MLP; v6: 64 dense layers, gated-deltanet untouched |
+| GPU memory | size the fp32 accumulators per layer and set `--layers-per-pass`; peak = model + LPP × layer accumulators + one in flight | v6: 3 layers = 92.0 GiB of 95; 4 does not fit |
+| tokenizer + template | re-render the corpus with the model's own template. Role masks score assistant tokens only. Strip or keep earlier turns' reasoning as the template does. Check the eos/turn-end tokens | v6: `rollouts --history-reasoning strip --seq 16384 --pack`; Gemma eos 106 |
+| corpus | pick families and weights for what the model is for. Assistant turns written by another model are context only: every label (cache top-64, factor samples) comes from the model itself | the 11 agentic-program families, Gemma-written, relabelled by v6 |
+| filter | at render, drop refusal-prefixed rows and rows that do not round-trip (render → tokenize → decode). Pack to the window length. Decontaminate any generated data against the acceptance benches (13-gram gate) | v6 render logs both counts per family: 0 refusals, 1 round-trip mismatch (swe.train) |
+| replay | when the data must be on-policy (bf16 recovery, a QAD whose cache context should be the model's own outputs), regenerate the answers with the model at its deployment sampler (`omk_qad.replay`). The K-FAC factors do not need it: their labels are sampled from the model anyway | used for the Gemma 128e recovery, not for v6 K-FAC |
+| sink cut | `--drop-grow` is an absolute gradient norm, so it is model-specific. Run `--probe-grow` and use the pooled p99 | Gemma: 10 (fixed); v6: probe p99 = 1.475 |
+| imatrix | compute AC with `--parse-special`, remap names to the ladder's build, prove coverage, combine with the cache imatrix | v6: fused `attn_qkv_gate` / `ssm_beta_alpha` remap, coverage check |
+| family rules | the per-tier tensor overrides the family needs, applied to the stock twin, so K-FAC inherits them | Gemma: attention Q8_0 (≥ Q4_K_M) / Q6_K below; v6: MTP head `blk.64` Q4_K floor at IQ2/IQ3_XXS/IQ3_XS, `_L` tiers embed/output Q8_0 |
+| tier set | K-FAC covers every MLP type the encoders implement (K-quants, IQ1–IQ4, Q8_0, legacy), so a tier is K-FAC'd whatever its non-MLP overrides are | v6: all 22 published tiers, including `_L` (embed/output Q8_0), Q3_K_XL/L/S and Q2_K |
+| validate | `kfac --check` (logits reproduced) → base-GGUF gate → `ENCODER_MATCH` → `KFACR_DONE` → twin score (K-FAC must beat the twin pooled; read the per-family split for a systematic regression) → seed gate before a QAD → post-publish sha and manifest checks | every gate is a hard stop in the chain scripts |
+
+### 9.7 Reading the KL / top-1 results: targeted families, the rest, and a code-leaning corpus
+
+**What the two numbers mean.** `klk` is the mean top-256 KL from the full-precision model to the quant at each scored
+assistant position: how far the whole next-token distribution moved. `top1` is how often the quant's most likely token
+is the full-precision model's: the greedy decode agreement. Both are measured on the eval rows, which are held out from
+the cache: 4 rows per family, never trained on and never used for the factors.
+
+**The corpus leans to code and agentic work.** The cache corpus, which supplies both the factor windows and the QAD
+training data, is the Gemma-4 agentic program's mix:
+
+| family | share of the mix | share of the scored eval positions |
+|---|---:|---:|
+| opencode | 41.9 % | 1.1 % |
+| agentic | 27.2 % | 4.8 % |
+| ifchat_v1 | 10.5 % | 4.5 % |
+| hermes (tool use) | 6.0 % | 5.0 % |
+| ifchat_v2 | 5.2 % | 18.7 % |
+| kimi31b (agent tasks) | 4.8 % | 2.5 % |
+| swe | 1.9 % | 1.0 % |
+| multilingual | 1.1 % | 19.4 % |
+| math | 0.5 % | 6.6 % |
+| science | 0.5 % | 19.7 % |
+| cp (competitive programming) | 0.3 % | 16.6 % |
+
+The code and agentic families (opencode, agentic, hermes, kimi31b, swe, cp) are **82 %** of the mix but only **31 %**
+of the scored positions. Eval rows of science, multilingual and instruction chat are long, so those families dominate
+the position count.
+
+**The QAD targets gain most.** `A` and `G` are measured on these windows, so the rounding protects first the
+directions the code and agentic families use. The same holds for a seeded QAD, which trains on the same windows.
+Their held-out rows are in-distribution for the curvature, and they gain about twice the pooled figure.
+
+On v6 Q4_K_M (§6.3):
+
+| | KL, `llama-quantize` | KL, K-FAC | change |
+|---|---:|---:|---:|
+| code/agentic families (78,691 positions) | 0.00356 | 0.00284 | **−20.4 %** |
+| all other families (173,943 positions) | 0.00437 | 0.00398 | −8.9 % |
+| pooled | 0.00412 | 0.00362 | −12.0 % |
+
+On the 26B Q4_K_M (§6.1) the code and agentic families gain 27–33 % (agentic, opencode, hermes, kimi31b) against a
+pooled −17.3 %.
+
+**The pooled number understates the targeted gain.** The pooled `klk` is weighted by scored positions, and 69 % of
+the positions are in four families that are 7 % of the mix: science, multilingual, ifchat_v2 and cp. A pooled −12 %
+therefore means about −20 % on what the corpus was built for, and about −9 % on everything else. Report the
+per-family table next to the pooled figure.
+
+**The families the corpus barely contains still improve.**
+- Science and multilingual (0.5 % and 1.1 % of the mix) gain 5–6 %.
+- Math (0.5 %) gains 13 %, and instruction chat 12–14 %.
+- At Q4_K_M **no family gets worse** on either metric.
+- At 5–8 bits the pooled gain is only 2–9 %, and single families move by noise-sized amounts in both directions.
+  - On v6 Q8_0, opencode (+5.3 % KL) and swe (+1.9 %) come out slightly worse. They are the two smallest eval
+    families, at 2,850 and 2,627 positions.
+  - At Q6_K and Q5_K_M a few families lose 0.01–0.19 top-1 points while their KL still improves.
+
+The curvature is not a list of memorised tokens. Most of what `A` and `G` capture (which input directions carry
+energy, which output rows the next layers read) is shared across tasks, and the rounding only redistributes an error
+that has to go somewhere. A family outside the corpus gets less help, not systematic harm. cp is the clearest case: 0.3 % of the
+mix, yet it gains 18.6 % on v6, because competitive programming uses the same code representations as opencode and swe.
+
+**Top-1 moves with the KL**, by a smaller margin. On v6 Q4_K_M it rises by +0.04 to +0.53 points per family, most for
+kimi31b (+0.53) and agentic (+0.41). Agreement on the argmax is already 97–98.5 % at Q4_K_M, so the room is small.
+The gain grows at lower bits: on the 26B it is +0.2 points at Q4_K_M, +0.7 at IQ3_XXS and +1.2 at IQ2_M.
+
+**Choosing a corpus for another model.** The family mix is a choice of where the quantization error should *not*
+land. A model meant for general chat should get a broader mix, or a weight closer to the eval distribution. A coding
+model can lean further. Keep at least a few rows of every family you care about in the eval split, so that a
+regression outside the corpus is visible.

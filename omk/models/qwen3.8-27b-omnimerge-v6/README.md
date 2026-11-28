@@ -120,7 +120,8 @@ Source: `runs/v6_kfac/ladder/<tier>/{ptq,kfac}.eval.json` (the twin scorer's poo
 ## Known gaps
 
 - Only the MLP is re-rounded; the gated-deltanet and attention projections keep the `llama-quantize` rounding.
-- The tiers outside the K-FAC set (Q6_K_L, Q5_K_L, Q4_K_L, Q3_K_XL, Q3_K_L, Q3_K_S, Q2_K) stay the stock AC-imatrix files.
+- All 22 published tiers are K-FAC rounded, the `_L` (embed/output Q8_0), Q3_K_XL/L/S and Q2_K tiers included;
+  the non-MLP tensors of every tier keep the stock rounding with the combined imatrix.
 
 ## Cards
 
