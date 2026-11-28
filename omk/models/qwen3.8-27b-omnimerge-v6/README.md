@@ -81,8 +81,40 @@ Clean run on bs2 (one RTX PRO 6000 96 GB, 16 CPU threads); failed attempts and i
 
 ## 4. Results
 
-<!-- results: filled from ladder/twins.log when the ladder completes -->
-_Pending (run started 2026-11-28 00:00 CET)._
+Every tier is scored twice on the same 252,634 assistant-token positions of the 44 eval rows (11 families), against the
+bf16 teacher's top-256 logits: the `llama-quantize` twin (same combined imatrix, same overrides) and the K-FAC file.
+Both files of a tier are byte-identical in size. "Rounding error vs RTN" is the K-FAC objective after rounding relative
+to round-to-nearest. The ladder is in progress (22 tiers); rows are added as each tier publishes.
+
+<!-- tier table: updated by scripts/omnimerge_v6_kfac/v6_tier_row.py -->
+| tier | size (GiB) | llama-quantize + imatrix | **K-FAC** | ΔKL | rounding error vs RTN | tier wall time |
+|---|---:|---:|---:|---:|---:|---:|
+| Q8_0 | 27.05 | 0.00044 / 0.9915 | **0.00043 / 0.9917** | −2.2 % | 0.475x | 56 min |
+| Q6_K | 20.89 | 0.00081 / 0.9899 | **0.00077 / 0.9899** | −5.4 % | 0.563x | 58 min |
+| Q4_K_M | 15.84 | 0.00412 / 0.9790 | **0.00362 / 0.9808** | −12.0 % | 0.610x | 58 min |
+
+The gain grows as the bit width falls: at Q8_0 the quantization error is already near the scorer's floor, at Q4_K_M
+K-FAC removes an eighth of it.
+
+**Per family, Q4_K_M.** The agentic and code families gain 16–26 % KL; the two largest families (science,
+multilingual) gain 5–6 % and hold the pooled figure at −12 %. No family gets worse on either metric.
+
+| family | positions | KL llama-quantize | **KL K-FAC** | ΔKL | top-1 llama-quantize | **top-1 K-FAC** | Δtop-1 (pt) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| swe | 2,627 | 0.005310 | **0.003933** | −25.9 % | 97.72 | **97.79** | +0.08 |
+| hermes | 12,658 | 0.003031 | **0.002252** | −25.7 % | 98.32 | **98.50** | +0.18 |
+| agentic | 12,164 | 0.004312 | **0.003392** | −21.3 % | 97.71 | **98.12** | +0.41 |
+| kimi31b | 6,369 | 0.005016 | **0.004043** | −19.4 % | 96.80 | **97.33** | +0.53 |
+| cp | 42,023 | 0.003072 | **0.002500** | −18.6 % | 98.20 | **98.45** | +0.25 |
+| opencode | 2,850 | 0.005124 | **0.004292** | −16.2 % | 97.51 | **97.82** | +0.32 |
+| ifchat_v1 | 11,374 | 0.007101 | **0.006086** | −14.3 % | 96.60 | **96.78** | +0.18 |
+| math | 16,691 | 0.002843 | **0.002473** | −13.0 % | 98.51 | **98.66** | +0.16 |
+| ifchat_v2 | 47,174 | 0.004916 | **0.004332** | −11.9 % | 97.66 | **97.88** | +0.22 |
+| science | 49,719 | 0.003814 | **0.003591** | −5.9 % | 98.04 | **98.08** | +0.04 |
+| multilingual | 48,985 | 0.004280 | **0.004048** | −5.4 % | 97.94 | **98.05** | +0.11 |
+| **all** | **252,634** | **0.004116** | **0.003621** | **−12.0 %** | **97.90** | **98.08** | **+0.18** |
+
+Source: `runs/v6_kfac/ladder/<tier>/{ptq,kfac}.eval.json` (the twin scorer's pooled and `families` blocks).
 
 ## Known gaps
 
