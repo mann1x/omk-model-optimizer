@@ -492,6 +492,36 @@ LCB-hard-77 87.01, MultiPL-E 89.33; tool-eval-bench hardmode 142.6 / 176 on the 
 [`cards/20b_bench.json`](../models/gemma-4-20b-v9-agentic/cards/20b_bench.json). These numbers measure the model
 through the quant; the quant's own quality is the twin KL above.
 
+### 6.3 A dense model, per family: Omnimerge-v6 Q4_K_M (Qwen3.8-27B)
+
+[ManniX-ITA/Qwen3.8-27B-Omnimerge-v6-MTP-GGUF](https://huggingface.co/ManniX-ITA/Qwen3.8-27B-Omnimerge-v6-MTP-GGUF):
+a dense/hybrid 64-layer model, so only the three dense FFN projections per layer are rounded (no experts). Factors
+512 windows x 2048, 3 layers/pass (3.0 h on one RTX PRO 6000); imatrix = combined AC + QAD-cache. Both files are
+16217 MiB (4.98 BPW), built from the same imatrix, scored on the same 252,634 assistant positions against the bf16
+teacher's top-256 logits. The rounding error fell from 0.00237 to 0.00145 (0.610x of RTN); the tier took 58 min end to
+end (PTQ 6.0 min, rounding 37.6 min, twin score 8.4 min, HF + ollama 6.0 min).
+
+The per-family split shows where the gain lands: the agentic and code families gain 16-26 % KL, while the two largest
+families (science, multilingual) gain 5-6 % and hold the pooled figure at -12 %. No family gets worse on either metric.
+
+| family | positions | KL llama-quantize | **KL K-FAC** | ΔKL | top-1 llama-quantize | **top-1 K-FAC** | Δtop-1 (pt) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| swe | 2,627 | 0.005310 | **0.003933** | −25.9 % | 97.72 | **97.79** | +0.08 |
+| hermes | 12,658 | 0.003031 | **0.002252** | −25.7 % | 98.32 | **98.50** | +0.18 |
+| agentic | 12,164 | 0.004312 | **0.003392** | −21.3 % | 97.71 | **98.12** | +0.41 |
+| kimi31b | 6,369 | 0.005016 | **0.004043** | −19.4 % | 96.80 | **97.33** | +0.53 |
+| cp | 42,023 | 0.003072 | **0.002500** | −18.6 % | 98.20 | **98.45** | +0.25 |
+| opencode | 2,850 | 0.005124 | **0.004292** | −16.2 % | 97.51 | **97.82** | +0.32 |
+| ifchat_v1 | 11,374 | 0.007101 | **0.006086** | −14.3 % | 96.60 | **96.78** | +0.18 |
+| math | 16,691 | 0.002843 | **0.002473** | −13.0 % | 98.51 | **98.66** | +0.16 |
+| ifchat_v2 | 47,174 | 0.004916 | **0.004332** | −11.9 % | 97.66 | **97.88** | +0.22 |
+| science | 49,719 | 0.003814 | **0.003591** | −5.9 % | 98.04 | **98.08** | +0.04 |
+| multilingual | 48,985 | 0.004280 | **0.004048** | −5.4 % | 97.94 | **98.05** | +0.11 |
+| **all** | **252,634** | **0.004116** | **0.003621** | **−12.0 %** | **97.90** | **98.08** | **+0.18** |
+
+Source: `runs/v6_kfac/ladder/Q4_K_M/{ptq,kfac}.eval.json` (the twin scorer's `families` block; every tier of the
+ladder writes the same split).
+
 ## 7. Limits and what the probes taught
 
 - **A quadratic in Δ holds while Δ is small.** It is excellent at 4–8 bits, good at 3, and at 2 bits the rounding
