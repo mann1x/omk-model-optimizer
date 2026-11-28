@@ -23,7 +23,7 @@ Contents: [1. What K-FAC is](#1-what-k-fac-is) · [2. Where it comes from: OBS, 
 
 ## 1. What K-FAC is
 
-**K-FAC = Kronecker-Factored Approximate Curvature** (Martens & Grosse, 2015). It is an approximation of a neural
+**K-FAC = Kronecker-Factored Approximate Curvature** ([Martens & Grosse, 2015](../../docs/papers/1503.05671v7.pdf)). It is an approximation of a neural
 network's curvature matrix — the Fisher information matrix, which at a well-trained model equals the Gauss-Newton
 Hessian of the loss — that is small enough to store and invert per layer.
 
@@ -66,10 +66,10 @@ The lineage is the "optimal brain" family of second-order weight-removal methods
 
 | method | year | what it does | curvature it uses |
 |---|---|---|---|
-| OBD (LeCun, Denker, Solla) | 1990 | prune the weight whose removal raises the loss least, `½ H_ii w_i²` | diagonal Hessian |
-| OBS (Hassibi, Stork) | 1993 | the same with the full Hessian, **and compensates the remaining weights** by `−w_i H⁻¹ e_i / [H⁻¹]_ii` | full Hessian + inverse |
-| OBQ (Frantar, Alistarh) | 2022 | OBS applied to quantization, one weight at a time, with the *layer-wise reconstruction* loss `‖W X − Ŵ X‖²` whose Hessian is `H = 2 X Xᵀ` — the input second moment, our `A` | `A` only, exact, per row |
-| **GPTQ** (Frantar, Ashkboos, Hoefler, Alistarh) | 2022 | makes OBQ tractable for LLMs: quantize the columns in a fixed order (not greedily), update all rows at once, propagate each column's rounding error into the not-yet-quantized columns through the **Cholesky factor of the damped inverse Hessian** `(A + λI)⁻¹` | `A` only, shared by all rows |
+| [OBD](../../docs/papers/lecun1989_optimal_brain_damage.pdf) (LeCun, Denker, Solla) | 1990 | prune the weight whose removal raises the loss least, `½ H_ii w_i²` | diagonal Hessian |
+| [OBS](../../docs/papers/hassibi1992_optimal_brain_surgeon.pdf) (Hassibi, Stork) | 1993 | the same with the full Hessian, **and compensates the remaining weights** by `−w_i H⁻¹ e_i / [H⁻¹]_ii` | full Hessian + inverse |
+| [OBQ](../../docs/papers/2208.11580v2.pdf) (Frantar, Alistarh) | 2022 | OBS applied to quantization, one weight at a time, with the *layer-wise reconstruction* loss `‖W X − Ŵ X‖²` whose Hessian is `H = 2 X Xᵀ` — the input second moment, our `A` | `A` only, exact, per row |
+| **[GPTQ](../../docs/papers/2210.17323v2.pdf)** (Frantar, Ashkboos, Hoefler, Alistarh) | 2022 | makes OBQ tractable for LLMs: quantize the columns in a fixed order (not greedily), update all rows at once, propagate each column's rounding error into the not-yet-quantized columns through the **Cholesky factor of the damped inverse Hessian** `(A + λI)⁻¹` | `A` only, shared by all rows |
 | `llama-quantize --imatrix` | 2024 | round-to-nearest per block, scale search weighted by `imatrix[col] = E[x_col²]` | the **diagonal** of `A` |
 | **K-FAC rounding (this)** | 2025 | GPTQ's error feedback **at the GGUF encoder's own block granularity with the real llama.cpp encoders**, driven by the collected `A_e` per expert; the output-side factor `G_e` makes the quadratic the KL curvature, used to predict and validate every rounding and, optionally, to refine it | `G ⊗ A` per layer and expert |
 
@@ -550,15 +550,18 @@ ladder writes the same split).
 ## 8. References
 
 - J. Martens, R. Grosse, *Optimizing Neural Networks with Kronecker-factored Approximate Curvature*, ICML 2015
-  (K-FAC: `F ≈ E[g gᵀ] ⊗ E[a aᵀ]` per layer).
-- Y. LeCun, J. Denker, S. Solla, *Optimal Brain Damage*, NeurIPS 1990. B. Hassibi, D. Stork, *Second order derivatives
-  for network pruning: Optimal Brain Surgeon*, NeurIPS 1993.
+  (K-FAC: `F ≈ E[g gᵀ] ⊗ E[a aᵀ]` per layer). [PDF](../../docs/papers/1503.05671v7.pdf) · [arXiv:1503.05671](https://arxiv.org/abs/1503.05671)
+- Y. LeCun, J. Denker, S. Solla, *Optimal Brain Damage*, NeurIPS 1990 ([PDF](../../docs/papers/lecun1989_optimal_brain_damage.pdf)). B. Hassibi, D. Stork, *Second order derivatives
+  for network pruning: Optimal Brain Surgeon*, NeurIPS 1993 ([PDF](../../docs/papers/hassibi1992_optimal_brain_surgeon.pdf)).
 - E. Frantar, D. Alistarh, *Optimal Brain Compression: a framework for accurate post-training quantization and
-  pruning*, NeurIPS 2022 (OBQ).
+  pruning*, NeurIPS 2022 (OBQ). [PDF](../../docs/papers/2208.11580v2.pdf) · [arXiv:2208.11580](https://arxiv.org/abs/2208.11580)
 - E. Frantar, S. Ashkboos, T. Hoefler, D. Alistarh, *GPTQ: Accurate Post-Training Quantization for Generative
-  Pre-trained Transformers*, ICLR 2023 (column-ordered OBQ with lazy updates and the Cholesky inverse-Hessian).
+  Pre-trained Transformers*, ICLR 2023 (column-ordered OBQ with lazy updates and the Cholesky inverse-Hessian). [PDF](../../docs/papers/2210.17323v2.pdf) · [arXiv:2210.17323](https://arxiv.org/abs/2210.17323)
 - llama.cpp `llama-quantize` / `llama-imatrix` (the importance matrix: per-column `E[x²]` weights for the block scale
   search), and the GGUF block formats this work encodes into.
-- Related 2025 work that also brings the output-side curvature into PTQ: YAQA, GuidedQuant (end-to-end Fisher /
+- Related 2025 work that also brings the output-side curvature into PTQ: YAQA ([PDF](../../docs/papers/2505.22988v3.pdf) · [arXiv:2505.22988](https://arxiv.org/abs/2505.22988)), GuidedQuant
+  ([PDF](../../docs/papers/2505.07004v4.pdf) · [arXiv:2505.07004](https://arxiv.org/abs/2505.07004)) (end-to-end Fisher /
   Hessian guidance for layer-wise quantization). This implementation differs in rounding at the GGUF block granularity
   with llama.cpp's own encoders and in collecting per-expert factors of a MoE.
+
+All cited papers are kept in [`docs/papers/`](../../docs/papers/README.md).

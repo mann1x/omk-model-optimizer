@@ -131,8 +131,8 @@ step.
    MoE is sensitive to them). This file is the reference: what llama.cpp alone produces, scored in the table as
    *llama-quantize + imatrix*. It is not published.
 4. **K-FAC rounding** — `omk_qad.kfac_round --stems all --qtype auto --ref <stock tier>`: every MLP tensor (routed
-   experts' gate_up and down, dense gate/up/down) is re-rounded by GPTQ at the encoder's own 256-column block, with
-   the real llama.cpp encoders (byte-identical codes) and the layer's Kronecker-factored curvature `H ≈ G ⊗ A`
+   experts' gate_up and down, dense gate/up/down) is re-rounded by [GPTQ](https://arxiv.org/abs/2210.17323) at the encoder's own 256-column block, with
+   the real llama.cpp encoders (byte-identical codes) and the layer's [Kronecker-factored curvature](https://arxiv.org/abs/1503.05671) `H ≈ G ⊗ A`
    (`A` = input second moment, `G` = sampled-label Fisher of the output, diagonal for the expert down-projections),
    collected on 512 windows × 2,048 tokens of the model's own agentic corpus with the attention-sink positions
    excluded. Output = a byte copy of the stock file with the MLP payloads replaced, so the two differ only by the

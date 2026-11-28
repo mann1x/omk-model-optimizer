@@ -23,11 +23,11 @@ QAD and ternary students of one model share one teacher cache and train side by 
 [`omk/docs/qad-ternary-together.md`](../omk/docs/qad-ternary-together.md).
 
 **And one post-training method, no training at all — K-FAC rounding** ([`omk/docs/kfac-rounding.md`](../omk/docs/kfac-rounding.md)):
-the MLP tensors of any `llama-quantize` GGUF are re-rounded against the model's Kronecker-factored curvature
+the MLP tensors of any `llama-quantize` GGUF are re-rounded against the model's [Kronecker-factored curvature](../docs/papers/1503.05671v7.pdf)
 (`H ≈ G ⊗ A`, collected once per model) with llama.cpp's own encoders, so the file keeps the stock layout, size and
 metadata and runs everywhere, with 6 % (Q8_0) to 41 % (Q3_K_M) less quantization KL at identical size. Its latents also
 seed the IQ2_XXS QAD students. Every tier of the two published Gemma-4 agentic GGUF repos is built this way; the guide
-walks through what K-FAC is, how it descends from OBS / OBQ / GPTQ, how to build a ladder tier by tier, and the
+walks through what K-FAC is, how it descends from [OBS](../docs/papers/hassibi1992_optimal_brain_surgeon.pdf) / [OBQ](../docs/papers/2208.11580v2.pdf) / [GPTQ](../docs/papers/2210.17323v2.pdf), how to build a ladder tier by tier, and the
 measured results.
 
 | | |

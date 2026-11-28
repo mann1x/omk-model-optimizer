@@ -132,7 +132,7 @@ covers every file.
 The GGUF tiers are not plain `llama-quantize` outputs. Each tier is made by llama.cpp b12386 with the AtomicChat
 corpus imatrix (9,590 chunks, rendered through the chat template, `--parse-special`) and the Gemma-4 A4B attention
 rule (attention Q8_0 from Q4_K_M upward, Q6_K below), then **re-rounded with K-FAC** (`omk_qad.kfac_round`): every MLP
-tensor GPTQ-rounded against the layer's Kronecker-factored curvature with the real llama.cpp encoders, into a byte copy
+tensor [GPTQ](https://arxiv.org/abs/2210.17323)-rounded against the layer's [Kronecker-factored curvature](https://arxiv.org/abs/1503.05671) with the real llama.cpp encoders, into a byte copy
 of the stock file. Measured on 44 held-out agentic windows against this model's own F16: Q4_K_M KL 0.00678 →
 **0.00534** (−21 %), Q6_K 0.00231 → **0.00214** (−7 %). Per-tier table and method:
 [GGUF card](https://huggingface.co/ManniX-ITA/gemma-4-20B-v9-agentic-GGUF),

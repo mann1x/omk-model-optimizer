@@ -73,8 +73,8 @@ script as run), llama.cpp **b12386** for every quantization step.
    attention projections (`attn_q/k/v/output`) are **Q8_0 from Q4_K_M upward and Q6_K below**. This is the reference
    file: what llama.cpp alone produces; scored in the table as *llama-quantize + imatrix*.
 4. **K-FAC rounding** — `omk_qad.kfac_round --stems all --qtype auto --ref <stock tier>`: every MLP tensor (routed
-   experts' gate_up and down, dense gate/up/down) is re-rounded by GPTQ at the encoder's own 256-column block, with
-   the real llama.cpp encoders (byte-identical codes) and the layer's Kronecker-factored curvature `H ≈ G ⊗ A`
+   experts' gate_up and down, dense gate/up/down) is re-rounded by [GPTQ](https://arxiv.org/abs/2210.17323) at the encoder's own 256-column block, with
+   the real llama.cpp encoders (byte-identical codes) and the layer's [Kronecker-factored curvature](https://arxiv.org/abs/1503.05671) `H ≈ G ⊗ A`
    (`A` = input second moment, `G` = sampled-label Fisher of the output, collected on 512 windows × 2,048 tokens of the
    same corpus with the attention-sink positions excluded). The output is a byte copy of the stock file with the MLP
    payloads replaced: same tensor types, same byte count, same metadata (imatrix keys included).
