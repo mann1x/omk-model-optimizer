@@ -1,0 +1,2 @@
+# Papers and other documents: never diff, merge or normalise line endings
+*.pdf binary
