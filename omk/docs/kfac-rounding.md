@@ -492,16 +492,29 @@ LCB-hard-77 87.01, MultiPL-E 89.33; tool-eval-bench hardmode 142.6 / 176 on the 
 [`cards/20b_bench.json`](../models/gemma-4-20b-v9-agentic/cards/20b_bench.json). These numbers measure the model
 through the quant; the quant's own quality is the twin KL above.
 
-### 6.3 A dense model, per family: Omnimerge-v6 Q4_K_M (Qwen3.8-27B)
+### 6.3 A dense model: the Omnimerge-v6 ladder (Qwen3.8-27B), tier by tier and per family
 
 [ManniX-ITA/Qwen3.8-27B-Omnimerge-v6-MTP-GGUF](https://huggingface.co/ManniX-ITA/Qwen3.8-27B-Omnimerge-v6-MTP-GGUF):
 a dense/hybrid 64-layer model, so only the three dense FFN projections per layer are rounded (no experts). Factors
-512 windows x 2048, 3 layers/pass (3.0 h on one RTX PRO 6000); imatrix = combined AC + QAD-cache. Both files are
+512 windows x 2048, 3 layers/pass (3.0 h on one RTX PRO 6000); imatrix = combined AC + QAD-cache. At Q4_K_M both files are
 16217 MiB (4.98 BPW), built from the same imatrix, scored on the same 252,634 assistant positions against the bf16
 teacher's top-256 logits. The rounding error fell from 0.00237 to 0.00145 (0.610x of RTN); the tier took 58 min end to
 end (PTQ 6.0 min, rounding 37.6 min, twin score 8.4 min, HF + ollama 6.0 min).
 
-The per-family split shows where the gain lands: the agentic and code families gain 16-26 % KL, while the two largest
+Per tier (ladder in progress, 22 tiers; rows are added as each tier publishes). KL / top-1 on the same 252,634
+positions; "rounding error" is the K-FAC objective after rounding relative to RTN (`KFACR_DONE`).
+
+| tier | size (GiB) | llama-quantize + imatrix | **K-FAC** | ΔKL | rounding error vs RTN | tier wall time |
+|---|---:|---:|---:|---:|---:|---:|
+| Q8_0 | 27.05 | 0.00044 / 0.9915 | **0.00043 / 0.9917** | −2.2 % | 0.475x | 56 min |
+| Q6_K | 20.89 | 0.00081 / 0.9899 | **0.00077 / 0.9899** | −5.4 % | 0.563x | 58 min |
+| Q4_K_M | 15.84 | 0.00412 / 0.9790 | **0.00362 / 0.9808** | −12.0 % | 0.610x | 58 min |
+
+As on the 20B ladder, the gain grows as the bit width falls: at 8 bits the quantization error is already near the
+scorer's floor, at 4 bits K-FAC removes an eighth of it. The tier wall time is almost flat (rounding is ~38 min at
+every K-quant width; the PTQ step shrinks from 6 min at Q4_K_M to under 1 min at Q8_0, publishing grows with the file).
+
+**Per family, Q4_K_M.** The split shows where the gain lands: the agentic and code families gain 16-26 % KL, while the two largest
 families (science, multilingual) gain 5-6 % and hold the pooled figure at -12 %. No family gets worse on either metric.
 
 | family | positions | KL llama-quantize | **KL K-FAC** | ΔKL | top-1 llama-quantize | **top-1 K-FAC** | Δtop-1 (pt) |
