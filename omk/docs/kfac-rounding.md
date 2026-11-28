@@ -535,6 +535,7 @@ positions; "rounding error" is the K-FAC objective after rounding relative to RT
 | Q4_K_L | 16.72 | 0.00405 / 0.9796 | **0.00354 / 0.9811** | −12.5 % | 0.610x | 53 min |
 | Q4_K_M | 15.84 | 0.00412 / 0.9790 | **0.00362 / 0.9808** | −12.0 % | 0.610x | 58 min |
 | IQ4_NL | 15.12 | 0.00496 / 0.9769 | **0.00423 / 0.9791** | −14.8 % | 0.584x | 53 min |
+| Q4_K_S | 14.75 | 0.00481 / 0.9776 | **0.00425 / 0.9791** | −11.7 % | 0.608x | 54 min |
 | IQ4_XS | 14.48 | 0.00504 / 0.9767 | **0.00431 / 0.9791** | −14.5 % | 0.581x | 53 min |
 
 As on the 20B ladder, the gain grows as the bit width falls: at 8 bits the quantization error is already near the
