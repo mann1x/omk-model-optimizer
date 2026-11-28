@@ -78,6 +78,30 @@ GGUF quantizations of [`ManniX-ITA/Qwen3.8-27B-Omnimerge-v6`](https://huggingfac
 | IQ2_M | 10.2 GB | yes | |
 | IQ2_S | 9.6 GB | yes | smallest shipped; 12 GB cards |
 
+### Tensor names: re-download a file fetched on 2026-11-28 before the fix
+
+The K-FAC files are built with llama.cpp b12386. For this architecture (`qwen35`) its converter stores two pairs of
+linear-attention projections of every layer as one tensor each: `attn_qkv_gate` (= `attn_qkv` + `attn_gate`) and
+`ssm_beta_alpha` (= `ssm_beta` + `ssm_alpha`). Older loaders do not know those names and refuse the file with
+
+```
+llama_model_load: error loading model: missing tensor 'blk.0.ssm_beta.weight'
+```
+
+That covers older llama.cpp builds and older ollama / ollama-based runtimes, including the opencoti engine up to c14.
+
+The first five K-FAC tiers were uploaded in that merged form on 2026-11-28: Q4_K_M, Q6_K, Q8_0, Q5_K_M and Q4_K_L,
+together with their ollama tags. All of them were replaced the same day by files with the classic names.
+- The two tensors of each pair are split back apart. That is a byte copy of whole rows: same quantization, same
+  weights. Only the file's sha256 changes; see each file's `.sha256` sidecar.
+- Every file in this repo and every `mannix/omnimerge-v6` tag now uses the split names, which old and new loaders
+  both read.
+- The split files score the same as the merged ones within noise: pooled KL 0.0036199 vs 0.0036210 on Q4_K_M.
+
+If a download or `ollama pull` from 2026-11-28 fails with the error above, fetch it again.
+
+To check a file, list its tensor names (`gguf-dump FILE | grep -c ssm_beta_alpha`). The count must be 0.
+
 ### Why not every tier uses imatrix
 
 This is a measured policy, not an omission. The imatrix crossover is a property of the quant **grid coarseness**: at the Q4 band and above the calibration bias outweighs importance-weighting and imatrix is neutral-to-harmful; below it (Q3/Q2/IQ) imatrix is the difference between a good quant and a broken one. Measured once per model family on a Q2→Q6 HE+/MPE ladder. So Q4_K_*/Q5_K_*/Q6_K* are built **without** imatrix and everything at Q3 and below — plus the IQ tiers — **with** it. Q8_0 needs none.
