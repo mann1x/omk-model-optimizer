@@ -92,6 +92,7 @@ to round-to-nearest. The ladder is in progress (22 tiers); rows are added as eac
 | Q8_0 | 27.05 | 0.00044 / 0.9915 | **0.00043 / 0.9917** | −2.2 % | 0.475x | 56 min |
 | Q6_K | 20.89 | 0.00081 / 0.9899 | **0.00077 / 0.9899** | −5.4 % | 0.563x | 58 min |
 | Q5_K_M | 18.29 | 0.00143 / 0.9870 | **0.00130 / 0.9876** | −9.0 % | 0.601x | 57 min |
+| Q4_K_L | 16.72 | 0.00405 / 0.9796 | **0.00354 / 0.9811** | −12.5 % | 0.610x | 53 min |
 | Q4_K_M | 15.84 | 0.00412 / 0.9790 | **0.00362 / 0.9808** | −12.0 % | 0.610x | 58 min |
 
 The gain grows as the bit width falls: at Q8_0 the quantization error is already near the scorer's floor, at Q4_K_M
