@@ -501,6 +501,23 @@ a dense/hybrid 64-layer model, so only the three dense FFN projections per layer
 teacher's top-256 logits. The rounding error fell from 0.00237 to 0.00145 (0.610x of RTN); the tier took 58 min end to
 end (PTQ 6.0 min, rounding 37.6 min, twin score 8.4 min, HF + ollama 6.0 min).
 
+Preparation, once per model (clean run on bs2: one RTX PRO 6000 96 GB, 16 CPU threads; failed attempts and idle gaps
+excluded). The QAD cache is needed even when no QAD follows: it holds the teacher top-64 logits the twin scorer grades
+every tier against and the cache imatrix that is combined with the AC imatrix (§4.0.1).
+
+| stage | device | wall time |
+|---|---|---:|
+| render 11 corpus families (train + eval) | CPU | 7.1 min |
+| layout + HF → BF16 GGUF convert (54.7 GB) | CPU | 5.7 min |
+| AC imatrix (`llama-imatrix`, AtomicChat corpus, 9,703 chunks x 512 = 5.0 M tokens, `--parse-special`) | GPU | 4 h 23 min — **reused** here from the 2026-09 stock ladder; a model without one pays it once |
+| AC imatrix re-save + fused-name remap + check | CPU | 2.5 min |
+| **QAD cache**: 768 x 16k windows, teacher top-64 + 4 eval rows per family + cache imatrix | GPU | **82 min** (12.7 s/row for the first 256 rows while the imatrix is collected, 3.25 s/row after) |
+| combined imatrix (AC + cache) + check | CPU | < 1 min |
+| base-GGUF gate (BF16 GGUF vs the HF teacher, 44 eval rows) | GPU | 7.2 min |
+| grow probe (64 windows x 2048) | GPU | 1.6 min |
+| **K-FAC dense factors**: 64 layers x 512 windows x 2048, 3 layers/pass | GPU | **3.0 h** (0.96 s/window, peak 92.0 GiB) |
+| **total before the first tier** | | **≈ 4.5 h GPU + 16 min CPU** with the AC imatrix in hand; **≈ 8.9 h GPU** from scratch |
+
 Per tier (ladder in progress, 22 tiers; rows are added as each tier publishes). KL / top-1 on the same 252,634
 positions; "rounding error" is the K-FAC objective after rounding relative to RTN (`KFACR_DONE`).
 
